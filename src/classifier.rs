@@ -45,7 +45,7 @@ impl Default for Params {
         Params {
             strength: 1.0,
             unknown_prob: 0.5,
-            max_interesting: 150,
+            max_interesting: 50,
             threshold: 0.5,
             good_bias: 1.0,
             min_word_count: 0,
