@@ -281,6 +281,14 @@ fn walk_maildir(root: &Path) -> io::Result<Vec<(String, PathBuf)>> {
 
 /// Decide the fp/fn/tp/tn label from a delivery verdict + the user's
 /// current folder. Returns the string label.
+///
+/// This is the *policy*-level label — what the deployed system did with the
+/// message given whatever threshold was in effect at delivery time. It
+/// conflates algorithm errors with threshold-policy errors: a message
+/// scoring 0.75 under a 0.8 threshold would be delivered as GOOD, and if
+/// the user later flagged it as spam we'd call that "fn" here — but the
+/// classifier wasn't really wrong, the threshold was. Use `confidence` and
+/// `is_algo_error` for algorithm-level evaluation.
 fn label(delivery_verdict: &str, current_folder: &str) -> &'static str {
     let is_junk = current_folder.eq_ignore_ascii_case(".Junk");
     match (delivery_verdict, is_junk) {
@@ -289,6 +297,32 @@ fn label(delivery_verdict: &str, current_folder: &str) -> &'static str {
         ("GOOD", true) => "fn",
         ("GOOD", false) => "tn",
         _ => "unknown",
+    }
+}
+
+/// Raw-score confidence band, independent of whatever delivery threshold
+/// was in effect. High-spam/high-ham scores represent classifier confidence;
+/// the uncertain band is where threshold policy determines the outcome and
+/// so "errors" in that band are not really algorithm errors.
+fn confidence(score: f64) -> &'static str {
+    if score >= 0.8 {
+        "high_spam"
+    } else if score <= 0.2 {
+        "high_ham"
+    } else {
+        "uncertain"
+    }
+}
+
+/// Algorithm-level error: the classifier was confident and the user
+/// disagreed. These are the messages worth pointing `explain` at, because
+/// the Fisher math produced a confident answer that was wrong.
+fn is_algo_error(score: f64, current_folder: &str) -> bool {
+    let is_junk = current_folder.eq_ignore_ascii_case(".Junk");
+    match confidence(score) {
+        "high_spam" => !is_junk, // confidently spam but user rescued
+        "high_ham" => is_junk,   // confidently ham but user flagged
+        _ => false,
     }
 }
 
@@ -396,6 +430,8 @@ fn main() {
     let mut files_no_msgid = 0u64;
     let mut files_unknown_msgid = 0u64;
     let mut counts: HashMap<&'static str, u64> = HashMap::new();
+    let mut conf_counts: HashMap<&'static str, u64> = HashMap::new();
+    let mut algo_errors = 0u64;
 
     for (folder, path) in files {
         files_total += 1;
@@ -414,10 +450,23 @@ fn main() {
         let lbl = label(&delivery.verdict, &folder);
         *counts.entry(lbl).or_insert(0) += 1;
 
+        let score_num = delivery.score.parse::<f64>().unwrap_or(0.5);
+        let conf = confidence(score_num);
+        *conf_counts.entry(conf).or_insert(0) += 1;
+        let algo_err = is_algo_error(score_num, &folder);
+        if algo_err {
+            algo_errors += 1;
+        }
+
         // Emit record
         out.write_all(b"{\"label\":")
             .and_then(|_| write_json_string(&mut out, lbl))
             .ok();
+        out.write_all(b",\"confidence\":")
+            .and_then(|_| write_json_string(&mut out, conf))
+            .ok();
+        out.write_all(b",\"algo_error\":").ok();
+        out.write_all(if algo_err { b"true" } else { b"false" }).ok();
         out.write_all(b",\"msgid\":")
             .and_then(|_| write_json_string(&mut out, &msgid))
             .ok();
@@ -446,6 +495,11 @@ fn main() {
     eprintln!("# files msgid not in logs: {files_unknown_msgid}");
     let matched: u64 = counts.values().sum();
     eprintln!("# files matched:           {matched}");
+    eprintln!("#");
+    eprintln!("# policy-level confusion matrix (verdict vs current folder):");
+    eprintln!("# policy label reflects whatever threshold was in effect at delivery time —");
+    eprintln!("# a score of 0.75 under a 0.8 threshold delivers as GOOD, and if the user later");
+    eprintln!("# flagged it, we count 'fn' even though the classifier wasn't confident.");
     for (label, count) in [
         ("tp", counts.get("tp").copied().unwrap_or(0)),
         ("tn", counts.get("tn").copied().unwrap_or(0)),
@@ -454,6 +508,17 @@ fn main() {
     ] {
         eprintln!("#   {label}: {count}");
     }
+    eprintln!("#");
+    eprintln!("# algorithm-level: raw-score confidence vs user action");
+    eprintln!("# confidence bands: high_ham <= 0.2, uncertain (0.2, 0.8), high_spam >= 0.8");
+    for (band, count) in [
+        ("high_ham", conf_counts.get("high_ham").copied().unwrap_or(0)),
+        ("uncertain", conf_counts.get("uncertain").copied().unwrap_or(0)),
+        ("high_spam", conf_counts.get("high_spam").copied().unwrap_or(0)),
+    ] {
+        eprintln!("#   {band}: {count}");
+    }
+    eprintln!("# algorithm errors (confident classifier + user disagreed): {algo_errors}");
 }
 
 #[cfg(test)]
@@ -490,6 +555,35 @@ mod tests {
         assert_eq!(label("GOOD", ".Junk"), "fn");
         assert_eq!(label("SPAM", ".Archive"), "fp");
         assert_eq!(label("GOOD", ".Sent"), "tn");
+    }
+
+    #[test]
+    fn test_confidence_bands() {
+        assert_eq!(confidence(0.0), "high_ham");
+        assert_eq!(confidence(0.2), "high_ham");
+        assert_eq!(confidence(0.21), "uncertain");
+        assert_eq!(confidence(0.5), "uncertain");
+        assert_eq!(confidence(0.79), "uncertain");
+        assert_eq!(confidence(0.8), "high_spam");
+        assert_eq!(confidence(1.0), "high_spam");
+    }
+
+    #[test]
+    fn test_algo_error() {
+        // Classifier confident spam, user rescued → genuine algorithm fp
+        assert!(is_algo_error(0.95, "INBOX"));
+        assert!(is_algo_error(0.95, ".Archive"));
+        // Classifier confident spam, user agreed → not an error
+        assert!(!is_algo_error(0.95, ".Junk"));
+        // Classifier confident ham, user flagged → genuine algorithm fn
+        assert!(is_algo_error(0.05, ".Junk"));
+        // Classifier confident ham, user agreed → not an error
+        assert!(!is_algo_error(0.05, "INBOX"));
+        // Uncertain zone → never an algo error regardless of outcome
+        assert!(!is_algo_error(0.5, "INBOX"));
+        assert!(!is_algo_error(0.5, ".Junk"));
+        assert!(!is_algo_error(0.7, ".Junk"));
+        assert!(!is_algo_error(0.79, "INBOX"));
     }
 
     #[test]
