@@ -52,13 +52,20 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl
 
 Binary goes to `/usr/bin/spamlite` on the mail server (where dovecot's `sieve_execute_bin_dir` points).
 
-Sieve scripts are in `/etc/dovecot/sieve/`:
-- `global.sieve` — inbound classification via `spamlite receive`
-- `retrain-as-spam.sieve` — IMAP move to Junk triggers `spamlite spam`
-- `retrain-as-good.sieve` — IMAP move from Junk triggers `spamlite good`
-- `train-as-ham.sieve` — IMAP move to TrainHam triggers `spamlite good`
+Sieve scripts on mrn are in `/etc/dovecot/sieve/`:
+- `global.sieve` — inbound classification, calls `spamfilter ... receive`
+- `retrain-as-spam.sieve` — IMAP move to Junk, calls `spamfilter-retrain spam`
+- `retrain-as-ham.sieve` — IMAP move out of Junk, calls `spamfilter-retrain good`
 
-Per-user databases live at `/srv/{domain}/msg/{user}/.spamlite/db.sqlite`.
+The sieve scripts do **not** invoke `spamlite` directly. They call the `spamfilter`
+and `spamfilter-retrain` wrappers at `/usr/local/bin/` which dispatch between
+spamlite and spamprobe per-user based on whether `.spamlite/` exists in the user's
+Maildir. The `spamfilter` wrapper hardcodes `-t 0.6` as the global threshold —
+this is the injection point for per-user threshold overrides, not spamlite itself.
+
+Per-user databases live at `/srv/{domain}/msg/{user}/.spamlite/db.sqlite`. See
+`_doc/2026-04-14-spamlite-improvement-plan.md` for the full wiring and active
+improvement plan.
 
 ## Testing
 

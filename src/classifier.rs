@@ -8,7 +8,6 @@ use crate::storage::{Database, Token};
 pub enum Verdict {
     Spam,
     Good,
-    Unsure,
 }
 
 impl std::fmt::Display for Verdict {
@@ -16,7 +15,6 @@ impl std::fmt::Display for Verdict {
         match self {
             Verdict::Spam => write!(f, "SPAM"),
             Verdict::Good => write!(f, "GOOD"),
-            Verdict::Unsure => write!(f, "UNSURE"),
         }
     }
 }
@@ -29,10 +27,8 @@ pub struct Params {
     pub unknown_prob: f64,
     /// Number of most interesting tokens to use
     pub max_interesting: usize,
-    /// Score above which we classify as spam
-    pub spam_threshold: f64,
-    /// Score below which we classify as good
-    pub good_threshold: f64,
+    /// Score at or above which we classify as spam (default 0.5)
+    pub threshold: f64,
 }
 
 impl Default for Params {
@@ -41,8 +37,7 @@ impl Default for Params {
             strength: 1.0,
             unknown_prob: 0.5,
             max_interesting: 150,
-            spam_threshold: 0.9,
-            good_threshold: 0.1,
+            threshold: 0.5,
         }
     }
 }
@@ -59,7 +54,7 @@ pub fn classify(
 
     // Need at least some training data
     if total_good < 1.0 && total_spam < 1.0 {
-        return Ok((Verdict::Unsure, 0.5));
+        return Ok((Verdict::Good, 0.5));
     }
 
     // Use 1.0 as minimum to avoid division by zero
@@ -104,7 +99,7 @@ pub fn classify(
     interesting.truncate(params.max_interesting);
 
     if interesting.is_empty() {
-        return Ok((Verdict::Unsure, 0.5));
+        return Ok((Verdict::Good, 0.5));
     }
 
     // Fisher's chi-squared combining
@@ -124,12 +119,10 @@ pub fn classify(
     let score = (1.0 + p_spam - p_ham) / 2.0;
     let score = score.clamp(0.0, 1.0);
 
-    let verdict = if score >= params.spam_threshold {
+    let verdict = if score >= params.threshold {
         Verdict::Spam
-    } else if score <= params.good_threshold {
-        Verdict::Good
     } else {
-        Verdict::Unsure
+        Verdict::Good
     };
 
     Ok((verdict, score))
@@ -227,7 +220,7 @@ mod tests {
         let params = Params::default();
         let tokens: Vec<String> = vec!["b:hello".into()];
         let (verdict, score) = classify(&db, &tokens, &params).unwrap();
-        assert_eq!(verdict, Verdict::Unsure);
+        assert_eq!(verdict, Verdict::Good);
         assert!((score - 0.5).abs() < 0.01);
     }
 

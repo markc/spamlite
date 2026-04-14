@@ -13,6 +13,27 @@ use spamlite::tokenizer;
 /// Database directory set via -d flag
 static DB_DIR: OnceLock<String> = OnceLock::new();
 
+/// Spam threshold set via -t flag (default 0.5)
+static THRESHOLD: OnceLock<f64> = OnceLock::new();
+
+/// TOE confidence gate set via -g flag (default 0.2). In `receive` mode, the
+/// classifier only trains when the score falls OUTSIDE the dead band
+/// `(gate, 1.0 - gate)` — i.e. training fires when `score <= gate || score >= (1.0 - gate)`.
+///
+/// Semantic (read as "trusted region width"):
+/// - `0.0` — trusted region is empty → training fully disabled (read-only)
+/// - `0.2` (default) — trusted = `[0, 0.2] ∪ [0.8, 1]` → train confident verdicts, skip uncertain
+/// - `0.5` — trusted region covers `[0, 1]` → pure TOE, train on everything
+///
+/// Default `0.2` is a reasonable starting point but should be revisited once
+/// the explain command exists and we can measure the actual score distribution
+/// on `admin_maildir/` and the production cluster. The right gate width
+/// depends on how well-calibrated spamlite's scores are on this mail mix,
+/// which is an empirical question, not a guess.
+static TOE_GATE: OnceLock<f64> = OnceLock::new();
+
+const TOE_GATE_DEFAULT: f64 = 0.2;
+
 fn db_path() -> PathBuf {
     // -d flag takes priority
     if let Some(dir) = DB_DIR.get() {
@@ -44,15 +65,69 @@ fn open_db() -> Database {
     })
 }
 
-fn cmd_receive() {
+fn cmd_score() {
     let raw = read_stdin();
     let tokens = tokenizer::tokenize(&raw);
     let db = open_db();
-    let params = Params::default();
+    let mut params = Params::default();
+    if let Some(&t) = THRESHOLD.get() {
+        params.threshold = t;
+    }
 
     match classifier::classify(&db, &tokens, &params) {
         Ok((verdict, score)) => {
             print!("{verdict} {score:.6}");
+        }
+        Err(e) => {
+            eprintln!("spamlite: classification error: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// receive = classify + confidence-gated training. After scoring, train on the
+/// classifier's own verdict ONLY if the score is outside the uncertainty band
+/// `(gate, 1.0 - gate)`, where `gate` defaults to `TOE_GATE_DEFAULT` and is
+/// configurable via `-g` or `SPAMLITE_TOE_GATE`. This is a third mode between
+/// spamprobe's pure TOE (`receive`) and TONE (`train`): "train on confidence."
+/// It is the safest cold-start mechanism for a frozen corpus because it
+/// restores training signal without reinforcing borderline errors.
+///
+/// The SPAM/GOOD score is printed to stdout BEFORE training runs, so the sieve
+/// contract is preserved even if the training write fails. Training failures
+/// are logged to stderr but do not exit non-zero — mail delivery must not break
+/// because the classifier couldn't persist counts.
+fn cmd_receive() {
+    let raw = read_stdin();
+    let tokens = tokenizer::tokenize(&raw);
+    let db = open_db();
+    let mut params = Params::default();
+    if let Some(&t) = THRESHOLD.get() {
+        params.threshold = t;
+    }
+    let gate = TOE_GATE.get().copied().unwrap_or(TOE_GATE_DEFAULT);
+
+    match classifier::classify(&db, &tokens, &params) {
+        Ok((verdict, score)) => {
+            print!("{verdict} {score:.6}");
+
+            if score > gate && score < (1.0 - gate) {
+                return;
+            }
+
+            let is_spam = matches!(verdict, classifier::Verdict::Spam);
+            if let Err(e) = db.train(&tokens, is_spam) {
+                eprintln!("spamlite: training error (non-fatal): {e}");
+                return;
+            }
+            let meta_result = if is_spam {
+                db.inc_total_spam()
+            } else {
+                db.inc_total_good()
+            };
+            if let Err(e) = meta_result {
+                eprintln!("spamlite: meta update error (non-fatal): {e}");
+            }
         }
         Err(e) => {
             eprintln!("spamlite: classification error: {e}");
@@ -138,30 +213,39 @@ fn cmd_import() {
 
 fn usage() {
     eprintln!(
-        "spamlite 0.1.0 — per-user Bayesian spam filter
+        "spamlite 0.3.0 — per-user Bayesian spam filter
 Copyright 2026 Mark Constable <mc@netserva.org>
 MIT License — https://github.com/markc/spamlite
 
 Usage:
-  spamlite [-d DIR] receive          Classify message from stdin (prints SPAM/GOOD/UNSURE + score)
-  spamlite [-d DIR] spam             Train message from stdin as spam
-  spamlite [-d DIR] good             Train message from stdin as good/ham
-  spamlite [-d DIR] counts           Show database statistics
-  spamlite [-d DIR] cleanup [N] [D]  Remove tokens with count <= N or not seen in D days
-  spamlite [-d DIR] export           Export database to CSV on stdout
-  spamlite [-d DIR] import           Import CSV from stdin (spamprobe-compatible format)
+  spamlite [-d DIR] [-t THRESHOLD] [-g GATE] receive   Classify + train on confident verdicts
+  spamlite [-d DIR] [-t THRESHOLD] score               Classify only (read-only, no training)
+  spamlite [-d DIR] spam                               Train message from stdin as spam
+  spamlite [-d DIR] good                               Train message from stdin as good/ham
+  spamlite [-d DIR] counts                             Show database statistics
+  spamlite [-d DIR] cleanup [N] [D]                    Remove tokens: count <= N or unseen in D days
+  spamlite [-d DIR] export                             Export database to CSV on stdout
+  spamlite [-d DIR] import                             Import CSV from stdin (spamprobe format)
 
 Options:
-  -d DIR    Database directory (uses DIR/db.sqlite)
+  -d DIR        Database directory (uses DIR/db.sqlite)
+  -t THRESHOLD  Spam threshold 0.0-1.0 (default: 0.5, higher = less aggressive)
+  -g GATE       TOE confidence gate 0.0-0.5 for `receive` (default: 0.2)
+                `receive` trains only if score <= gate || score >= (1.0 - gate)
+                0.0 = disable training, 0.5 = pure TOE (train everything)
 
 Environment:
   SPAMLITE_DB               Database file path (default: ~/.spamlite/db.sqlite)
+  SPAMLITE_THRESHOLD        Spam threshold (default: 0.5)
+  SPAMLITE_TOE_GATE         TOE confidence gate for `receive` (default: 0.2)
 
-Priority: -d flag > SPAMLITE_DB env > ~/.spamlite/db.sqlite"
+Priority: -t flag > SPAMLITE_THRESHOLD env > 0.5
+          -g flag > SPAMLITE_TOE_GATE env > 0.2
+          -d flag > SPAMLITE_DB env > ~/.spamlite/db.sqlite"
     );
 }
 
-/// Parse args, extracting -d flag, returning remaining args
+/// Parse args, extracting -d and -t flags, returning remaining args
 fn parse_args() -> Vec<String> {
     let args: Vec<String> = std::env::args().collect();
     let mut remaining = Vec::new();
@@ -178,8 +262,65 @@ fn parse_args() -> Vec<String> {
                 process::exit(1);
             }
         }
+        if args[i] == "-t" {
+            if i + 1 < args.len() {
+                match args[i + 1].parse::<f64>() {
+                    Ok(t) if (0.0..=1.0).contains(&t) => {
+                        let _ = THRESHOLD.set(t);
+                    }
+                    _ => {
+                        eprintln!("spamlite: -t requires a number between 0.0 and 1.0");
+                        process::exit(1);
+                    }
+                }
+                i += 2;
+                continue;
+            } else {
+                eprintln!("spamlite: -t requires a threshold argument");
+                process::exit(1);
+            }
+        }
+        if args[i] == "-g" {
+            if i + 1 < args.len() {
+                match args[i + 1].parse::<f64>() {
+                    Ok(g) if (0.0..=0.5).contains(&g) => {
+                        let _ = TOE_GATE.set(g);
+                    }
+                    _ => {
+                        eprintln!("spamlite: -g requires a number between 0.0 and 0.5");
+                        process::exit(1);
+                    }
+                }
+                i += 2;
+                continue;
+            } else {
+                eprintln!("spamlite: -g requires a gate argument");
+                process::exit(1);
+            }
+        }
         remaining.push(args[i].clone());
         i += 1;
+    }
+
+    // Also check environment variable for threshold
+    if THRESHOLD.get().is_none() {
+        if let Ok(val) = std::env::var("SPAMLITE_THRESHOLD") {
+            if let Ok(t) = val.parse::<f64>() {
+                if (0.0..=1.0).contains(&t) {
+                    let _ = THRESHOLD.set(t);
+                }
+            }
+        }
+    }
+
+    if TOE_GATE.get().is_none() {
+        if let Ok(val) = std::env::var("SPAMLITE_TOE_GATE") {
+            if let Ok(g) = val.parse::<f64>() {
+                if (0.0..=0.5).contains(&g) {
+                    let _ = TOE_GATE.set(g);
+                }
+            }
+        }
     }
 
     remaining
@@ -195,6 +336,7 @@ fn main() {
 
     match args[0].as_str() {
         "receive" => cmd_receive(),
+        "score" => cmd_score(),
         "spam" => cmd_train(true),
         "good" => cmd_train(false),
         "counts" => cmd_counts(),

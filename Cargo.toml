@@ -1,6 +1,6 @@
 [package]
 name = "spamlite"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Per-user Bayesian spam filter — drop-in spamprobe replacement"
 license = "MIT"
@@ -8,8 +8,8 @@ authors = ["Mark Constable <mc@netserva.org>"]
 repository = "https://github.com/markc/spamlite"
 
 [dependencies]
-mail-parser = "0.10"
-rusqlite = { version = "0.32", features = ["bundled"] }
+mail-parser = "0.11"
+rusqlite = { version = "0.38", features = ["bundled"] }
 nanohtml2text = "0.2"
 
 [profile.release]
