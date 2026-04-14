@@ -301,7 +301,7 @@ fn cmd_import() {
 
 fn usage() {
     eprintln!(
-        "spamlite 0.3.0 — per-user Bayesian spam filter
+        "spamlite 0.4.0 — per-user Bayesian spam filter
 Copyright 2026 Mark Constable <mc@netserva.org>
 MIT License — https://github.com/markc/spamlite
 

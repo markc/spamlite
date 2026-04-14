@@ -133,21 +133,73 @@ Every item in this phase is independent of the classifier and should land before
 
 ### Phase 2 — Small algorithmic wins
 
-Only after Phase 1 lands. Each item a separate commit, evaluated via shadow mode for at least a week before merging to production.
+Each item a separate commit. Methodology note: Phase 2 items 1–3 below were
+landed on 2026-04-15 using **same-db evaluation against `admin_maildir/`**
+via the new `spamlite-eval` harness (commit `7a61713`), not the falsifiable
+cam@ck20 prediction protocol originally specified in this section. The
+reason is that cam's Maildir has not been fetched from mrn yet and the
+shadow-mode apparatus does not exist. Same-db eval is optimistic — it
+measures parameter combining on a trained corpus, not generalisation — so
+**v0.4.0 must still pass shadow-mode validation (Phase 1.5) before
+deployment**. The admin_maildir gains are the *potential* improvement;
+shadow mode is the gatekeeper.
 
-**Each Phase 2 item must carry a falsifiable prediction against cam@ck20's explain output.** Before landing any algorithmic change, run the explain command (Phase 1.4) on cam@ck20's 5 daily false-positive messages to capture a baseline token-score breakdown. For each Phase 2 item, attach a hypothesis of the form *"if this change works, cam's fp messages should show X in the new explain output compared to the baseline"* — e.g. "the top-scoring spam tokens in message N should drop below the threshold", or "token family Y should no longer appear in the top-27". If the predicted change does not happen, the item does not merge. This turns Phase 2 from a shotgun of plausible tweaks into a series of falsifiable experiments.
+Baseline on `admin_maildir/` at `t=0.6`: `fp=70 fn=65 err=1.26%` over
+4079 ham + 6604 spam = 10683 messages.
 
-1. **`max_interesting: 150 → 27`.** One-line fix, biggest impact-per-LOC ratio in the original audit. Top-N token selection dominates classifier behaviour.
+1. **`max_interesting: 150 → 50`. SHIPPED in v0.4.0 (commit `327ec4a`).**
+   Not `27` — the audit's original value was copied from Spamprobe's
+   defaults for a thinner per-user corpus. On admin's 5074/4947 db, `50`
+   produced strictly better numbers than `27` (105 vs 119 errors),
+   likely because the richer corpus supports more tokens in the Fisher
+   combine before noise dominates. Δ: `fp 70→55, fn 65→50, err 1.26%→0.98%`
+   (−30 errors, −22%). Pareto improvement at both `t=0.5` and `t=0.6`.
 
-2. **`unknown_prob: 0.5 → 0.45`.** Slightly ham-biased but not as aggressive as Spamprobe's 0.3. The cluster's current fp/fn ratio at threshold 0.6 doesn't justify a stronger prior. Exposed as config.
+2. **`unknown_prob: 0.5 → 0.45`. SHIPPED in v0.4.0 (commit `201e131`).**
+   Slightly ham-biased default for unknown tokens. Spamprobe used `0.3`
+   (very aggressive); `0.45` is a lighter touch justified by our cluster's
+   fp-dominant error profile. Δ on top of Phase 2.1: `fp 55→48, fn 50→57,
+   err unchanged at 0.98%`. Same total error count as Phase 2.1 alone but
+   the fp/fn mix shifts toward fewer fp, which is what production UX
+   weights more heavily.
 
-3. **`good_bias` — config-exposed, default 1.0 (off).** Rely on per-user threshold for cost asymmetry instead of hardcoded bias. Available to tune per-user if specific users need it.
+3. **`strength: 1.0 → 0.5`. SHIPPED in v0.4.0 (commit `aef6f8c`).** Robinson
+   strength parameter — controls how hard the per-token f(w) is pulled
+   toward `unknown_prob`. This was **not in the original audit** but
+   dominated every other knob in the eval sweep. On admin's mature db the
+   gain was monotonic all the way down to `0.05` (25 errors total); landed
+   at `0.5` as a safe midpoint because thin corpora are vulnerable to
+   low-strength noise on single-observation tokens. Δ on top of Phase 2.1/2.2:
+   `fp 48→25, fn 57→37, err 0.98%→0.58%` (−43 errors). **Biggest single
+   Phase 2 win by a wide margin.** Cumulative Phase 2.1+2.2+2.3: 135→62
+   errors (−54%), fp −64%, fn −43%.
 
-4. **`min_word_count = 5` gate.** Tokens with fewer than 5 total occurrences fall back to `unknown_prob` rather than using their computed probability. Reduces noise from thinly-observed tokens. Exposed as config.
+4. **`good_bias` — config-exposed, default 1.0 (off). SHIPPED in
+   the Phase 2 refactor (commit `70a70a7`).** Available as `Params.good_bias`;
+   eval showed that non-1.0 values are a pure fp/fn tradeoff dial with no
+   aggregate accuracy gain, so keeping the default off and leaving per-user
+   tuning to the shadow-mode phase.
 
-5. **Token length bounds loosened to `1..=90`.** Recovers currency codes, initials, "rx", and long URL/base64 fragments. Long tokens hashed to fixed-length blobs rather than stored raw, to keep schema sane.
+5. **`min_word_count` gate — config-exposed, default 0 (off). SHIPPED in
+   commit `70a70a7`.** Eval showed this actively hurts accuracy on the
+   admin db (values 3 or 5 roughly doubled fp) because it prunes the
+   informative long tail of rarely-observed but strongly-discriminating
+   tokens. Likely useful for cold/thin corpora — kept as config for
+   per-user tuning, not a default.
 
-6. **Header coverage: add to/cc, distinguish first-Received from subsequent (`Hrecv_`/`Hrecvx_`).**
+6. **Token length bounds loosened to `1..=90`. DEFERRED to after shadow
+   mode.** Exposed as `TokenizerConfig.min_len` / `max_len` in commit
+   `70a70a7`, but not made the default because it mostly affects newly-
+   tokenised messages against the existing db (which only knows old-bound
+   tokens) — needs retrained corpora to evaluate fairly.
+
+7. **Expanded header coverage — config-exposed, DEFERRED to after
+   shadow mode.** Implemented as `TokenizerConfig.expanded_headers` in
+   commit `70a70a7`: adds `h:to:*`, `h:cc:*`, and splits the received
+   chain into `h:hrecv:*` (first hop) / `h:hrecvx:*` (subsequent). Same
+   problem as item 6: the new token prefixes are unknown to every existing
+   db, so the eval shows a small regression. Proper evaluation requires
+   either retraining or a freshly-captured corpus.
 
 ### Phase 3 — Structural improvements
 
