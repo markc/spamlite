@@ -29,6 +29,15 @@ pub struct Params {
     pub max_interesting: usize,
     /// Score at or above which we classify as spam (default 0.5)
     pub threshold: f64,
+    /// Weight applied to ham evidence when computing per-token raw probability.
+    /// `raw_p = spam / (spam + good_bias * good)`. `1.0` disables the bias
+    /// (symmetric). Spamprobe uses `2.0`; we default to `1.0` and rely on
+    /// per-user threshold tuning for cost asymmetry.
+    pub good_bias: f64,
+    /// Minimum (good + spam) occurrences for a token to contribute its computed
+    /// probability. Tokens below this fall back to `unknown_prob`. Reduces noise
+    /// from thinly-observed tokens. `0` disables the gate.
+    pub min_word_count: u64,
 }
 
 impl Default for Params {
@@ -38,6 +47,8 @@ impl Default for Params {
             unknown_prob: 0.5,
             max_interesting: 150,
             threshold: 0.5,
+            good_bias: 1.0,
+            min_word_count: 0,
         }
     }
 }
@@ -73,14 +84,19 @@ pub fn classify(
 
     for word in token_words {
         let fw = if let Some(token) = known_map.get(word.as_str()) {
-            let pw = token.spam as f64 / total_spam;
-            let qw = token.good as f64 / total_good;
-            let denom = pw + qw;
-            let raw_p = if denom > 0.0 { pw / denom } else { 0.5 };
+            let n = token.good + token.spam;
+            if n < params.min_word_count {
+                params.unknown_prob
+            } else {
+                let pw = token.spam as f64 / total_spam;
+                let qw = token.good as f64 / total_good;
+                let denom = pw + params.good_bias * qw;
+                let raw_p = if denom > 0.0 { pw / denom } else { 0.5 };
 
-            let n = (token.good + token.spam) as f64;
-            // Robinson's Bayesian correction
-            (params.strength * params.unknown_prob + n * raw_p) / (params.strength + n)
+                let nf = n as f64;
+                // Robinson's Bayesian correction
+                (params.strength * params.unknown_prob + nf * raw_p) / (params.strength + nf)
+            }
         } else {
             // Unknown token — use unknown_prob
             params.unknown_prob
@@ -209,12 +225,17 @@ pub fn classify_explain(
     let mut entries: Vec<FisherEntry> = Vec::with_capacity(token_words.len());
     for word in token_words {
         if let Some(token) = known_map.get(word.as_str()) {
+            let n = token.good + token.spam;
+            if n < params.min_word_count {
+                entries.push(FisherEntry::Unknown(params.unknown_prob));
+                continue;
+            }
             let pw = token.spam as f64 / total_spam;
             let qw = token.good as f64 / total_good;
-            let denom = pw + qw;
+            let denom = pw + params.good_bias * qw;
             let raw_p = if denom > 0.0 { pw / denom } else { 0.5 };
-            let n = (token.good + token.spam) as f64;
-            let fw = (params.strength * params.unknown_prob + n * raw_p) / (params.strength + n);
+            let nf = n as f64;
+            let fw = (params.strength * params.unknown_prob + nf * raw_p) / (params.strength + nf);
             entries.push(FisherEntry::Known(TokenDetail {
                 word: (*word).clone(),
                 good: token.good,
