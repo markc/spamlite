@@ -43,7 +43,7 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Params {
-            strength: 1.0,
+            strength: 0.5,
             unknown_prob: 0.45,
             max_interesting: 50,
             threshold: 0.5,
