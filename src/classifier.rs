@@ -128,6 +128,181 @@ pub fn classify(
     Ok((verdict, score))
 }
 
+/// One token's contribution to a classification decision, as returned by
+/// `classify_explain`. `fw` is the Robinson-corrected spam probability
+/// (0.0 = definitely ham, 1.0 = definitely spam, 0.5 = uninformative).
+#[derive(Debug, Clone)]
+pub struct TokenDetail {
+    pub word: String,
+    pub good: u64,
+    pub spam: u64,
+    pub fw: f64,
+}
+
+/// Full breakdown of a classification decision, returned by `classify_explain`.
+/// Intended for debugging individual messages — e.g. why a balanced-corpus user
+/// like cam@ck20 gets fp on specific messages. Do not call from the sieve hot
+/// path; use `classify` instead.
+#[derive(Debug)]
+pub struct Explanation {
+    pub verdict: Verdict,
+    pub score: f64,
+    pub total_good: u64,
+    pub total_spam: u64,
+    pub msg_tokens: usize,
+    pub known_tokens: usize,
+    /// Interesting tokens (farthest from 0.5), sorted by distance descending,
+    /// truncated to `params.max_interesting`. Excludes unknown tokens — their
+    /// `fw` is always `unknown_prob` and they contribute zero discrimination.
+    pub top_tokens: Vec<TokenDetail>,
+    pub h_spam: f64,
+    pub h_ham: f64,
+    pub p_spam: f64,
+    pub p_ham: f64,
+}
+
+/// Like `classify`, but retains per-token detail for debugging. Returns an
+/// `Explanation` with the full breakdown. The math is identical to `classify`
+/// — if this function and `classify` ever diverge, `classify` wins.
+pub fn classify_explain(
+    db: &Database,
+    token_words: &[String],
+    params: &Params,
+) -> rusqlite::Result<Explanation> {
+    let total_good_raw = db.total_good()?;
+    let total_spam_raw = db.total_spam()?;
+    let total_good = (total_good_raw as f64).max(1.0);
+    let total_spam = (total_spam_raw as f64).max(1.0);
+
+    if total_good_raw < 1 && total_spam_raw < 1 {
+        return Ok(Explanation {
+            verdict: Verdict::Good,
+            score: 0.5,
+            total_good: 0,
+            total_spam: 0,
+            msg_tokens: token_words.len(),
+            known_tokens: 0,
+            top_tokens: Vec::new(),
+            h_spam: 0.0,
+            h_ham: 0.0,
+            p_spam: 0.0,
+            p_ham: 0.0,
+        });
+    }
+
+    let known_tokens_vec = db.lookup_tokens(token_words)?;
+    let known_count = known_tokens_vec.len();
+    let known_map: std::collections::HashMap<&str, &Token> = known_tokens_vec
+        .iter()
+        .map(|t| (t.word.as_str(), t))
+        .collect();
+
+    // Build the full probs list — one entry per input token, known or unknown.
+    // Known tokens carry their word+counts; unknowns are represented by their
+    // `unknown_prob` probability without a word (no display purpose). We keep
+    // them in the fisher math because `classify` does and the two functions
+    // must agree on the final score.
+    enum FisherEntry {
+        Known(TokenDetail),
+        Unknown(f64),
+    }
+    let mut entries: Vec<FisherEntry> = Vec::with_capacity(token_words.len());
+    for word in token_words {
+        if let Some(token) = known_map.get(word.as_str()) {
+            let pw = token.spam as f64 / total_spam;
+            let qw = token.good as f64 / total_good;
+            let denom = pw + qw;
+            let raw_p = if denom > 0.0 { pw / denom } else { 0.5 };
+            let n = (token.good + token.spam) as f64;
+            let fw = (params.strength * params.unknown_prob + n * raw_p) / (params.strength + n);
+            entries.push(FisherEntry::Known(TokenDetail {
+                word: (*word).clone(),
+                good: token.good,
+                spam: token.spam,
+                fw,
+            }));
+        } else {
+            entries.push(FisherEntry::Unknown(params.unknown_prob));
+        }
+    }
+
+    // Sort by distance from 0.5 descending (most interesting first) — identical
+    // to `classify`. Unknown tokens have distance 0 and sort to the tail.
+    entries.sort_by(|a, b| {
+        let fa = match a {
+            FisherEntry::Known(d) => d.fw,
+            FisherEntry::Unknown(p) => *p,
+        };
+        let fb = match b {
+            FisherEntry::Known(d) => d.fw,
+            FisherEntry::Unknown(p) => *p,
+        };
+        let da = (fa - 0.5).abs();
+        let db = (fb - 0.5).abs();
+        db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    entries.truncate(params.max_interesting);
+
+    if entries.is_empty() {
+        return Ok(Explanation {
+            verdict: Verdict::Good,
+            score: 0.5,
+            total_good: total_good_raw,
+            total_spam: total_spam_raw,
+            msg_tokens: token_words.len(),
+            known_tokens: known_count,
+            top_tokens: Vec::new(),
+            h_spam: 0.0,
+            h_ham: 0.0,
+            p_spam: 0.0,
+            p_ham: 0.0,
+        });
+    }
+
+    let n = entries.len();
+    let fws: Vec<f64> = entries
+        .iter()
+        .map(|e| match e {
+            FisherEntry::Known(d) => d.fw,
+            FisherEntry::Unknown(p) => *p,
+        })
+        .collect();
+    let h_spam: f64 = -2.0 * fws.iter().map(|&f| (1.0 - f).max(1e-200).ln()).sum::<f64>();
+    let h_ham: f64 = -2.0 * fws.iter().map(|&f| f.max(1e-200).ln()).sum::<f64>();
+    let p_spam = 1.0 - chi2_cdf(h_spam, 2 * n);
+    let p_ham = 1.0 - chi2_cdf(h_ham, 2 * n);
+    let score = ((1.0 + p_spam - p_ham) / 2.0).clamp(0.0, 1.0);
+    let verdict = if score >= params.threshold {
+        Verdict::Spam
+    } else {
+        Verdict::Good
+    };
+
+    // For display, extract only the known tokens from the top-N Fisher set.
+    // Unknowns at 0.5 are not useful to show and would clutter the output.
+    let top_tokens: Vec<TokenDetail> = entries
+        .into_iter()
+        .filter_map(|e| match e {
+            FisherEntry::Known(d) => Some(d),
+            FisherEntry::Unknown(_) => None,
+        })
+        .collect();
+
+    Ok(Explanation {
+        verdict,
+        score,
+        total_good: total_good_raw,
+        total_spam: total_spam_raw,
+        msg_tokens: token_words.len(),
+        known_tokens: known_count,
+        top_tokens,
+        h_spam,
+        h_ham,
+        p_spam,
+        p_ham,
+    })
+}
+
 /// Chi-squared cumulative distribution function (survival function).
 /// Simple series expansion — accurate for the degrees of freedom we use.
 fn chi2_cdf(x: f64, df: usize) -> f64 {
@@ -222,6 +397,55 @@ mod tests {
         let (verdict, score) = classify(&db, &tokens, &params).unwrap();
         assert_eq!(verdict, Verdict::Good);
         assert!((score - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_classify_explain_matches_classify() {
+        let db = setup_db();
+        let params = Params::default();
+        let msgs: Vec<Vec<String>> = vec![
+            vec![
+                "h:subject:buy".into(),
+                "h:subject:now".into(),
+                "b:viagra".into(),
+                "b:discount".into(),
+            ],
+            vec![
+                "h:subject:meeting".into(),
+                "b:agenda".into(),
+                "b:discuss".into(),
+            ],
+            vec!["b:totally_unknown".into(), "b:another_unknown".into()],
+        ];
+        for msg in msgs {
+            let (v1, s1) = classify(&db, &msg, &params).unwrap();
+            let expl = classify_explain(&db, &msg, &params).unwrap();
+            assert_eq!(v1, expl.verdict, "verdict mismatch for {msg:?}");
+            assert!(
+                (s1 - expl.score).abs() < 1e-9,
+                "score mismatch for {msg:?}: classify={s1} explain={}",
+                expl.score
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_explain_retains_token_details() {
+        let db = setup_db();
+        let params = Params::default();
+        let msg: Vec<String> = vec![
+            "b:viagra".into(),
+            "b:discount".into(),
+            "b:never_seen".into(),
+        ];
+        let expl = classify_explain(&db, &msg, &params).unwrap();
+        assert_eq!(expl.msg_tokens, 3);
+        assert_eq!(expl.known_tokens, 2); // "b:never_seen" is unknown
+        assert_eq!(expl.top_tokens.len(), 2);
+        for tok in &expl.top_tokens {
+            assert!(tok.spam > 0 || tok.good > 0);
+            assert!(tok.word == "b:viagra" || tok.word == "b:discount");
+        }
     }
 
     #[test]

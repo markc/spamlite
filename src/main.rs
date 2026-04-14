@@ -157,6 +157,94 @@ fn cmd_train(is_spam: bool) {
     }
 }
 
+/// explain = classify + verbose breakdown of top interesting tokens. Read-only.
+/// Intended for debugging individual messages — e.g. "why is this ham scoring
+/// as spam?" The output shows the Robinson-corrected probability f(w) for
+/// each token that made the top-N interesting set, sorted most-interesting
+/// first. A bar visualises direction (left = ham-indicative, right = spam).
+fn cmd_explain() {
+    let raw = read_stdin();
+    let tokens = tokenizer::tokenize(&raw);
+    let db = open_db();
+    let mut params = Params::default();
+    if let Some(&t) = THRESHOLD.get() {
+        params.threshold = t;
+    }
+
+    let expl = match classifier::classify_explain(&db, &tokens, &params) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("spamlite: classification error: {e}");
+            process::exit(1);
+        }
+    };
+
+    println!("spamlite explain");
+    println!();
+    println!(
+        "Message:  {} tokens total, {} known to DB, {} unknown",
+        expl.msg_tokens,
+        expl.known_tokens,
+        expl.msg_tokens.saturating_sub(expl.known_tokens)
+    );
+    println!(
+        "Database: good={}  spam={}",
+        expl.total_good, expl.total_spam
+    );
+    println!(
+        "Verdict:  {} score={:.6}  (threshold={:.3})",
+        expl.verdict, expl.score, params.threshold
+    );
+    println!(
+        "Fisher:   H_spam={:.2}  H_ham={:.2}  P_spam={:.4}  P_ham={:.4}",
+        expl.h_spam, expl.h_ham, expl.p_spam, expl.p_ham
+    );
+    println!();
+
+    if expl.top_tokens.is_empty() {
+        println!("(no known tokens in message — nothing to explain)");
+        return;
+    }
+
+    let display_limit = 40.min(expl.top_tokens.len());
+    println!(
+        "Top {} interesting tokens (of {} used in Fisher combining):",
+        display_limit,
+        expl.top_tokens.len()
+    );
+    println!();
+    println!(
+        "  {:<44}  {:>6}  {:>6}  {:>7}  direction",
+        "word", "good", "spam", "f(w)"
+    );
+    println!("  {:-<44}  {:-<6}  {:-<6}  {:-<7}  ---------", "", "", "", "");
+
+    for tok in expl.top_tokens.iter().take(display_limit) {
+        // Bar: 11 cells, centre is 0.5. Left half = ham, right half = spam.
+        let bar = {
+            let pos = (tok.fw * 10.0).round() as i32;
+            let pos = pos.clamp(0, 10) as usize;
+            let mut s = [' '; 11];
+            s[pos] = if tok.fw >= 0.5 { '>' } else { '<' };
+            s[5] = if s[5] == ' ' { '|' } else { s[5] };
+            s.iter().collect::<String>()
+        };
+        let word_trunc: String = tok.word.chars().take(44).collect();
+        println!(
+            "  {:<44}  {:>6}  {:>6}  {:>7.4}  {}",
+            word_trunc, tok.good, tok.spam, tok.fw, bar
+        );
+    }
+
+    if expl.top_tokens.len() > display_limit {
+        println!();
+        println!(
+            "(...{} more tokens in Fisher set, not shown)",
+            expl.top_tokens.len() - display_limit
+        );
+    }
+}
+
 fn cmd_counts() {
     let db = open_db();
     match db.counts() {
@@ -220,6 +308,7 @@ MIT License — https://github.com/markc/spamlite
 Usage:
   spamlite [-d DIR] [-t THRESHOLD] [-g GATE] receive   Classify + train on confident verdicts
   spamlite [-d DIR] [-t THRESHOLD] score               Classify only (read-only, no training)
+  spamlite [-d DIR] [-t THRESHOLD] explain             Verbose token-level breakdown (debug)
   spamlite [-d DIR] spam                               Train message from stdin as spam
   spamlite [-d DIR] good                               Train message from stdin as good/ham
   spamlite [-d DIR] counts                             Show database statistics
@@ -337,6 +426,7 @@ fn main() {
     match args[0].as_str() {
         "receive" => cmd_receive(),
         "score" => cmd_score(),
+        "explain" => cmd_explain(),
         "spam" => cmd_train(true),
         "good" => cmd_train(false),
         "counts" => cmd_counts(),
