@@ -28,6 +28,10 @@ path = "src/bin/harvest.rs"
 name = "spamlite-correlate"
 path = "src/bin/correlate.rs"
 
+[[bin]]
+name = "spamlite-shadow-report"
+path = "src/bin/shadow_report.rs"
+
 [profile.release]
 opt-level = "z"
 lto = true

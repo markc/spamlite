@@ -1,0 +1,58 @@
+#!/bin/bash
+# spamfilter — dispatch spamlite/spamprobe + optional shadow-mode observation.
+#
+# Invocation (from /etc/dovecot/sieve/global.sieve):
+#   spamfilter /srv/{domain}/msg/{user} receive
+#
+# Shadow mode runs a candidate binary (/usr/local/bin/spamlite-0.4.0)
+# alongside the primary for users listed in /etc/spamlite-shadow.allow. A
+# literal `*` line enables shadowing cluster-wide. The candidate is always
+# invoked as `score` (read-only, no db writes) and its verdict is logged to
+# the user's .spamlite/shadow.jsonl. Shadow failures are silent; stdout and
+# exit code are determined entirely by the primary path.
+#
+# Side benefit: lowercases $DIR before use, working around a pre-existing
+# sieve-script bug where ${lhs}/${rhs} aren't lowercased and uppercase
+# recipient addresses (e.g. SCOTT@PROMANTT.COM.AU) would land in a path
+# that does not exist.
+
+DIR="$1"; shift
+CMD="$1"; shift
+DIR="${DIR,,}"  # bash 4+ lowercase — fixes uppercase-recipient delivery bug
+
+# Buffer stdin so both primary and candidate can read the same message
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+cat > "$TMP"
+
+# Primary path — determines delivery. Absolute paths to avoid PATH issues.
+if [[ -d "$DIR/.spamlite" ]]; then
+    PRIMARY=$(/usr/local/bin/spamlite -d "$DIR/.spamlite" -t 0.6 "$CMD" < "$TMP")
+else
+    PRIMARY=$(/usr/bin/spamprobe -c -d "$DIR/.spamprobe" "$CMD" < "$TMP")
+fi
+PRIMARY_RC=$?
+
+# Shadow mode — observability only, best-effort, never affects delivery
+if [[ -x /usr/local/bin/spamlite-0.4.0 ]] \
+   && [[ -d "$DIR/.spamlite" ]] \
+   && [[ "$CMD" == "receive" || "$CMD" == "score" ]] \
+   && [[ -r /etc/spamlite-shadow.allow ]]; then
+    USER_NAME=$(basename "$DIR")
+    DOMAIN_NAME=$(basename "$(dirname "$(dirname "$DIR")")")
+    USER_ID="${USER_NAME}@${DOMAIN_NAME}"
+    if grep -qxF '*' /etc/spamlite-shadow.allow 2>/dev/null \
+       || grep -qxF "$USER_ID" /etc/spamlite-shadow.allow 2>/dev/null; then
+        CAND=$(timeout 2s /usr/local/bin/spamlite-0.4.0 \
+            -d "$DIR/.spamlite" -t 0.6 score < "$TMP" 2>/dev/null)
+        if [[ -n "$CAND" ]]; then
+            TS=$(date -u +%FT%TZ)
+            printf '{"t":"%s","v":"0.4.0","cmd":"%s","user":"%s","primary":"%s","cand":"%s"}\n' \
+                "$TS" "$CMD" "$USER_ID" "$PRIMARY" "$CAND" \
+                >> "$DIR/.spamlite/shadow.jsonl" 2>/dev/null
+        fi
+    fi
+fi
+
+printf '%s' "$PRIMARY"
+exit $PRIMARY_RC
