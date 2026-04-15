@@ -1,0 +1,30 @@
+#!/bin/bash
+# spamlite-daily-digest — wraps the threshold digest + shadow-mode report
+# into a single email body, intended to be piped to sendmail from cron.
+#
+# Installed at /usr/local/bin/spamlite-daily-digest on mrn. Invoked by
+# /etc/cron.d/spamlite-threshold-digest at 04:30 daily.
+#
+# The threshold digest (Mix script) is the authoritative daily report.
+# The shadow-mode section only renders if there are shadow.jsonl files
+# on disk, so it silently disappears if shadow mode is disabled.
+
+set -o pipefail
+
+# Section 1 — threshold digest (always)
+/usr/local/bin/spamlite-threshold-digest
+DIGEST_RC=$?
+
+# Section 2 — shadow-mode divergence (only if any shadow.jsonl exists)
+SHADOW_FILES=$(find /srv -maxdepth 5 -name shadow.jsonl 2>/dev/null)
+if [[ -n "$SHADOW_FILES" ]] && [[ -x /usr/local/bin/spamlite-shadow-report ]]; then
+    echo
+    echo "=============================================================="
+    echo "Shadow mode divergence (spamlite-0.4.0 candidate vs 0.2.0 primary)"
+    echo "=============================================================="
+    echo
+    echo "$SHADOW_FILES" | tr '\n' '\0' \
+        | xargs -0 /usr/local/bin/spamlite-shadow-report 2>&1
+fi
+
+exit $DIGEST_RC
