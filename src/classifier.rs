@@ -43,12 +43,108 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Params {
-            strength: 0.5,
-            unknown_prob: 0.45,
-            max_interesting: 50,
+            strength: 1.0,
+            unknown_prob: 0.5,
+            max_interesting: 150,
             threshold: 0.5,
             good_bias: 1.0,
             min_word_count: 0,
+        }
+    }
+}
+
+impl Params {
+    /// Load per-user overrides from `<db_dir>/params.toml`. Unknown keys are
+    /// ignored. Missing file is silently treated as defaults. Parse errors
+    /// emit a warning but fall back to defaults — never break delivery.
+    ///
+    /// File format is intentionally simple key=value:
+    ///
+    /// ```text
+    /// # comments allowed
+    /// strength = 0.5
+    /// unknown_prob = 0.45
+    /// max_interesting = 50
+    /// threshold = 0.7
+    /// good_bias = 1.0
+    /// min_word_count = 0
+    /// ```
+    pub fn load_overrides(&mut self, db_dir: &std::path::Path) {
+        let path = db_dir.join("params.toml");
+        let body = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for (lineno, raw) in body.lines().enumerate() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                eprintln!(
+                    "spamlite: {}:{}: expected key = value, got {raw:?}",
+                    path.display(),
+                    lineno + 1
+                );
+                continue;
+            };
+            let k = k.trim();
+            let v = v.trim();
+            let parse_f = |v: &str, field: &str| {
+                v.parse::<f64>().map_err(|e| {
+                    eprintln!(
+                        "spamlite: {}:{}: {field}: bad number {v:?}: {e}",
+                        path.display(),
+                        lineno + 1
+                    );
+                })
+            };
+            let parse_u = |v: &str, field: &str| {
+                v.parse::<u64>().map_err(|e| {
+                    eprintln!(
+                        "spamlite: {}:{}: {field}: bad integer {v:?}: {e}",
+                        path.display(),
+                        lineno + 1
+                    );
+                })
+            };
+            match k {
+                "strength" => {
+                    if let Ok(x) = parse_f(v, k) {
+                        self.strength = x;
+                    }
+                }
+                "unknown_prob" => {
+                    if let Ok(x) = parse_f(v, k) {
+                        self.unknown_prob = x;
+                    }
+                }
+                "max_interesting" => {
+                    if let Ok(x) = parse_u(v, k) {
+                        self.max_interesting = x as usize;
+                    }
+                }
+                "threshold" => {
+                    if let Ok(x) = parse_f(v, k) {
+                        self.threshold = x;
+                    }
+                }
+                "good_bias" => {
+                    if let Ok(x) = parse_f(v, k) {
+                        self.good_bias = x;
+                    }
+                }
+                "min_word_count" => {
+                    if let Ok(x) = parse_u(v, k) {
+                        self.min_word_count = x;
+                    }
+                }
+                _ => eprintln!(
+                    "spamlite: {}:{}: unknown key {k:?} (ignored)",
+                    path.display(),
+                    lineno + 1
+                ),
+            }
         }
     }
 }
@@ -142,6 +238,76 @@ pub fn classify(
     };
 
     Ok((verdict, score))
+}
+
+/// One message represented as the per-token (good_count, spam_count) pairs
+/// already fetched from the database. `None` means the token is unknown.
+/// Used by `spamlite-tune` to sweep parameters in memory without re-hitting
+/// the database for every combination — the SQL phase costs ~ms/message and
+/// dominates a parameter sweep otherwise.
+pub type CountedTokens = Vec<Option<(u64, u64)>>;
+
+/// Compute spam probability from already-fetched per-token (good, spam) counts.
+/// Math is identical to `classify`'s inner loop — the only difference is that
+/// the SQL lookup has been hoisted out so this function runs in pure CPU time.
+/// If `classify_from_counts` and `classify` ever drift, `classify` is the
+/// authoritative implementation.
+pub fn classify_from_counts(
+    counts: &CountedTokens,
+    total_good: u64,
+    total_spam: u64,
+    params: &Params,
+) -> (Verdict, f64) {
+    if total_good < 1 && total_spam < 1 {
+        return (Verdict::Good, 0.5);
+    }
+    let total_good = (total_good as f64).max(1.0);
+    let total_spam = (total_spam as f64).max(1.0);
+
+    let mut fws: Vec<f64> = Vec::with_capacity(counts.len());
+    for c in counts {
+        let fw = match *c {
+            Some((good, spam)) => {
+                let n = good + spam;
+                if n < params.min_word_count {
+                    params.unknown_prob
+                } else {
+                    let pw = spam as f64 / total_spam;
+                    let qw = good as f64 / total_good;
+                    let denom = pw + params.good_bias * qw;
+                    let raw_p = if denom > 0.0 { pw / denom } else { 0.5 };
+                    let nf = n as f64;
+                    (params.strength * params.unknown_prob + nf * raw_p) / (params.strength + nf)
+                }
+            }
+            None => params.unknown_prob,
+        };
+        fws.push(fw);
+    }
+
+    fws.sort_by(|a, b| {
+        let da = (a - 0.5).abs();
+        let db = (b - 0.5).abs();
+        db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    fws.truncate(params.max_interesting);
+
+    if fws.is_empty() {
+        return (Verdict::Good, 0.5);
+    }
+
+    let n = fws.len();
+    let h_spam: f64 = -2.0 * fws.iter().map(|&f| (1.0 - f).max(1e-200).ln()).sum::<f64>();
+    let h_ham: f64 = -2.0 * fws.iter().map(|&f| f.max(1e-200).ln()).sum::<f64>();
+    let p_spam = 1.0 - chi2_cdf(h_spam, 2 * n);
+    let p_ham = 1.0 - chi2_cdf(h_ham, 2 * n);
+    let score = ((1.0 + p_spam - p_ham) / 2.0).clamp(0.0, 1.0);
+    let verdict = if score >= params.threshold {
+        Verdict::Spam
+    } else {
+        Verdict::Good
+    };
+    (verdict, score)
 }
 
 /// One token's contribution to a classification decision, as returned by

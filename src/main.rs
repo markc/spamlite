@@ -65,14 +65,24 @@ fn open_db() -> Database {
     })
 }
 
+/// Build runtime params: compiled defaults, then `<db_dir>/params.toml`
+/// per-user overrides, then `-t` CLI flag (wins over both).
+fn make_params() -> Params {
+    let mut params = Params::default();
+    if let Some(parent) = db_path().parent() {
+        params.load_overrides(parent);
+    }
+    if let Some(&t) = THRESHOLD.get() {
+        params.threshold = t;
+    }
+    params
+}
+
 fn cmd_score() {
     let raw = read_stdin();
     let tokens = tokenizer::tokenize(&raw);
     let db = open_db();
-    let mut params = Params::default();
-    if let Some(&t) = THRESHOLD.get() {
-        params.threshold = t;
-    }
+    let params = make_params();
 
     match classifier::classify(&db, &tokens, &params) {
         Ok((verdict, score)) => {
@@ -101,10 +111,7 @@ fn cmd_receive() {
     let raw = read_stdin();
     let tokens = tokenizer::tokenize(&raw);
     let db = open_db();
-    let mut params = Params::default();
-    if let Some(&t) = THRESHOLD.get() {
-        params.threshold = t;
-    }
+    let params = make_params();
     let gate = TOE_GATE.get().copied().unwrap_or(TOE_GATE_DEFAULT);
 
     match classifier::classify(&db, &tokens, &params) {
@@ -166,10 +173,7 @@ fn cmd_explain() {
     let raw = read_stdin();
     let tokens = tokenizer::tokenize(&raw);
     let db = open_db();
-    let mut params = Params::default();
-    if let Some(&t) = THRESHOLD.get() {
-        params.threshold = t;
-    }
+    let params = make_params();
 
     let expl = match classifier::classify_explain(&db, &tokens, &params) {
         Ok(e) => e,

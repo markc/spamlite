@@ -240,9 +240,13 @@ fn normalize_url(url: &str, max_len: usize) -> String {
     // Strip query string and fragment
     let url = url.split('?').next().unwrap_or(&url);
     let url = url.split('#').next().unwrap_or(url);
-    // Truncate to max token length
+    // Truncate to max token length, respecting char boundaries for multi-byte UTF-8
     if url.len() > max_len {
-        url[..max_len].to_string()
+        let mut end = max_len;
+        while end > 0 && !url.is_char_boundary(end) {
+            end -= 1;
+        }
+        url[..end].to_string()
     } else {
         url.to_string()
     }

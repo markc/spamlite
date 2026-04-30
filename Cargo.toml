@@ -1,6 +1,6 @@
 [package]
 name = "spamlite"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Per-user Bayesian spam filter — drop-in spamprobe replacement"
 license = "MIT"
@@ -31,6 +31,10 @@ path = "src/bin/correlate.rs"
 [[bin]]
 name = "spamlite-shadow-report"
 path = "src/bin/shadow_report.rs"
+
+[[bin]]
+name = "spamlite-tune"
+path = "src/bin/tune.rs"
 
 [profile.release]
 opt-level = "z"
