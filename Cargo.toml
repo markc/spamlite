@@ -1,6 +1,6 @@
 [package]
 name = "spamlite"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 description = "Per-user Bayesian spam filter — drop-in spamprobe replacement"
 license = "MIT"
@@ -39,6 +39,9 @@ path = "src/bin/tune.rs"
 [profile.release]
 opt-level = "z"
 lto = true
-panic = "abort"
+# panic = "unwind" (default) is REQUIRED: the sieve hot path fail-open guard
+# in main.rs uses catch_unwind, which is inert under panic = "abort". The
+# abort setting is also what turned the v0.2.0 tokenizer panic into a
+# SIGABRT/exit-134 and six weeks of unfiltered deliveries for one user.
 strip = true
 codegen-units = 1

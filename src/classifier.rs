@@ -108,35 +108,71 @@ impl Params {
                     );
                 })
             };
+            // Range guards: an out-of-range value is rejected (default kept),
+            // not clamped — silently "repairing" a corrupt file hides the
+            // problem. Out-of-range params don't crash the classifier but they
+            // produce nonsense scores that fail open, which is worse than
+            // ignoring the file.
+            let reject = |field: &str, v: &str, range: &str| {
+                eprintln!(
+                    "spamlite: {}:{}: {field} = {v} out of range ({range}); keeping default",
+                    path.display(),
+                    lineno + 1
+                );
+            };
             match k {
                 "strength" => {
                     if let Ok(x) = parse_f(v, k) {
-                        self.strength = x;
+                        if (0.0..=100.0).contains(&x) {
+                            self.strength = x;
+                        } else {
+                            reject(k, v, "0.0..=100.0");
+                        }
                     }
                 }
                 "unknown_prob" => {
                     if let Ok(x) = parse_f(v, k) {
-                        self.unknown_prob = x;
+                        if (0.0..=1.0).contains(&x) {
+                            self.unknown_prob = x;
+                        } else {
+                            reject(k, v, "0.0..=1.0");
+                        }
                     }
                 }
                 "max_interesting" => {
                     if let Ok(x) = parse_u(v, k) {
-                        self.max_interesting = x as usize;
+                        if (1..=10_000).contains(&x) {
+                            self.max_interesting = x as usize;
+                        } else {
+                            reject(k, v, "1..=10000");
+                        }
                     }
                 }
                 "threshold" => {
                     if let Ok(x) = parse_f(v, k) {
-                        self.threshold = x;
+                        if (0.0..=1.0).contains(&x) {
+                            self.threshold = x;
+                        } else {
+                            reject(k, v, "0.0..=1.0");
+                        }
                     }
                 }
                 "good_bias" => {
                     if let Ok(x) = parse_f(v, k) {
-                        self.good_bias = x;
+                        if x > 0.0 && x <= 100.0 {
+                            self.good_bias = x;
+                        } else {
+                            reject(k, v, ">0.0..=100.0");
+                        }
                     }
                 }
                 "min_word_count" => {
                     if let Ok(x) = parse_u(v, k) {
-                        self.min_word_count = x;
+                        if x <= 1_000_000 {
+                            self.min_word_count = x;
+                        } else {
+                            reject(k, v, "0..=1000000");
+                        }
                     }
                 }
                 _ => eprintln!(
@@ -633,6 +669,28 @@ mod tests {
             assert!(tok.spam > 0 || tok.good > 0);
             assert!(tok.word == "b:viagra" || tok.word == "b:discount");
         }
+    }
+
+    #[test]
+    fn test_load_overrides_rejects_out_of_range() {
+        let dir = std::env::temp_dir().join(format!("spamlite-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("params.toml"),
+            "strength = -1.0\nunknown_prob = 2.0\nthreshold = 5.0\ngood_bias = 0.0\nmax_interesting = 0\nmin_word_count = 99\n",
+        )
+        .unwrap();
+        let mut p = Params::default();
+        p.load_overrides(&dir);
+        // All out-of-range values rejected — defaults kept
+        assert_eq!(p.strength, 1.0);
+        assert_eq!(p.unknown_prob, 0.5);
+        assert_eq!(p.threshold, 0.5);
+        assert_eq!(p.good_bias, 1.0);
+        assert_eq!(p.max_interesting, 150);
+        // In-range value accepted
+        assert_eq!(p.min_word_count, 99);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

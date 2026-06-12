@@ -80,15 +80,6 @@ impl Database {
             })
     }
 
-    /// Set a meta value
-    fn set_meta(&self, key: &str, value: u64) -> SqlResult<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            params![key, value.to_string()],
-        )?;
-        Ok(())
-    }
-
     /// Get total good message count
     pub fn total_good(&self) -> SqlResult<u64> {
         self.get_meta("total_good")
@@ -99,16 +90,25 @@ impl Database {
         self.get_meta("total_spam")
     }
 
+    /// Atomically increment a meta counter. A single UPDATE avoids the
+    /// read-modify-write lost-update race when two deliveries for the same
+    /// user run concurrently (dovecot lmtp can and does parallelise).
+    fn inc_meta(&self, key: &str) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ?1",
+            params![key],
+        )?;
+        Ok(())
+    }
+
     /// Increment total good count
     pub fn inc_total_good(&self) -> SqlResult<()> {
-        let n = self.total_good()? + 1;
-        self.set_meta("total_good", n)
+        self.inc_meta("total_good")
     }
 
     /// Increment total spam count
     pub fn inc_total_spam(&self) -> SqlResult<()> {
-        let n = self.total_spam()? + 1;
-        self.set_meta("total_spam", n)
+        self.inc_meta("total_spam")
     }
 
     /// Batch-lookup tokens by word. Returns only tokens that exist in the DB.
@@ -242,6 +242,12 @@ impl Database {
 
         for row in rows {
             let (word, good, spam) = row?;
+            // Skip tokens that would corrupt the CSV line format. A `"` can
+            // reach the db via a single-quoted href URL; control chars never
+            // should but cost nothing to guard. Such tokens are junk signal.
+            if word.contains('"') || word.chars().any(|c| c.is_control()) {
+                continue;
+            }
             writeln!(writer, "{good},{spam},0,\"{word}\"").ok();
         }
 

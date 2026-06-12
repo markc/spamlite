@@ -48,14 +48,34 @@ fn db_path() -> PathBuf {
     PathBuf::from(".spamlite").join("db.sqlite")
 }
 
+/// Hard cap on message bytes read from stdin. Real mail is bounded well below
+/// this by the MTA's message_size_limit; the cap only protects against a
+/// misconfigured pipe feeding unbounded data. Truncation at this size does not
+/// meaningfully affect classification — the discriminating tokens of any real
+/// message appear long before 64 MiB.
+const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
+
 fn read_stdin() -> Vec<u8> {
     let mut buf = Vec::new();
-    io::stdin().read_to_end(&mut buf).unwrap_or_else(|e| {
-        eprintln!("spamlite: failed to read stdin: {e}");
-        process::exit(1);
-    });
+    io::stdin()
+        .take(MAX_STDIN_BYTES)
+        .read_to_end(&mut buf)
+        .unwrap_or_else(|e| {
+            eprintln!("spamlite: failed to read stdin: {e}");
+            process::exit(1);
+        });
+    if buf.len() as u64 == MAX_STDIN_BYTES {
+        eprintln!("spamlite: stdin truncated at {MAX_STDIN_BYTES} bytes");
+    }
     buf
 }
+
+/// Neutral verdict emitted when the sieve hot path fails open. A panic
+/// anywhere in tokenize/classify must NOT abort the process: sieve captures
+/// stdout, and an empty capture means the message is delivered unfiltered
+/// with a logged exit 134 (exactly how the v0.2.0 CJK-URL tokenizer panic
+/// presented in production for six weeks).
+const FAIL_OPEN_VERDICT: &str = "GOOD 0.500000";
 
 fn open_db() -> Database {
     let path = db_path();
@@ -80,17 +100,21 @@ fn make_params() -> Params {
 
 fn cmd_score() {
     let raw = read_stdin();
-    let tokens = tokenizer::tokenize(&raw);
-    let db = open_db();
-    let params = make_params();
-
-    match classifier::classify(&db, &tokens, &params) {
-        Ok((verdict, score)) => {
-            print!("{verdict} {score:.6}");
+    let result = std::panic::catch_unwind(move || {
+        let tokens = tokenizer::tokenize(&raw);
+        let db = open_db();
+        let params = make_params();
+        classifier::classify(&db, &tokens, &params)
+    });
+    match result {
+        Ok(Ok((verdict, score))) => print!("{verdict} {score:.6}"),
+        Ok(Err(e)) => {
+            eprintln!("spamlite: classification error (fail-open): {e}");
+            print!("{FAIL_OPEN_VERDICT}");
         }
-        Err(e) => {
-            eprintln!("spamlite: classification error: {e}");
-            process::exit(1);
+        Err(_) => {
+            eprintln!("spamlite: internal panic (fail-open, message scored neutral)");
+            print!("{FAIL_OPEN_VERDICT}");
         }
     }
 }
@@ -109,37 +133,60 @@ fn cmd_score() {
 /// because the classifier couldn't persist counts.
 fn cmd_receive() {
     let raw = read_stdin();
-    let tokens = tokenizer::tokenize(&raw);
-    let db = open_db();
-    let params = make_params();
     let gate = TOE_GATE.get().copied().unwrap_or(TOE_GATE_DEFAULT);
 
-    match classifier::classify(&db, &tokens, &params) {
-        Ok((verdict, score)) => {
-            print!("{verdict} {score:.6}");
-
-            if score > gate && score < (1.0 - gate) {
-                return;
-            }
-
+    // Phase 1 — tokenize + classify, panic-isolated. Nothing is printed
+    // inside the guarded region, so a fail-open can never double-print.
+    let classified = std::panic::catch_unwind(move || {
+        let tokens = tokenizer::tokenize(&raw);
+        let db = open_db();
+        let params = make_params();
+        classifier::classify(&db, &tokens, &params).map(|(verdict, score)| {
             let is_spam = matches!(verdict, classifier::Verdict::Spam);
-            if let Err(e) = db.train(&tokens, is_spam) {
-                eprintln!("spamlite: training error (non-fatal): {e}");
-                return;
-            }
-            let meta_result = if is_spam {
-                db.inc_total_spam()
-            } else {
-                db.inc_total_good()
-            };
-            if let Err(e) = meta_result {
-                eprintln!("spamlite: meta update error (non-fatal): {e}");
-            }
+            (format!("{verdict} {score:.6}"), score, is_spam, tokens, db)
+        })
+    });
+
+    let (output, score, is_spam, tokens, db) = match classified {
+        Ok(Ok(parts)) => parts,
+        Ok(Err(e)) => {
+            eprintln!("spamlite: classification error (fail-open): {e}");
+            print!("{FAIL_OPEN_VERDICT}");
+            return;
         }
-        Err(e) => {
-            eprintln!("spamlite: classification error: {e}");
-            process::exit(1);
+        Err(_) => {
+            eprintln!("spamlite: internal panic (fail-open, message scored neutral)");
+            print!("{FAIL_OPEN_VERDICT}");
+            return;
         }
+    };
+
+    // The SPAM/GOOD score is printed BEFORE training runs, so the sieve
+    // contract is preserved even if the training write fails.
+    print!("{output}");
+
+    if score > gate && score < (1.0 - gate) {
+        return;
+    }
+
+    // Phase 2 — confidence-gated training, also panic-isolated. The verdict
+    // is already on stdout; a training panic must not turn rc 0 into SIGABRT.
+    let trained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Err(e) = db.train(&tokens, is_spam) {
+            eprintln!("spamlite: training error (non-fatal): {e}");
+            return;
+        }
+        let meta_result = if is_spam {
+            db.inc_total_spam()
+        } else {
+            db.inc_total_good()
+        };
+        if let Err(e) = meta_result {
+            eprintln!("spamlite: meta update error (non-fatal): {e}");
+        }
+    }));
+    if trained.is_err() {
+        eprintln!("spamlite: training panic (non-fatal, verdict already emitted)");
     }
 }
 
@@ -305,7 +352,7 @@ fn cmd_import() {
 
 fn usage() {
     eprintln!(
-        "spamlite 0.4.0 — per-user Bayesian spam filter
+        "spamlite {} — per-user Bayesian spam filter
 Copyright 2026 Mark Constable <mc@netserva.org>
 MIT License — https://github.com/markc/spamlite
 
@@ -334,7 +381,8 @@ Environment:
 
 Priority: -t flag > SPAMLITE_THRESHOLD env > 0.5
           -g flag > SPAMLITE_TOE_GATE env > 0.2
-          -d flag > SPAMLITE_DB env > ~/.spamlite/db.sqlite"
+          -d flag > SPAMLITE_DB env > ~/.spamlite/db.sqlite",
+        env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -437,6 +485,7 @@ fn main() {
         "cleanup" => cmd_cleanup(&args[1..]),
         "export" => cmd_export(),
         "import" => cmd_import(),
+        "-V" | "--version" | "version" => println!("spamlite {}", env!("CARGO_PKG_VERSION")),
         "-h" | "--help" | "help" => usage(),
         other => {
             eprintln!("spamlite: unknown command '{other}'");
