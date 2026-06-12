@@ -70,6 +70,12 @@ April params.toml was never deployed; nothing to roll back.
 `deploy/spamlite-tune-nightly` is written for **mix 0.3.0** as deployed on mrn
 at `/usr/local/bin/mix` (`function($x) = expr` lambdas, `$1` positionals, no
 newline-`..` continuation). This is NOT the current `~/.mix` dialect (0.16.x)
-and mix on mrn is NOT at the canonical `/opt/cosmix/bin/` path. Reconcile
-before any mix upgrade on mrn — the threshold-digest script shares the same
-constraint.
+and mix on mrn is NOT at the canonical `/opt/cosmix/bin/` path.
+
+**Scheduled: at the next shadow switcheroo** (v0.5.0 promotion / next
+candidate swap, ~2 weeks from 2026-06-12), install the latest mix at
+`/opt/cosmix/bin/mix` on mrn FIRST, then port every mrn Mix script to the
+current dialect and switch shebangs (`spamlite-tune-nightly`,
+`spamlite-threshold-digest`, anything else
+`grep -rl 'usr/local/bin/mix' /usr/local/bin/` finds). Verify each script
+manually against the new binary before retiring `/usr/local/bin/mix`.
