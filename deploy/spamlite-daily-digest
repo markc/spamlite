@@ -20,7 +20,7 @@ SHADOW_FILES=$(find /srv -maxdepth 5 -name shadow.jsonl 2>/dev/null)
 if [[ -n "$SHADOW_FILES" ]] && [[ -x /usr/local/bin/spamlite-shadow-report ]]; then
     echo
     echo "=============================================================="
-    echo "Shadow mode divergence (spamlite-0.4.0 candidate vs 0.2.0 primary)"
+    echo "Shadow mode divergence (candidate vs primary spamlite)"
     echo "=============================================================="
     echo
     echo "$SHADOW_FILES" | tr '\n' '\0' \

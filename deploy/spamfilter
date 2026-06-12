@@ -4,17 +4,20 @@
 # Invocation (from /etc/dovecot/sieve/global.sieve):
 #   spamfilter /srv/{domain}/msg/{user} receive
 #
-# Shadow mode runs a candidate binary (/usr/local/bin/spamlite-0.4.0)
-# alongside the primary for users listed in /etc/spamlite-shadow.allow. A
-# literal `*` line enables shadowing cluster-wide. The candidate is always
-# invoked as `score` (read-only, no db writes) and its verdict is logged to
-# the user's .spamlite/shadow.jsonl. Shadow failures are silent; stdout and
-# exit code are determined entirely by the primary path.
+# Shadow mode runs a candidate binary alongside the primary for users listed
+# in /etc/spamlite-shadow.allow. A literal `*` line enables shadowing
+# cluster-wide. The candidate is always invoked as `score` (read-only, no db
+# writes) and its verdict is logged to the user's .spamlite/shadow.jsonl.
+# Shadow failures are silent; stdout and exit code are determined entirely
+# by the primary path.
 #
 # Side benefit: lowercases $DIR before use, working around a pre-existing
 # sieve-script bug where ${lhs}/${rhs} aren't lowercased and uppercase
 # recipient addresses (e.g. SCOTT@PROMANTT.COM.AU) would land in a path
 # that does not exist.
+
+CANDIDATE_VER="0.5.0"
+CANDIDATE_BIN="/usr/local/bin/spamlite-${CANDIDATE_VER}"
 
 DIR="$1"; shift
 CMD="$1"; shift
@@ -34,7 +37,7 @@ fi
 PRIMARY_RC=$?
 
 # Shadow mode — observability only, best-effort, never affects delivery
-if [[ -x /usr/local/bin/spamlite-0.4.0 ]] \
+if [[ -x "$CANDIDATE_BIN" ]] \
    && [[ -d "$DIR/.spamlite" ]] \
    && [[ "$CMD" == "receive" || "$CMD" == "score" ]] \
    && [[ -r /etc/spamlite-shadow.allow ]]; then
@@ -43,12 +46,21 @@ if [[ -x /usr/local/bin/spamlite-0.4.0 ]] \
     USER_ID="${USER_NAME}@${DOMAIN_NAME}"
     if grep -qxF '*' /etc/spamlite-shadow.allow 2>/dev/null \
        || grep -qxF "$USER_ID" /etc/spamlite-shadow.allow 2>/dev/null; then
-        CAND=$(timeout 2s /usr/local/bin/spamlite-0.4.0 \
+        CAND=$(timeout 2s "$CANDIDATE_BIN" \
             -d "$DIR/.spamlite" -t 0.6 score < "$TMP" 2>/dev/null)
         if [[ -n "$CAND" ]]; then
             TS=$(date -u +%FT%TZ)
-            printf '{"t":"%s","v":"0.4.0","cmd":"%s","user":"%s","primary":"%s","cand":"%s"}\n' \
-                "$TS" "$CMD" "$USER_ID" "$PRIMARY" "$CAND" \
+            # Extract Message-ID for cross-referencing shadow events with
+            # mail.log TRAIN/DELIVERY. Best-effort: grep first matching header
+            # line, strip prefix, drop CR, JSON-escape backslashes + quotes,
+            # cap at 200 chars. Empty if not found.
+            MSGID=$(grep -i -m1 '^message-id:' "$TMP" 2>/dev/null \
+                | sed -E 's/^[Mm]essage-[Ii][Dd]:[[:space:]]*//' \
+                | tr -d '\r' \
+                | sed 's/\\/\\\\/g; s/"/\\"/g' \
+                | head -c 200)
+            printf '{"t":"%s","v":"%s","cmd":"%s","user":"%s","msgid":"%s","primary":"%s","cand":"%s"}\n' \
+                "$TS" "$CANDIDATE_VER" "$CMD" "$USER_ID" "$MSGID" "$PRIMARY" "$CAND" \
                 >> "$DIR/.spamlite/shadow.jsonl" 2>/dev/null
         fi
     fi
