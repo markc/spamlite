@@ -132,6 +132,15 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
     // Body parts
     for part in message.text_bodies() {
         let text = part.text_contents().unwrap_or_default();
+
+        // URLs in plain-text bodies carry the same signal as HTML hrefs —
+        // text-only spam was previously losing its `u:` tokens entirely.
+        for url in extract_urls_from_text(&text, config.max_len) {
+            if valid(&url) {
+                tokens.push(format!("u:{url}"));
+            }
+        }
+
         for w in extract_words(&text) {
             if valid(&w) {
                 tokens.push(format!("b:{w}"));
@@ -234,6 +243,42 @@ fn extract_urls(html: &str, max_len: usize) -> Vec<String> {
     urls
 }
 
+/// Extract URLs from plain text — scan for http(s):// runs terminated by
+/// whitespace or characters that can't appear in a sane URL. Same
+/// normalization as the HTML path so text and HTML mail produce identical
+/// `u:` tokens for the same link.
+fn extract_urls_from_text(text: &str, max_len: usize) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut search = text;
+    while let Some(pos) = search.find("http") {
+        search = &search[pos..];
+        let rest = if let Some(r) = search.strip_prefix("https://") {
+            r
+        } else if let Some(r) = search.strip_prefix("http://") {
+            r
+        } else {
+            // "http" without "://" — skip past it and keep scanning
+            search = &search[4..];
+            continue;
+        };
+        let scheme_len = search.len() - rest.len();
+        let end = rest
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '|')
+            })
+            .unwrap_or(rest.len());
+        if end > 0 {
+            let url = &search[..scheme_len + end];
+            let normalized = normalize_url(url, max_len);
+            if !normalized.is_empty() {
+                urls.push(normalized);
+            }
+        }
+        search = &rest[end..];
+    }
+    urls
+}
+
 /// Normalize a URL for tokenization — keep scheme+host+path, drop query
 fn normalize_url(url: &str, max_len: usize) -> String {
     let url = url.to_lowercase();
@@ -294,6 +339,34 @@ mod tests {
         let tokens = tokenize(email);
         assert!(tokens.iter().any(|t| t == "h:subject:make_money"));
         assert!(tokens.iter().any(|t| t == "h:subject:money_fast"));
+    }
+
+    #[test]
+    fn test_extract_urls_from_text() {
+        let text = "Visit https://example.com/page?x=1 or http://spam.biz/buy now.\nNot a url: httpfoo";
+        let urls = extract_urls_from_text(text, MAX_TOKEN_LEN);
+        assert_eq!(urls, vec!["https://example.com/page", "http://spam.biz/buy"]);
+    }
+
+    #[test]
+    fn test_extract_urls_from_text_multibyte_boundary() {
+        // The exact production URL shape that panicked v0.2.0 (byte index 40
+        // inside '圳'). Must truncate at a char boundary, never panic.
+        let text = "click http://a.spread48.com/74987-2139538/深圳思齐软件有限公司.newsletter/forward.aspx now";
+        let urls = extract_urls_from_text(text, MAX_TOKEN_LEN);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].len() <= MAX_TOKEN_LEN);
+        assert!(urls[0].starts_with("http://a.spread48.com/"));
+    }
+
+    #[test]
+    fn test_text_body_urls_tokenized() {
+        let email = b"From: x@y.com\r\nSubject: hi\r\nContent-Type: text/plain\r\n\r\nGo to https://example.com/offer today\r\n";
+        let tokens = tokenize(email);
+        assert!(
+            tokens.iter().any(|t| t == "u:https://example.com/offer"),
+            "expected u: token from plain-text body, got {tokens:?}"
+        );
     }
 
     #[test]
