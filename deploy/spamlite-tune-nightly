@@ -1,4 +1,4 @@
-#!/usr/local/bin/mix
+#!/opt/cosmix/bin/mix
 -- spamlite-tune-nightly — per-user classifier parameter tuning, cluster-wide.
 --
 -- Installed at /usr/local/bin/spamlite-tune-nightly on mrn. Invoked by
@@ -11,9 +11,9 @@
 -- tuned params beat the baseline on a held-out stratified test set — a
 -- refusal (rc=2) is the normal, healthy outcome for most users.
 --
--- NOTE: written for the mix 0.3.0 dialect deployed on mrn (`function($x) =`
--- lambdas, $1 positional arg) — NOT current ~/.mix syntax. Verify against
--- /usr/local/bin/mix on the target before "modernising" this file.
+-- NOTE: originally written for the mix 0.3.0 dialect; since 2026-06-13 mrn
+-- runs current mix (0.17.0) at /opt/cosmix/bin/mix and every construct here
+-- was verified against it (no changes needed beyond the shebang).
 --
 -- Pass $1 to cap the number of users tuned (smoke-testing aid).
 

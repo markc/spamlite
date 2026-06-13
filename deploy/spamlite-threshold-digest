@@ -1,0 +1,144 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-threshold-digest — daily cluster-wide digest of spamlite user stats.
+--
+-- Mix v0.2.4 rewrite — flagship acceptance test for the v0.2.0 stdlib
+-- plan (`src/_doc/2026-04-13-mix-stdlib-and-ergonomics-plan.md`).
+-- Output is byte-identical to the v0.1-era original on real
+-- /srv/*/msg/*/.spamlite-stats.jsonl data (verified against 216
+-- users on mail.renta.net, 2026-04-13).
+--
+-- 2026-06-13: ported to current mix (0.17.0) at /opt/cosmix/bin/mix.
+-- Only change: `.fn` dot-field access -> `["fn"]` (fn is a reserved word
+-- in current mix). Output verified byte-identical to the 0.3.0 run.
+--
+-- Reads ${BASE}/*/msg/*/.spamlite-stats.jsonl (default ${BASE} = /srv),
+-- takes each user's latest JSONL line, aggregates cluster totals, and
+-- prints a plain-text report to stdout. Intended to be piped to sendmail
+-- from cron.
+--
+-- Pass $1 to override the base dir for local testing without touching
+-- /srv. Production cron omits the argument.
+--
+-- Install as /usr/local/bin/spamlite-threshold-digest.
+
+$BASE = $1
+if $BASE == nil then
+    $BASE = "/srv"
+end
+
+$TOP_N = 20
+$MATURE_GOOD = 5000
+$MATURE_SPAM = 5000
+$CAND_FN = 5
+$THRESHOLD = "0.6"
+
+-- --- Collect ---
+-- Phase 4: recursive glob replaces the 16-line two-level hand-walk.
+$files = glob($BASE .. "/*/msg/*/.spamlite-stats.jsonl")
+
+$users = []
+$skipped = 0
+
+for each $path in $files
+    $lines = read_lines($path)
+    if length($lines) == 0 then
+        $skipped = $skipped + 1
+        continue
+    end
+    -- Phase 6.2: negative indexing replaces `$lns[$nl - 1]`.
+    $last = $lines[-1]
+    try
+        $rec = json_parse($last)
+    catch $e
+        $skipped = $skipped + 1
+        continue
+    end
+
+    -- Extract domain + user from ${BASE}/<domain>/msg/<user>/.spamlite-stats.jsonl
+    -- path_parts gives us the dir; split it into segments and take the
+    -- last two (user + "msg") and the one before "msg" (domain).
+    $dir = path_parts($path).dir
+    $segments = split($dir, "/")
+    $user = $segments[-1]
+    $domain = $segments[-3]
+    $who = $user .. "@" .. $domain
+
+    $good = $rec.db[0]
+    $spam = $rec.db[1]
+    $fn = $rec.corr["fn"]
+    $fp = $rec.corr.fp
+
+    push($users, {
+      "who": $who,
+      "good": $good,
+      "spam": $spam,
+      "fn": $fn,
+      "fp": $fp,
+      "d": $rec.d
+    })
+end
+
+-- Phase 2: sum_by / count / filter replace three hand-rolled loops.
+$n = length($users)
+$total_fn = sum_by($users, function($u) = $u["fn"])
+$total_fp = sum_by($users, function($u) = $u.fp)
+$total_good = sum_by($users, function($u) = $u.good)
+$total_spam = sum_by($users, function($u) = $u.spam)
+$mature = count($users, function($u) = $u.good >= $MATURE_GOOD and $u.spam >= $MATURE_SPAM)
+
+$today = date_format(time(), "%Y-%m-%d")
+$host = hostname()
+
+-- --- Header ---
+-- Phase 3: printf replaces multi-`..` print chains.
+printf("Spamlite Threshold Digest — %s\n", $today)
+printf("Host: %s   Global threshold: %s\n\n", $host, $THRESHOLD)
+print "Cluster totals (latest JSONL line per user):"
+printf("  Users reported:                      %d  (skipped %d)\n", $n, $skipped)
+printf("  Mature DBs (good>=5000, spam>=5000): %d\n", $mature)
+printf("  Missed spam (fn, 24h sum):           %d\n", $total_fn)
+printf("  Rescued FP  (fp, 24h sum):           %d\n", $total_fp)
+printf("  Corpus good / spam:                  %d / %d\n\n", $total_good, $total_spam)
+
+-- --- Top N by fn ---
+-- Phase 2: sort_by+take replaces the 30-line hand-rolled selector.
+printf("Top %d users by fn (missed spam, last 24h):\n", $TOP_N)
+printf("  %-38s %-13s %5s %5s  %s\n", "user", "good/spam", "fn", "fp", "date")
+
+$top = take(sort_by($users, function($u) = 0 - $u["fn"]), $TOP_N)
+for each $u in filter($top, function($u) = $u["fn"] > 0)
+    $gs = fmt("%d/%d", $u.good, $u.spam)
+    printf("  %-38s %-13s %5d %5d  %s\n", $u.who, $gs, $u["fn"], $u.fp, $u.d)
+end
+
+print ""
+
+-- --- FP report ---
+print "Users with fp > 0 (filter false positives — rare, high-signal):"
+$fp_users = filter($users, function($u) = $u.fp > 0)
+if length($fp_users) == 0 then
+    print "  (none)"
+else
+    for each $u in $fp_users
+        $gs = fmt("%d/%d", $u.good, $u.spam)
+        printf("  %-38s %-13s  fn=%d fp=%d\n", $u.who, $gs, $u["fn"], $u.fp)
+    end
+end
+
+print ""
+
+-- --- Per-user threshold candidates ---
+printf("Per-user threshold candidates (mature DB AND fn >= %d):\n", $CAND_FN)
+$candidates = filter($users, function($u) = $u.good >= $MATURE_GOOD and $u.spam >= $MATURE_SPAM and $u["fn"] >= $CAND_FN)
+if length($candidates) == 0 then
+    print "  (none)"
+else
+    for each $u in $candidates
+        $gs = fmt("%d/%d", $u.good, $u.spam)
+        printf("  %-38s %-13s  fn=%d\n", $u.who, $gs, $u["fn"])
+    end
+end
+
+print ""
+print "-- end of digest --"
+exit(0)

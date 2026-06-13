@@ -12,7 +12,9 @@
 set -o pipefail
 
 # Section 1 — threshold digest (always)
-/usr/local/bin/spamlite-threshold-digest
+# /srv is passed explicitly: mix 0.3.0 panics ("is_stmt_sync verified",
+# evaluator.rs:3812) reading the unbound $1 when the script gets no args.
+/usr/local/bin/spamlite-threshold-digest /srv
 DIGEST_RC=$?
 
 # Section 2 — shadow-mode divergence (only if any shadow.jsonl exists)
