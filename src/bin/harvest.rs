@@ -491,10 +491,10 @@ mod tests {
     fn test_parse_msgid_fileinto_variant() {
         // fileinto action path (system-sender filtering) also has the same
         // "stored mail into mailbox" tail shape.
-        let line = "2026-04-12T00:27:20.400443+10:00 mail dovecot: lmtp(admin@renta.net)<3174648><CKcZKkda2mn4cDAAmhYRNg>: sieve: msgid=<20260411142711.AD36363E42@mail.example.org>: fileinto action: stored mail into mailbox 'Trash'";
+        let line = "2026-04-12T00:27:20.400443+10:00 mail dovecot: lmtp(admin@renta.net)<3174648><CKcZKkda2mn4cDAAmhYRNg>: sieve: msgid=<20260411142711.AD36363E42@mx.example.org>: fileinto action: stored mail into mailbox 'Trash'";
         match parse_line(line) {
             ParsedLine::Msgid(m) => {
-                assert_eq!(m.msgid, "<20260411142711.AD36363E42@mail.example.org>");
+                assert_eq!(m.msgid, "<20260411142711.AD36363E42@mx.example.org>");
             }
             _ => panic!("expected Msgid variant"),
         }

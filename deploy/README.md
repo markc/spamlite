@@ -4,6 +4,10 @@ Production files deployed to `mail.renta.net` (mrn). Keep this directory in
 sync with the server so the git repo is authoritative and deployments are
 reviewable.
 
+Host-specific one-off scripts that embed real user/domain values (review
+crons etc.) live in the gitignored `deploy-private/` directory, not here.
+Example identities in this file are anonymized.
+
 ## Files
 
 - **`spamfilter`** — sieve `execute :pipe` wrapper. Installed at
@@ -38,7 +42,7 @@ echo '*' | sudo tee /etc/spamlite-shadow.allow
 
 ```bash
 sudo tee /etc/spamlite-shadow.allow <<EOF
-admin@renta.net
+admin@example.com
 evan@corp-c.example.com
 alice@agency-a.example.net.au
 EOF

@@ -5,7 +5,7 @@
 -- plan (`src/_doc/2026-04-13-mix-stdlib-and-ergonomics-plan.md`).
 -- Output is byte-identical to the v0.1-era original on real
 -- /srv/*/msg/*/.spamlite-stats.jsonl data (verified against 216
--- users on mail.renta.net, 2026-04-13).
+-- users on the production mail host, 2026-04-13).
 --
 -- 2026-06-13: ported to current mix (0.17.0) at /opt/cosmix/bin/mix.
 -- Only change: `.fn` dot-field access -> `["fn"]` (fn is a reserved word
