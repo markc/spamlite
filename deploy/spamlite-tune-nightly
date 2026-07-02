@@ -1,0 +1,82 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-tune-nightly — per-user classifier parameter tuning, cluster-wide.
+--
+-- Installed at /usr/local/bin/spamlite-tune-nightly on mrn. Invoked by
+-- /etc/cron.d/spamlite-tune-nightly at 02:30 daily, output appended to
+-- /var/log/spamlite-tune.log.
+--
+-- For every user with a .spamlite db, runs spamlite-tune --write against
+-- their live Maildir (ham = Maildir/cur, spam = Maildir/.Junk/cur). The
+-- tuner's generalisation gate means params.toml is only ever written when
+-- tuned params beat the baseline on a held-out stratified test set — a
+-- refusal (rc=2) is the normal, healthy outcome for most users.
+--
+-- NOTE: originally written for the mix 0.3.0 dialect; since 2026-06-13 mrn
+-- runs current mix (0.17.0) at /opt/cosmix/bin/mix and every construct here
+-- was verified against it (no changes needed beyond the shebang).
+--
+-- Pass $1 to cap the number of users tuned (smoke-testing aid).
+
+$TUNE = "/usr/local/bin/spamlite-tune"
+$MIN_HAM = 100
+$MIN_SPAM = 50
+
+$max_users = 0
+if $1 != nil then
+    $max_users = to_number($1)
+end
+
+$dbs = glob("/srv/*/msg/*/.spamlite/db.sqlite")
+print("spamlite-tune-nightly: " .. length($dbs) .. " spamlite users found")
+
+$done = 0
+$written = 0
+$refused = 0
+$skipped = 0
+$failed = 0
+
+for each $dbfile in $dbs
+    if $max_users > 0 and $done >= $max_users then
+        continue
+    end
+
+    $sl_dir = dirname($dbfile)
+    $home = dirname($sl_dir)
+    $user = basename($home)
+    $domain = basename(dirname(dirname($home)))
+    $uid = $user .. "@" .. $domain
+    $ham = $home .. "/Maildir/cur"
+    $spam = $home .. "/Maildir/.Junk/cur"
+
+    $hn = to_number(trim(run_rc("ls " .. shell_quote($ham) .. " 2>/dev/null | wc -l").stdout))
+    $sn = to_number(trim(run_rc("ls " .. shell_quote($spam) .. " 2>/dev/null | wc -l").stdout))
+
+    if $hn < $MIN_HAM or $sn < $MIN_SPAM then
+        $skipped = $skipped + 1
+        continue
+    end
+
+    $cmd = "ionice -c3 nice -n19 " .. $TUNE .. " -d " .. shell_quote($sl_dir)
+    $cmd = $cmd .. " --ham " .. shell_quote($ham) .. " --spam " .. shell_quote($spam)
+    $cmd = $cmd .. " --baseline-threshold 0.6 --limit 4000 --json --write"
+    $r = run_rc($cmd)
+    $done = $done + 1
+
+    if $r.rc == 0 and contains($r.stdout, "\"generalised\":true") then
+        print($uid .. ": WROTE params.toml — " .. trim($r.stdout))
+        $written = $written + 1
+    else
+        if $r.rc == 2 then
+            print($uid .. ": refused (no generalising gain)")
+            $refused = $refused + 1
+        else
+            print($uid .. ": FAILED rc=" .. $r.rc .. " " .. trim($r.stderr))
+            $failed = $failed + 1
+        end
+    end
+end
+
+$summary = "spamlite-tune-nightly: done=" .. $done .. " wrote=" .. $written
+$summary = $summary .. " refused=" .. $refused .. " skipped=" .. $skipped .. " failed=" .. $failed
+print($summary)
+exit(0)

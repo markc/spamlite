@@ -1,0 +1,67 @@
+#!/bin/bash
+# spamlite-sieve — mbx transparent passthrough + shadow-candidate observation.
+#
+# mbx has no spamfilter dispatch wrapper: /etc/dovecot/sieve/spamlite symlinks
+# straight to the binary and global.sieve invokes it as
+#   spamlite -d /srv/{domain}/msg/{user}/.spamlite score
+# (retrain sieves: spamlite -d .spamlite good|spam). This wrapper sits at the
+# symlink target instead, passes everything through to the primary unchanged,
+# and — only for read-only classify commands with an absolute existing db dir —
+# also runs the candidate binary as `score` and logs both verdicts to the
+# user's .spamlite/shadow.jsonl in the same JSONL format as mrn's spamfilter
+# shadow harness. Shadow failures are silent; stdout and exit code are
+# determined entirely by the primary path.
+#
+# Deployed at /usr/local/bin/spamlite-sieve; symlink repointed 2026-07-02
+# (was: spamlite -> /usr/local/bin/spamlite directly).
+
+CANDIDATE_VER="0.6.0"
+CANDIDATE_BIN="/usr/local/bin/spamlite-${CANDIDATE_VER}"
+PRIMARY_BIN="/usr/local/bin/spamlite"
+
+DBDIR=""
+CMD=""
+if [[ "$1" == "-d" ]]; then
+    DBDIR="$2"
+    CMD="$3"
+fi
+
+# Anything that isn't a shadowable classify call passes straight through
+# (training, counts, relative retrain -d, missing candidate, ...).
+if [[ ! -x "$CANDIDATE_BIN" || ! -d "$DBDIR" || "$DBDIR" != /* ]] \
+   || [[ "$CMD" != "score" && "$CMD" != "receive" ]]; then
+    exec "$PRIMARY_BIN" "$@"
+fi
+
+# Buffer stdin so both primary and candidate can read the same message
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+cat > "$TMP"
+
+PRIMARY=$("$PRIMARY_BIN" "$@" < "$TMP")
+PRIMARY_RC=$?
+
+# Per-user tuning parity with mrn's harness: params.toml users own their
+# threshold (candidate -t would defeat it — 0.6.0 keeps -t > params.toml).
+CARGS=(-d "$DBDIR")
+[[ -f "$DBDIR/params.toml" ]] || CARGS+=(-t 0.5)
+CAND=$(timeout 2s "$CANDIDATE_BIN" "${CARGS[@]}" score < "$TMP" 2>/dev/null)
+
+if [[ -n "$CAND" ]]; then
+    # /srv/{domain}/msg/{user}/.spamlite -> user@domain
+    USER_DIR=$(dirname "$DBDIR")
+    USER_NAME=$(basename "$USER_DIR")
+    DOMAIN_NAME=$(basename "$(dirname "$(dirname "$USER_DIR")")")
+    TS=$(date -u +%FT%TZ)
+    MSGID=$(grep -i -m1 '^message-id:' "$TMP" 2>/dev/null \
+        | sed -E 's/^[Mm]essage-[Ii][Dd]:[[:space:]]*//' \
+        | tr -d '\r' \
+        | sed 's/\\/\\\\/g; s/"/\\"/g' \
+        | head -c 200)
+    printf '{"t":"%s","v":"%s","cmd":"%s","user":"%s","msgid":"%s","primary":"%s","cand":"%s"}\n' \
+        "$TS" "$CANDIDATE_VER" "$CMD" "${USER_NAME}@${DOMAIN_NAME}" "$MSGID" "$PRIMARY" "$CAND" \
+        >> "$DBDIR/shadow.jsonl" 2>/dev/null
+fi
+
+printf '%s' "$PRIMARY"
+exit $PRIMARY_RC

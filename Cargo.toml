@@ -1,0 +1,47 @@
+[package]
+name = "spamlite"
+version = "0.6.0"
+edition = "2021"
+description = "Per-user Bayesian spam filter — drop-in spamprobe replacement"
+license = "MIT"
+authors = ["Mark Constable <mc@netserva.org>"]
+repository = "https://github.com/markc/spamlite"
+
+[dependencies]
+mail-parser = "0.11"
+rusqlite = { version = "0.38", features = ["bundled"] }
+nanohtml2text = "0.2"
+
+[[bin]]
+name = "spamlite"
+path = "src/main.rs"
+
+[[bin]]
+name = "spamlite-eval"
+path = "src/bin/eval.rs"
+
+[[bin]]
+name = "spamlite-harvest"
+path = "src/bin/harvest.rs"
+
+[[bin]]
+name = "spamlite-correlate"
+path = "src/bin/correlate.rs"
+
+[[bin]]
+name = "spamlite-shadow-report"
+path = "src/bin/shadow_report.rs"
+
+[[bin]]
+name = "spamlite-tune"
+path = "src/bin/tune.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+# panic = "unwind" (default) is REQUIRED: the sieve hot path fail-open guard
+# in main.rs uses catch_unwind, which is inert under panic = "abort". The
+# abort setting is also what turned the v0.2.0 tokenizer panic into a
+# SIGABRT/exit-134 and six weeks of unfiltered deliveries for one user.
+strip = true
+codegen-units = 1
