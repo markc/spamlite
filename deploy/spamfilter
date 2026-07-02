@@ -1,0 +1,92 @@
+#!/bin/bash
+# spamfilter — dispatch spamlite/spamprobe + optional shadow-mode observation.
+#
+# Invocation (from /etc/dovecot/sieve/global.sieve):
+#   spamfilter /srv/{domain}/msg/{user} receive
+#
+# Shadow mode runs a candidate binary alongside the primary for users listed
+# in /etc/spamlite-shadow.allow. A literal `*` line enables shadowing
+# cluster-wide. The candidate is always invoked as `score` (read-only, no db
+# writes) and its verdict is logged to the user's .spamlite/shadow.jsonl.
+# Shadow failures are silent; stdout and exit code are determined entirely
+# by the primary path.
+#
+# Side benefit: lowercases $DIR before use, working around a pre-existing
+# sieve-script bug where ${lhs}/${rhs} aren't lowercased and uppercase
+# recipient addresses (e.g. SCOTT@PROMANTT.COM.AU) would land in a path
+# that does not exist.
+
+CANDIDATE_VER="0.6.0"
+CANDIDATE_BIN="/usr/local/bin/spamlite-${CANDIDATE_VER}"
+
+DIR="$1"; shift
+CMD="$1"; shift
+DIR="${DIR,,}"  # bash 4+ lowercase — fixes uppercase-recipient delivery bug
+
+# Buffer stdin so both primary and candidate can read the same message
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+cat > "$TMP"
+
+# Primary path — determines delivery. Absolute paths to avoid PATH issues.
+#
+# 2026-06-26: spamlite `receive` is mapped to `score` (read-only classify) to
+# stop confidence-gated TOE self-training on inbound. That auto-training created
+# a self-reinforcing false-positive loop — a legit bulk-ESP sender scoring >=0.8
+# trains itself as spam on every delivery, faster than users can rescue it from
+# Junk (e.g. kiri@tewantintravel.com, a travel agent whose supplier mail is all
+# bulk-ESP). Supervised training still happens via spamfilter-retrain on IMAP
+# Junk moves. Revert by restoring spamfilter.bak-2026-06-26.
+SLCMD="$CMD"
+if [[ -d "$DIR/.spamlite" ]]; then
+    [[ "$CMD" == "receive" ]] && SLCMD="score"
+    # Per-user tuning: if the user has a params.toml, let it own the threshold
+    # (and every other param). The binary's -t flag WINS over params.toml, so we
+    # must OMIT -t for those users or their per-user threshold is dead; the
+    # binary default threshold is 0.5, identical to the global below. Everyone
+    # without a params.toml still gets the explicit global -t 0.5.
+    # 2026-06-29: added to unblock per-user thresholds (mc).
+    SLARGS=(-d "$DIR/.spamlite")
+    [[ -f "$DIR/.spamlite/params.toml" ]] || SLARGS+=(-t 0.5)
+    PRIMARY=$(/usr/local/bin/spamlite "${SLARGS[@]}" "$SLCMD" < "$TMP")
+else
+    PRIMARY=$(/usr/bin/spamprobe -c -d "$DIR/.spamprobe" "$CMD" < "$TMP")
+fi
+PRIMARY_RC=$?
+
+# Shadow mode — observability only, best-effort, never affects delivery
+if [[ -x "$CANDIDATE_BIN" ]] \
+   && [[ -d "$DIR/.spamlite" ]] \
+   && [[ "$CMD" == "receive" || "$CMD" == "score" ]] \
+   && [[ -r /etc/spamlite-shadow.allow ]]; then
+    USER_NAME=$(basename "$DIR")
+    DOMAIN_NAME=$(basename "$(dirname "$(dirname "$DIR")")")
+    USER_ID="${USER_NAME}@${DOMAIN_NAME}"
+    if grep -qxF '*' /etc/spamlite-shadow.allow 2>/dev/null \
+       || grep -qxF "$USER_ID" /etc/spamlite-shadow.allow 2>/dev/null; then
+        # Mirror the primary's per-user threshold logic: users with a
+        # params.toml own their threshold (candidate -t would defeat it and
+        # every divergence would be a threshold artefact, not a signal).
+        CARGS=(-d "$DIR/.spamlite")
+        [[ -f "$DIR/.spamlite/params.toml" ]] || CARGS+=(-t 0.5)
+        CAND=$(timeout 2s "$CANDIDATE_BIN" "${CARGS[@]}" score < "$TMP" 2>/dev/null)
+        if [[ -n "$CAND" ]]; then
+            TS=$(date -u +%FT%TZ)
+            # Extract Message-ID for cross-referencing shadow events with
+            # mail.log TRAIN/DELIVERY. Best-effort: grep first matching header
+            # line, strip prefix, drop CR, JSON-escape backslashes + quotes,
+            # cap at 200 chars. Empty if not found.
+            MSGID=$(grep -i -m1 '^message-id:' "$TMP" 2>/dev/null \
+                | sed -E 's/^[Mm]essage-[Ii][Dd]:[[:space:]]*//' \
+                | tr -d '\r' \
+                | sed 's/\\/\\\\/g; s/"/\\"/g' \
+                | head -c 200)
+            printf '{"t":"%s","v":"%s","cmd":"%s","user":"%s","msgid":"%s","primary":"%s","cand":"%s"}\n' \
+                "$TS" "$CANDIDATE_VER" "$CMD" "$USER_ID" "$MSGID" "$PRIMARY" "$CAND" \
+                >> "$DIR/.spamlite/shadow.jsonl" 2>/dev/null
+        fi
+    fi
+fi
+
+printf '%s' "$PRIMARY"
+exit $PRIMARY_RC

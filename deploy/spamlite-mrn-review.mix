@@ -1,0 +1,106 @@
+-- spamlite-mrn-review.mix — cluster-wide review of the 0.5.1 @ t=0.5 promotion on
+-- mrn (primary swapped from 0.4.0 on 2026-06-27T08:09Z, threshold 0.6->0.5 at 08:12Z).
+-- Parses journald DELIVERY scores + TRAIN corrections across ALL users, flags
+-- per-user false-positive spikes (TRAIN->good = user rescued a junked message),
+-- emails markc@renta.net, then self-deletes its one-off cron.
+-- Args: a number = window in days (default 2); "dryrun" = print only, keep cron.
+
+$WATCH = ["kenelle@auzy.net.au", "kiri@tewantintravel.com", "genna", "cathy"]  -- known bulk-ESP FP risk
+
+$days = 2
+$dry = false
+$cronfile = ""
+for each $a in args()
+  if $a == "dryrun" then $dry = true end
+  if starts_with($a, "/etc/cron.d/") then $cronfile = $a end
+  if to_number($a) != nil then $days = to_number($a) end
+end
+$J = "/usr/bin/journalctl --since '" .. ("" .. $days) .. " days ago' --no-pager 2>/dev/null"
+
+-- Per-message dedup for TRAIN corrections. The retrain sieves log the Message-ID
+-- (2026-06-29). Two disjoint buckets, summed: NEW-format lines
+-- ('TRAIN: user <msgid> -> dir', two tokens) are deduped by user+msgid (sort -u),
+-- so imapsieve repeat-fires of one rescue (same msgid, ~4s apart) and
+-- train_max_reps reps collapse to ONE while a genuine bulk move (distinct msgids)
+-- still counts each message. OLD-format lines (pre-change, one token before
+-- '-> dir') have no msgid and are counted RAW (they age out of the window in a
+-- couple of days). users_dedup emits one user line per counted unit.
+fn users_dedup($dir) = "( " .. $J .. " | grep -E 'TRAIN: [^ ]+ [^ ]+ -> " .. $dir .. "' | sed -E 's/.*TRAIN: ([^ ]+ [^ ]+) -> " .. $dir .. ".*/\\1/' | sort -u | sed -E 's/ .*//' ; " .. $J .. " | grep -E 'TRAIN: [^ ]+ -> " .. $dir .. "' | sed -E 's/.*TRAIN: ([^ ]+) -> " .. $dir .. ".*/\\1/' )"
+
+-- INBOUND score distribution (all users)
+$lines = split(trim(run_rc($J .. " | grep 'DELIVERY:'").stdout), "\n")
+$n = 0
+$inbox = 0
+$junk = 0
+$smin = 1.0
+$smax = 0.0
+$ssum = 0.0
+$hi = 0
+$mid = 0
+for each $line in $lines
+  if contains($line, "DELIVERY:") and contains($line, "(") then
+    $segs = split($line, "(")
+    $body = split($segs[length($segs) - 1], ")")[0]
+    $parts = split($body, " ")
+    if length($parts) >= 2 and ($parts[0] == "GOOD" or $parts[0] == "SPAM") then
+      $score = to_number($parts[1])
+      $n = $n + 1
+      $ssum = $ssum + $score
+      $smin = min($smin, $score)
+      $smax = max($smax, $score)
+      $hi = $hi + ($score >= 0.9 ? 1 : 0)
+      $mid = $mid + (($score >= 0.5 and $score < 0.9) ? 1 : 0)
+      $junk = $junk + (contains($line, "-> Junk") ? 1 : 0)
+      $inbox = $inbox + (contains($line, "-> Junk") ? 0 : 1)
+    end
+  end
+end
+$avg = $n > 0 ? round($ssum / $n, 4) : 0
+
+-- corrections (shell aggregation: per-user uniq -c, pre-sorted desc)
+$fp_per_user = trim(run_rc(users_dedup("good") .. " | sort | uniq -c | sort -rn | head -25").stdout)
+$tg_total = trim(run_rc(users_dedup("good") .. " | wc -l").stdout)
+$ts_total = trim(run_rc(users_dedup("spam") .. " | wc -l").stdout)
+$errs = trim(run_rc($J .. " | grep -iE 'spamlite|spamfilter' | grep -iE 'error|panic|fail-open|not found|core' | wc -l").stdout)
+
+-- watch-user FP counts
+$watch_rep = ""
+for each $w in $WATCH
+  $c = trim(run_rc(users_dedup("good") .. " | grep -c " .. shell_quote($w)).stdout)
+  $watch_rep = $watch_rep .. "    " .. $w .. ": " .. $c .. "\n"
+end
+
+$r = "spamlite 0.5.1 @ t=0.5 - mrn cluster review (last " .. ("" .. $days) .. " days)\n"
+$r = $r .. "primary swapped 0.4.0->0.5.1 @ 2026-06-27T08:09Z; threshold 0.6->0.5 @ 08:12Z\n\n"
+$r = $r .. "ERRORS: spamlite/spamfilter log lines matching error|panic|fail-open = " .. $errs .. "  (expect 0)\n\n"
+$r = $r .. "INBOUND (all users, read-only score path):\n"
+$r = $r .. "  scored=" .. ("" .. $n) .. "   -> Inbox=" .. ("" .. $inbox) .. "   -> Junk=" .. ("" .. $junk) .. "\n"
+$r = $r .. "  score min/avg/max = " .. ("" .. $smin) .. " / " .. ("" .. $avg) .. " / " .. ("" .. $smax) .. "\n"
+$r = $r .. "  scores 0.5-0.9 = " .. ("" .. $mid) .. "   scores >=0.9 (saturation) = " .. ("" .. $hi) .. "\n\n"
+$r = $r .. "FALSE-POSITIVE corrections (TRAIN -> good = user rescued junked mail):\n"
+$r = $r .. "  [per-message: deduped by user+msgid; pre-2026-06-29 lines (no msgid) still raw]\n"
+$r = $r .. "  total = " .. $tg_total .. "\n"
+$r = $r .. "  per-user (count user, top 25):\n"
+$r = $r .. (($fp_per_user == "") ? "    none\n" : ($fp_per_user .. "\n"))
+$r = $r .. "  watch users (bulk-ESP FP risk):\n" .. $watch_rep .. "\n"
+$r = $r .. "MISSED-SPAM corrections (TRAIN -> spam = user junked inbox spam):\n"
+$r = $r .. "  total = " .. $ts_total .. "\n\n"
+$r = $r .. "BOTTOM LINE:\n"
+$ok = ($errs == "0")
+$r = $r .. "  errors clean: " .. ($ok ? "yes" : "NO - investigate") .. "\n"
+$r = $r .. "  FP corrections (" .. $tg_total .. ") vs missed-spam corrections (" .. $ts_total .. ") - watch the FP/user spikes above.\n"
+$r = $r .. "  If a single user shows an FP spike from bulk-ESP saturation (scores pinned\n"
+$r = $r .. "  ~1.0), a threshold nudge will NOT help - drop them a per-user params.toml with\n"
+$r = $r .. "  combine_mode=geometric + train_max_reps (retrainable), or a Roundcube allow-list.\n"
+$r = $r .. "  Else 0.5.1@0.5 is holding; proceed toward a 0.5.2/0.6.0 next shadow candidate.\n"
+
+if $dry then
+  print("=== DRY RUN (no email, cron kept) ===")
+  print($r)
+else
+  $msg = "To: markc@renta.net\nFrom: root@mrn.renta.net\nSubject: spamlite mrn review - 0.5.1@0.5 (last " .. ("" .. $days) .. "d)\n\n" .. $r
+  write_file("/tmp/mrn-review.eml", $msg)
+  run_rc("/usr/sbin/sendmail -t < /tmp/mrn-review.eml")
+  run_rc("rm -f /tmp/mrn-review.eml" .. ($cronfile != "" ? (" " .. $cronfile) : ""))
+  print("mrn review emailed to markc@renta.net" .. ($cronfile != "" ? (" + cron " .. $cronfile .. " removed") : ""))
+end

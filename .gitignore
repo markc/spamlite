@@ -1,0 +1,9 @@
+/target
+.cargo/
+Cargo.lock
+admin_maildir/
+.claude/
+
+# Private ops docs/journals — NEVER commit (fresh anonymized _doc/ may return later)
+_journal/
+_doc-private/

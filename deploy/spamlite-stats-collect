@@ -1,0 +1,305 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-stats-collect — nightly per-user spamlite score & correction collector.
+--
+-- Installed at /usr/local/bin/spamlite-stats-collect on the mail server.
+-- Invoked by /etc/cron.d/spamlite-stats at 04:15 daily, wrapped in
+-- `ionice -c 3 nice -n 19`, output appended to /var/log/spamlite-stats.log.
+-- The 04:30 threshold-digest reads the JSONL this writes.
+--
+-- For each user with a ~/.spamlite/ dir under /srv/*/msg/*/, scans messages
+-- whose ctime is newer than the stats file (first run: last 24h) in
+-- Maildir/{cur,new} and Maildir/.Junk/{cur,new}. Extracts the X-Spam-Status
+-- header, bins scores into 10 buckets of width 0.1, and counts
+-- filter/user disagreements:
+--   fn = message in Junk but scored GOOD (user flagged missed spam)
+--   fp = message in Inbox but scored SPAM (user rescued a false positive)
+-- Also captures db counts via `spamlite counts`. Appends one compact JSONL
+-- line per day to ~/.spamlite-stats.jsonl, chowned back to the mailbox owner.
+--
+-- Usage:
+--   spamlite-stats-collect            -- normal nightly run (cron)
+--   spamlite-stats-collect --force    -- re-run even if today's line exists
+--   spamlite-stats-collect --user P   -- process a single user home (debug)
+--   spamlite-stats-collect --dry-run  -- print would-write lines, touch nothing
+--
+-- Mix port of the python prototype (2026-06-13). The one Mix change it
+-- needed: bytes_to_string($b, {lossy:true}) — added in mix 0.17.2 — so a
+-- raw-8bit byte before the ASCII header doesn't reject the whole decode.
+-- The ionice/nice self-renice the python did is dropped: the cron wraps it.
+-- Design rationale: ~/.ns/blsyd/bl01/b1/mrn/_journal/2026-04-11.md.
+
+$SPAMLITE_BIN = "/usr/local/bin/spamlite"
+$STATS_NAME = ".spamlite-stats.jsonl"
+$HEADER_BYTES = 8192
+$SCORE_RE = "(?im)^X-Spam-Status:\\s*(SPAM|GOOD)\\s+([0-9.]+)"
+
+function warn($msg)
+  -- no eprint builtin; cron merges 2>&1 into the log anyway.
+  print("warn: " .. $msg)
+end
+
+-- 0.0-0.1 -> 0, ..., 0.9-1.0 -> 9. >=1.0 clamps to 9, <0 to 0.
+-- (fmt("%d") truncates toward zero, so 9.99 -> 9, matching python int().)
+function bucket($score)
+  if $score >= 1.0 then
+    return 9
+  end
+  if $score < 0.0 then
+    return 0
+  end
+  return to_number(fmt("%d", $score * 10))
+end
+
+-- Read the first HEADER_BYTES of a message, lossy-decode, regex the
+-- X-Spam-Status header. Returns {verdict, score} or nil.
+function read_score($path)
+  try
+    $bytes = read_file_bytes($path, $HEADER_BYTES)
+    $head = bytes_to_string($bytes, {"lossy": true})
+    $m = regex_find($SCORE_RE, $head)
+    if length($m) == 0 then
+      return nil
+    end
+    $g = $m[0]["groups"]
+    return {"verdict": upper($g[0]), "score": to_number($g[1])}
+  catch $e
+    return nil
+  end
+end
+
+-- Walk the four maildir folders, return histograms + correction counts.
+-- find does the ctime-vs-cursor filter server-side and prints inode+path
+-- in one fork per folder; %i feeds the within-run inode dedupe set.
+function scan_user($home, $cursor_ts, $stats_exists, $stats_path)
+  $in_hist = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  $jk_hist = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  $fn = 0
+  $fp = 0
+  $seen = 0
+  $inodes = {}
+  $folders = [
+    {"kind": "inbox", "path": $home .. "/Maildir/cur"},
+    {"kind": "inbox", "path": $home .. "/Maildir/new"},
+    {"kind": "junk", "path": $home .. "/Maildir/.Junk/cur"},
+    {"kind": "junk", "path": $home .. "/Maildir/.Junk/new"}
+  ]
+  for each $f in $folders
+    $dir = $f["path"]
+    if not is_dir($dir) then
+      continue
+    end
+    if $stats_exists then
+      $newer = "-newercc " .. shell_quote($stats_path)
+    else
+      $newer = "-newerct " .. shell_quote("@" .. fmt("%d", $cursor_ts))
+    end
+    $cmd = "find " .. shell_quote($dir) .. " -maxdepth 1 -type f " .. $newer .. " -printf '%i\\t%p\\n'"
+    $r = run_rc($cmd)
+    if $r["rc"] != 0 then
+      warn("find " .. $dir .. ": " .. trim($r["stderr"]))
+      continue
+    end
+    $out = trim($r["stdout"])
+    if $out == "" then
+      continue
+    end
+    for each $line in split($out, "\n")
+      $parts = split($line, "\t")
+      if length($parts) < 2 then
+        continue
+      end
+      $ino = $parts[0]
+      $path = $parts[1]
+      if has_key($inodes, $ino) then
+        continue
+      end
+      $inodes[$ino] = true
+      $res = read_score($path)
+      if $res == nil then
+        continue
+      end
+      $bk = bucket($res["score"])
+      $seen = $seen + 1
+      if $f["kind"] == "inbox" then
+        $in_hist[$bk] = $in_hist[$bk] + 1
+        if $res["verdict"] == "SPAM" then
+          $fp = $fp + 1
+        end
+      else
+        $jk_hist[$bk] = $jk_hist[$bk] + 1
+        if $res["verdict"] == "GOOD" then
+          $fn = $fn + 1
+        end
+      end
+    end
+  end
+  return {"in": $in_hist, "jk": $jk_hist, "fn": $fn, "fp": $fp, "seen": $seen}
+end
+
+-- [good, spam, tokens] from `spamlite counts`, or nil on error.
+-- coreutils `timeout` gives the 30s bound run_rc has no native option for.
+function db_counts($home)
+  $sp = $home .. "/" .. ".spamlite"
+  $r = run_rc("timeout 30 " .. $SPAMLITE_BIN .. " -d " .. shell_quote($sp) .. " counts")
+  if $r["rc"] != 0 then
+    warn("spamlite counts " .. $sp .. " rc=" .. ("" .. $r["rc"]) .. ": " .. trim($r["stderr"]))
+    return nil
+  end
+  $good = 0
+  $spam = 0
+  $tokens = 0
+  for each $line in split($r["stdout"], "\n")
+    $ci = pos(":", $line)
+    if $ci == 0 then
+      continue
+    end
+    $key = lower(trim(substr($line, 0, $ci - 1)))
+    $valstr = trim(substr($line, $ci, length($line) - $ci))
+    $words = split($valstr, " ")
+    if length($words) == 0 then
+      continue
+    end
+    $n = nil
+    try
+      $n = to_number($words[0])
+    catch $e
+      $n = nil
+    end
+    if $n == nil then
+      continue
+    end
+    if starts_with($key, "good") then
+      $good = $n
+    end
+    if starts_with($key, "spam") then
+      $spam = $n
+    end
+    if starts_with($key, "unique") then
+      $tokens = $n
+    end
+  end
+  return [$good, $spam, $tokens]
+end
+
+-- The 'd' field of the last JSONL line, or nil. Stats files are one
+-- line/day, so the whole file is tiny — no seek-from-end needed.
+function last_line_date($stats_path)
+  try
+    $lines = read_lines($stats_path)
+    if length($lines) == 0 then
+      return nil
+    end
+    $last = $lines[length($lines) - 1]
+    if trim($last) == "" then
+      return nil
+    end
+    return json_parse($last)["d"]
+  catch $e
+    return nil
+  end
+end
+
+-- Scan one user, append (or dry-print) their daily line. Returns a status
+-- string on write/dry, or nil when skipped (already written today).
+function process_user($home, $uid, $gid, $today, $force, $dry_run)
+  $stats_path = $home .. "/" .. $STATS_NAME
+  $stats_exists = is_file($stats_path)
+  if $stats_exists then
+    $cursor_ts = stat($stats_path)["ctime"]
+    if not $force then
+      if last_line_date($stats_path) == $today then
+        return nil
+      end
+    end
+  else
+    $cursor_ts = time() - 86400
+  end
+
+  $window_from = date_format($cursor_ts, "%Y-%m-%dT%H:%M")
+  $window_to = date_format(time(), "%Y-%m-%dT%H:%M")
+
+  $scan = scan_user($home, $cursor_ts, $stats_exists, $stats_path)
+  $db = db_counts($home)
+  if $db == nil then
+    $db = [0, 0, 0]
+  end
+
+  $line = {
+    "d": $today,
+    "db": $db,
+    "in": $scan["in"],
+    "jk": $scan["jk"],
+    "corr": {"fn": $scan["fn"], "fp": $scan["fp"]},
+    "w": [$window_from, $window_to]
+  }
+  $encoded = json_encode($line)
+
+  $summary = "seen=" .. ("" .. $scan["seen"]) .. " fn=" .. ("" .. $scan["fn"]) .. " fp=" .. ("" .. $scan["fp"])
+  if $dry_run then
+    print("  DRY " .. $home .. ": " .. $encoded)
+    return $summary
+  end
+
+  append_file($stats_path, $encoded .. "\n")
+  try
+    chown($stats_path, $uid, $gid)
+    chmod($stats_path, 0o644)
+  catch $e
+    warn("chown " .. $stats_path .. ": " .. ("" .. $e))
+  end
+  return $summary .. " db=" .. ("" .. $db[0]) .. "/" .. ("" .. $db[1]) .. "/" .. ("" .. $db[2])
+end
+
+-- ---- main ----
+
+$go = getopt(args(), {"force": {}, "dry-run": {}, "user": {"arg": true}})
+$force = $go["opts"]["force"]
+$dry_run = $go["opts"]["dry-run"]
+$single = $go["opts"]["user"]
+
+$today = date_format(time(), "%Y-%m-%d")
+$started = time()
+print("[" .. date_format($started, "%Y-%m-%dT%H:%M:%S") .. "] spamlite-stats-collect today=" .. $today .. " force=" .. ("" .. $force) .. " dry_run=" .. ("" .. $dry_run))
+
+$users = []
+if $single then
+  $sp = $single .. "/.spamlite"
+  $st = nil
+  try
+    $st = stat($sp)
+  catch $e
+    print("no .spamlite/ at " .. $single .. ": " .. ("" .. $e))
+    exit(1)
+  end
+  push($users, {"home": $single, "uid": $st["uid"], "gid": $st["gid"]})
+else
+  for each $d in sort(glob("/srv/*/msg/*/.spamlite"))
+    try
+      $st = stat($d)
+      push($users, {"home": dirname($d), "uid": $st["uid"], "gid": $st["gid"]})
+    catch $e
+      warn("stat " .. $d .. ": " .. ("" .. $e))
+    end
+  end
+end
+
+$n_ok = 0
+$n_skip = 0
+$n_err = 0
+for each $u in $users
+  try
+    $msg = process_user($u["home"], $u["uid"], $u["gid"], $today, $force, $dry_run)
+    if $msg == nil then
+      $n_skip = $n_skip + 1
+    else
+      $n_ok = $n_ok + 1
+      print("  ok " .. $u["home"] .. ": " .. $msg)
+    end
+  catch $e
+    $n_err = $n_err + 1
+    warn($u["home"] .. ": " .. ("" .. $e))
+  end
+end
+
+$elapsed = time() - $started
+print("[done] users=" .. ("" .. length($users)) .. " ok=" .. ("" .. $n_ok) .. " skip=" .. ("" .. $n_skip) .. " err=" .. ("" .. $n_err) .. " elapsed=" .. fmt("%.1f", $elapsed) .. "s")
