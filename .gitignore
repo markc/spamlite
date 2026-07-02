@@ -6,4 +6,5 @@ admin_maildir/
 
 # Private ops docs/journals — NEVER commit (fresh anonymized _doc/ may return later)
 _journal/
+deploy-private/
 _doc-private/

@@ -508,9 +508,9 @@ pub struct TokenDetail {
 }
 
 /// Full breakdown of a classification decision, returned by `classify_explain`.
-/// Intended for debugging individual messages — e.g. why a balanced-corpus user
-/// like cam@ck20 gets fp on specific messages. Do not call from the sieve hot
-/// path; use `classify` instead.
+/// Intended for debugging individual messages — e.g. why a balanced-corpus
+/// user gets false positives on specific messages. Do not call from the sieve
+/// hot path; use `classify` instead.
 #[derive(Debug)]
 pub struct Explanation {
     pub verdict: Verdict,

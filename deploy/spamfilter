@@ -13,7 +13,7 @@
 #
 # Side benefit: lowercases $DIR before use, working around a pre-existing
 # sieve-script bug where ${lhs}/${rhs} aren't lowercased and uppercase
-# recipient addresses (e.g. SCOTT@PROMANTT.COM.AU) would land in a path
+# recipient addresses (e.g. SCOTT@EXAMPLE.COM.AU) would land in a path
 # that does not exist.
 
 CANDIDATE_VER="0.6.0"
@@ -34,7 +34,7 @@ cat > "$TMP"
 # stop confidence-gated TOE self-training on inbound. That auto-training created
 # a self-reinforcing false-positive loop — a legit bulk-ESP sender scoring >=0.8
 # trains itself as spam on every delivery, faster than users can rescue it from
-# Junk (e.g. kiri@tewantintravel.com, a travel agent whose supplier mail is all
+# Junk (e.g. a travel agent whose supplier mail is all
 # bulk-ESP). Supervised training still happens via spamfilter-retrain on IMAP
 # Junk moves. Revert by restoring spamfilter.bak-2026-06-26.
 SLCMD="$CMD"

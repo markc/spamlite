@@ -431,11 +431,11 @@ mod tests {
 
     #[test]
     fn test_parse_train_line() {
-        let line = "2026-04-14T18:36:24.600202+10:00 mail dovecot: imap(sandy@gardinermail.com.au)<3881567><wtaHdmdPPoXLGYQI>: sieve: DEBUG: TRAIN: sandy@gardinermail.com.au -> good";
+        let line = "2026-04-14T18:36:24.600202+10:00 mail dovecot: imap(jill@corp-e.example.com.au)<3881567><wtaHdmdPPoXLGYQI>: sieve: DEBUG: TRAIN: jill@corp-e.example.com.au -> good";
         match parse_line(line) {
             ParsedLine::Train(ev) => {
                 assert_eq!(ev.timestamp, "2026-04-14T18:36:24.600202+10:00");
-                assert_eq!(ev.user, "sandy@gardinermail.com.au");
+                assert_eq!(ev.user, "jill@corp-e.example.com.au");
                 assert_eq!(ev.verdict, "good");
                 assert_eq!(ev.session, "wtaHdmdPPoXLGYQI");
             }
@@ -445,11 +445,11 @@ mod tests {
 
     #[test]
     fn test_parse_delivery_line() {
-        let line = "2026-04-12T00:24:10.067207+10:00 mail dovecot: lmtp(admin@mcclintocks.com.au)<3174350><KzEVOYlZ2mnObzAAmhYRNg>: sieve: DEBUG: DELIVERY: admin@mcclintocks.com.au -> Inbox (GOOD 0.078958)";
+        let line = "2026-04-12T00:24:10.067207+10:00 mail dovecot: lmtp(admin@corp-f.example.com.au)<3174350><KzEVOYlZ2mnObzAAmhYRNg>: sieve: DEBUG: DELIVERY: admin@corp-f.example.com.au -> Inbox (GOOD 0.078958)";
         match parse_line(line) {
             ParsedLine::Delivery(d) => {
                 assert_eq!(d.timestamp, "2026-04-12T00:24:10.067207+10:00");
-                assert_eq!(d.user, "admin@mcclintocks.com.au");
+                assert_eq!(d.user, "admin@corp-f.example.com.au");
                 assert_eq!(d.verdict, "GOOD");
                 assert_eq!(d.score, "0.078958");
                 assert_eq!(d.folder, "Inbox");
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_parse_delivery_spam_to_junk() {
-        let line = "2026-04-12T00:28:22.157192+10:00 mail dovecot: lmtp(georgivs@nospam.com.au)<3174747><nhZqAoVa2mlbcTAAmhYRNg>: sieve: DEBUG: DELIVERY: georgivs@nospam.com.au -> Junk (SPAM 1.000000)";
+        let line = "2026-04-12T00:28:22.157192+10:00 mail dovecot: lmtp(felix@corp-d.example.com.au)<3174747><nhZqAoVa2mlbcTAAmhYRNg>: sieve: DEBUG: DELIVERY: felix@corp-d.example.com.au -> Junk (SPAM 1.000000)";
         match parse_line(line) {
             ParsedLine::Delivery(d) => {
                 assert_eq!(d.verdict, "SPAM");
@@ -491,10 +491,10 @@ mod tests {
     fn test_parse_msgid_fileinto_variant() {
         // fileinto action path (system-sender filtering) also has the same
         // "stored mail into mailbox" tail shape.
-        let line = "2026-04-12T00:27:20.400443+10:00 mail dovecot: lmtp(admin@renta.net)<3174648><CKcZKkda2mn4cDAAmhYRNg>: sieve: msgid=<20260411142711.AD36363E42@pve5.goldcoast.org>: fileinto action: stored mail into mailbox 'Trash'";
+        let line = "2026-04-12T00:27:20.400443+10:00 mail dovecot: lmtp(admin@renta.net)<3174648><CKcZKkda2mn4cDAAmhYRNg>: sieve: msgid=<20260411142711.AD36363E42@mx.example.org>: fileinto action: stored mail into mailbox 'Trash'";
         match parse_line(line) {
             ParsedLine::Msgid(m) => {
-                assert_eq!(m.msgid, "<20260411142711.AD36363E42@pve5.goldcoast.org>");
+                assert_eq!(m.msgid, "<20260411142711.AD36363E42@mx.example.org>");
             }
             _ => panic!("expected Msgid variant"),
         }

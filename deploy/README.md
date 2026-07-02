@@ -4,6 +4,10 @@ Production files deployed to `mail.renta.net` (mrn). Keep this directory in
 sync with the server so the git repo is authoritative and deployments are
 reviewable.
 
+Host-specific one-off scripts that embed real user/domain values (review
+crons etc.) live in the gitignored `deploy-private/` directory, not here.
+Example identities in this file are anonymized.
+
 ## Files
 
 - **`spamfilter`** — sieve `execute :pipe` wrapper. Installed at
@@ -38,9 +42,9 @@ echo '*' | sudo tee /etc/spamlite-shadow.allow
 
 ```bash
 sudo tee /etc/spamlite-shadow.allow <<EOF
-admin@renta.net
-cam@ck20.com
-kenelle@auzy.net.au
+admin@example.com
+evan@corp-c.example.com
+alice@agency-a.example.net.au
 EOF
 ```
 
@@ -70,7 +74,7 @@ sudo find /srv -maxdepth 5 -name shadow.jsonl -print0 \
 The wrapper does `DIR="${DIR,,}"` before using `$DIR` because the sieve
 script at `/etc/dovecot/sieve/global.sieve` does not lowercase the
 `${lhs}`/`${rhs}` variables before building the `/srv/${rhs}/msg/${lhs}`
-path. Uppercase-addressed inbound mail (e.g. `SCOTT@PROMANTT.COM.AU`) was
+path. Uppercase-addressed inbound mail (e.g. `SCOTT@EXAMPLE.COM.AU`) was
 producing `lmtp: Error: caught runtime exception: No such file or directory`
 followed by `Terminated with non-zero exit code 1`. 5 such errors in
 2026-04-12..2026-04-15 logs. The wrapper fix bypasses the sieve bug without
