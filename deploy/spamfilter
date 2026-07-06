@@ -16,7 +16,7 @@
 # recipient addresses (e.g. SCOTT@EXAMPLE.COM.AU) would land in a path
 # that does not exist.
 
-CANDIDATE_VER="0.6.0"
+CANDIDATE_VER="0.8.0"
 CANDIDATE_BIN="/usr/local/bin/spamlite-${CANDIDATE_VER}"
 
 DIR="$1"; shift
