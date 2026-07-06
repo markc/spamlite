@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 use crate::storage::Database;
+use std::collections::HashMap;
 
 /// Classification result
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Verdict {
     Spam,
     Good,
@@ -87,6 +88,38 @@ pub struct Params {
     /// is what makes "one ham retrain flips the sender" work. Message totals are
     /// bumped once; only token counts repeat, so the corpus ratio stays honest.
     pub train_max_reps: u64,
+    /// Enable the abuse-TLD hard-rail (default off). When on, a message that
+    /// carries BOTH an abuse-only sending TLD (`x:tld:<t>` with `good == 0` and
+    /// `spam >= rail_min_spam` in the DB) AND a structural co-flag
+    /// (`x:brandmiss:*`, `x:confusable`, or `x:mixedscript`) has its combined
+    /// score floored to `rail_floor` — a hard structural override of the soft
+    /// Bayesian score. This is the lever for inbox-spam that mimics the user's
+    /// own marketing vocabulary, where a single strong `x:tld` token is otherwise
+    /// washed out by the Robinson-Fisher combiner (see the pacdaz gate). Requires
+    /// the tokenizer's `tld_feature`+`homoglyph_fold`/`brand_mismatch` flags to be
+    /// on so the tokens it keys off are actually emitted.
+    pub rail: bool,
+    /// Weak-tier floor: minimum spam-only occurrences a `x:tld:<t>` token needs
+    /// (with `good == 0`) before it counts as "abuse-only" at all. A TLD between
+    /// this and `rail_strong_spam` fires only WITH a co-flag. Default 2 (thin
+    /// evidence, guarded by the co-flag requirement).
+    pub rail_min_spam: u64,
+    /// Strong-tier threshold: an abuse-only TLD with `spam >= rail_strong_spam`
+    /// fires the rail on its own (no co-flag needed) — the evidence is strong
+    /// enough that corroboration is unnecessary. Must be `>= rail_min_spam` to be
+    /// meaningful. Default 15. Set very high to force every tier to require a
+    /// co-flag (the original strict conjunction).
+    pub rail_strong_spam: u64,
+    /// Score the rail floors a tripped message to. Must clear any realistic
+    /// threshold so the verdict flips to SPAM. Default 0.95.
+    pub rail_floor: f64,
+    /// Master switch for the weak tier's co-flag requirement. Default `true` —
+    /// weak-tier abuse-TLDs (below `rail_strong_spam`) must carry a structural
+    /// co-flag, which is the FP guard against cold-start on thin gTLDs. Setting it
+    /// `false` collapses both tiers to "abuse-TLD alone" (pure relax): higher
+    /// recall against co-flag-free throwaway-TLD spam, but it trades away that
+    /// guard — a gate-measurement lever, not a production default.
+    pub rail_require_coflag: bool,
 }
 
 impl Default for Params {
@@ -103,6 +136,11 @@ impl Default for Params {
             min_distance: 0.0,
             min_array_size: 0,
             train_max_reps: 1,
+            rail: false,
+            rail_min_spam: 2,
+            rail_strong_spam: 15,
+            rail_floor: 0.95,
+            rail_require_coflag: true,
         }
     }
 }
@@ -127,6 +165,11 @@ impl Params {
     /// min_distance = 0.1
     /// min_array_size = 15
     /// train_max_reps = 5
+    /// rail = true              # abuse-TLD hard-rail (default off)
+    /// rail_min_spam = 2        # weak-tier floor: x:tld spam-only count to qualify
+    /// rail_strong_spam = 15    # strong-tier: fires without a co-flag at/above this
+    /// rail_floor = 0.95        # score a tripped message is floored to
+    /// rail_require_coflag = true  # weak-tier needs a co-flag (false = pure relax)
     /// ```
     pub fn load_overrides(&mut self, db_dir: &std::path::Path) {
         let path = db_dir.join("params.toml");
@@ -275,6 +318,43 @@ impl Params {
                         }
                     }
                 }
+                "rail" => match v.to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => self.rail = true,
+                    "0" | "false" | "no" | "off" => self.rail = false,
+                    _ => reject(k, v, "true|false"),
+                },
+                "rail_min_spam" => {
+                    if let Ok(x) = parse_u(v, k) {
+                        if (1..=1_000_000).contains(&x) {
+                            self.rail_min_spam = x;
+                        } else {
+                            reject(k, v, "1..=1000000");
+                        }
+                    }
+                }
+                "rail_strong_spam" => {
+                    if let Ok(x) = parse_u(v, k) {
+                        if (1..=1_000_000).contains(&x) {
+                            self.rail_strong_spam = x;
+                        } else {
+                            reject(k, v, "1..=1000000");
+                        }
+                    }
+                }
+                "rail_floor" => {
+                    if let Ok(x) = parse_f(v, k) {
+                        if (0.5..=1.0).contains(&x) {
+                            self.rail_floor = x;
+                        } else {
+                            reject(k, v, "0.5..=1.0");
+                        }
+                    }
+                }
+                "rail_require_coflag" => match v.to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => self.rail_require_coflag = true,
+                    "0" | "false" | "no" | "off" => self.rail_require_coflag = false,
+                    _ => reject(k, v, "true|false"),
+                },
                 _ => eprintln!(
                     "spamlite: {}:{}: unknown key {k:?} (ignored)",
                     path.display(),
@@ -422,6 +502,117 @@ fn score_fws(fws: &[f64], params: &Params) -> Option<Scored> {
     })
 }
 
+/// A trip of the abuse-TLD hard-rail: the message carried an abuse-only sending
+/// TLD token (optionally with a structural co-flag), so `apply_rail` floors its
+/// score. Carried out of `classify_explain` for the `explain` diagnostic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RailHit {
+    /// The abuse-only TLD token that qualified, e.g. `x:tld:life`.
+    pub tld_token: String,
+    /// Its DB spam count (`good` is 0 by definition of the rail).
+    pub tld_spam: u64,
+    /// The structural co-flag token that co-occurred (`(none)` when a strong-tier
+    /// TLD fired without one).
+    pub co_flag: String,
+    /// Which tier fired: `true` = strong (spam >= `rail_strong_spam`, co-flag not
+    /// required), `false` = weak (`rail_min_spam` <= spam < `rail_strong_spam`,
+    /// co-flag required).
+    pub strong: bool,
+}
+
+/// Evaluate the two-tier abuse-TLD hard-rail against a message's tokens and the
+/// DB counts already fetched for them. Returns `Some(hit)` when the rail should
+/// fire. `params.rail` must be on and the message must carry an `x:tld:<t>` token
+/// whose DB counts are abuse-only (`good == 0` and `spam >= rail_min_spam`). Then
+/// the tier decides whether a co-flag is also required:
+///
+/// - **Strong tier** (`spam >= rail_strong_spam`): fires on the TLD alone. Such a
+///   TLD has overwhelming spam-only evidence, so flooring without corroboration is
+///   safe — this is what catches the plain throwaway-TLD phishing (`.life`, `.shop`)
+///   that carries no homoglyph/brand signal.
+/// - **Weak tier** (`rail_min_spam <= spam < rail_strong_spam`): requires a
+///   structural co-flag (`x:brandmiss:*` / `x:confusable` / `x:mixedscript`). The
+///   co-flag is the guard that stops a first-contact legit sender on a thin gTLD
+///   (e.g. a real business on `.email`, `good==0` purely from cold-start) being
+///   floored on weak evidence alone.
+///
+/// `rail_require_coflag == false` collapses both tiers to "TLD alone" (pure relax,
+/// a gate-measurement lever that trades away the weak-tier cold-start guard).
+///
+/// `known` is the same `lookup_tokens` map `classify` builds; unknown TLD tokens
+/// (absent from the map) never qualify. Presence-only for co-flags — a co-flag's
+/// own DB counts are irrelevant, only that the current message emitted one.
+fn rail_hit(
+    token_words: &[String],
+    known: &HashMap<String, (u64, u64)>,
+    params: &Params,
+) -> Option<RailHit> {
+    if !params.rail {
+        return None;
+    }
+    let co_flag = token_words.iter().find(|t| {
+        t.as_str() == "x:confusable"
+            || t.as_str() == "x:mixedscript"
+            || t.starts_with("x:brandmiss:")
+    });
+    let co_flag_label = co_flag.map(|s| s.as_str()).unwrap_or("(none)");
+    // A misconfigured `rail_strong_spam < rail_min_spam` would make every
+    // qualifying TLD "strong" (fires alone), silently disabling the weak-tier
+    // co-flag guard. Clamp so the strong threshold is never below the entry gate.
+    let strong_threshold = params.rail_strong_spam.max(params.rail_min_spam);
+    for t in token_words {
+        if !t.starts_with("x:tld:") {
+            continue;
+        }
+        let Some(&(good, spam)) = known.get(t) else { continue };
+        if good != 0 || spam < params.rail_min_spam {
+            continue;
+        }
+        let strong = spam >= strong_threshold;
+        // A weak-tier abuse-TLD needs a co-flag; a strong-tier one fires alone.
+        // Skip (keep scanning) rather than return so a later strong TLD in the
+        // same message can still trip the rail.
+        if params.rail_require_coflag && !strong && co_flag.is_none() {
+            continue;
+        }
+        return Some(RailHit {
+            tld_token: t.clone(),
+            tld_spam: spam,
+            co_flag: co_flag_label.to_string(),
+            strong,
+        });
+    }
+    None
+}
+
+/// Apply the hard-rail to a base score. When `hit` is `Some`, floor the score to
+/// `params.rail_floor` (never lowers a score already above the floor). Returns
+/// the possibly-floored score; the caller re-derives the verdict from it so the
+/// threshold comparison stays the single source of the SPAM/GOOD decision.
+fn apply_rail(base: f64, hit: &Option<RailHit>, params: &Params) -> f64 {
+    if hit.is_some() {
+        base.max(params.rail_floor)
+    } else {
+        base
+    }
+}
+
+/// Re-derive the verdict after `apply_rail`. When the rail fired the verdict is
+/// taken purely from the (possibly floored) score vs threshold; otherwise the
+/// combiner's own `base` verdict is kept. Shared by `classify` and both
+/// `classify_explain` paths so the rail can never make the two disagree.
+fn rail_verdict(base: Verdict, score: f64, hit: &Option<RailHit>, params: &Params) -> Verdict {
+    if hit.is_some() {
+        if score >= params.threshold {
+            Verdict::Spam
+        } else {
+            Verdict::Good
+        }
+    } else {
+        base
+    }
+}
+
 /// Classify a set of tokens against the database.
 /// Returns (verdict, score) where score is 0.0 (definitely good) to 1.0 (definitely spam).
 pub fn classify(
@@ -452,10 +643,19 @@ pub fn classify(
         })
         .collect();
 
-    Ok(match score_fws(&fws, params) {
+    let (base_verdict, base) = match score_fws(&fws, params) {
         Some(s) => (s.verdict, s.combined.score),
         None => (Verdict::Good, 0.5),
-    })
+    };
+
+    // Hard-rail post-combine: a structural override for abuse-TLD mail the soft
+    // Bayesian combiner dilutes. Floors the score, then the verdict is re-derived
+    // from it. No-op (keeps the combiner's own verdict) when the rail is off or
+    // does not trip — so default behaviour is unchanged.
+    let hit = rail_hit(token_words, &known, params);
+    let score = apply_rail(base, &hit, params);
+    let verdict = rail_verdict(base_verdict, score, &hit, params);
+    Ok((verdict, score))
 }
 
 /// One message represented as the per-token (good_count, spam_count) pairs
@@ -527,6 +727,10 @@ pub struct Explanation {
     pub h_ham: f64,
     pub p_spam: f64,
     pub p_ham: f64,
+    /// `Some` when the abuse-TLD hard-rail fired for this message (score floored).
+    /// `None` when the rail is off or did not trip. Debug-only; the `score`/
+    /// `verdict` above already reflect the floor.
+    pub rail: Option<RailHit>,
 }
 
 /// Like `classify`, but retains per-token detail for debugging. Returns an
@@ -553,6 +757,7 @@ pub fn classify_explain(
         h_ham: 0.0,
         p_spam: 0.0,
         p_ham: 0.0,
+        rail: None,
     };
 
     if total_good_raw < 1 && total_spam_raw < 1 {
@@ -589,8 +794,22 @@ pub fn classify_explain(
         }
     }
 
+    // The rail is evaluated ONCE and applied on BOTH the normal and the
+    // no-interesting-tokens paths, so `classify_explain` can never disagree with
+    // `classify` — which also rails the empty-selection base of 0.5. (Missing this
+    // on the `None` path was a real divergence: a message with an abuse-only TLD
+    // but no interesting tokens rails to SPAM in `classify` yet showed GOOD here.)
+    let hit = rail_hit(token_words, &known, params);
+
     let Some(s) = score_fws(&fws, params) else {
-        return Ok(neutral(total_good_raw, total_spam_raw, known_count));
+        // No interesting tokens → neutral base 0.5, then the rail applies.
+        let score = apply_rail(0.5, &hit, params);
+        let verdict = rail_verdict(Verdict::Good, score, &hit, params);
+        let mut e = neutral(total_good_raw, total_spam_raw, known_count);
+        e.verdict = verdict;
+        e.score = score;
+        e.rail = hit;
+        return Ok(e);
     };
 
     // For display, map the selected indices back to their known-token details,
@@ -602,9 +821,13 @@ pub fn classify_explain(
         .filter_map(|&i| details[i].take())
         .collect();
 
+    // Same rail as `classify`: floor the score and re-derive the verdict.
+    let score = apply_rail(s.combined.score, &hit, params);
+    let verdict = rail_verdict(s.verdict, score, &hit, params);
+
     Ok(Explanation {
-        verdict: s.verdict,
-        score: s.combined.score,
+        verdict,
+        score,
         total_good: total_good_raw,
         total_spam: total_spam_raw,
         msg_tokens: token_words.len(),
@@ -614,6 +837,7 @@ pub fn classify_explain(
         h_ham: s.combined.h_ham,
         p_spam: s.combined.p_spam,
         p_ham: s.combined.p_ham,
+        rail: hit,
     })
 }
 
@@ -856,5 +1080,243 @@ mod tests {
         // floor off → keep all
         p.min_distance = 0.0;
         assert_eq!(min_distance_keep(&sorted, &p), 5);
+    }
+
+    // ---- abuse-TLD hard-rail (two-tier) ----
+
+    /// DB where a message's discriminating vocabulary is ham-shaped (so the soft
+    /// score lands under any threshold) but the sender's TLD is abuse-only. Two
+    /// abuse TLDs: `.life` (spam=20, STRONG under default rail_strong_spam=15) and
+    /// `.work` (spam=3, WEAK), plus legit `.com.au` (ham → never abuse). Mirrors
+    /// the pacdaz corpus shape: strong throwaway gTLDs + a thin one.
+    fn setup_rail_db() -> Database {
+        let db = Database::open(Path::new(":memory:")).unwrap();
+        let ham: Vec<String> = vec![
+            "b:hello".into(),
+            "b:agenda".into(),
+            "b:project".into(),
+            "b:meeting".into(),
+            "b:report".into(),
+            "x:tld:com.au".into(),
+        ];
+        for _ in 0..30 {
+            db.inc_total_good().unwrap();
+            db.train(&ham, false).unwrap();
+        }
+        // 20 spam from an abuse-only `.life` TLD (strong tier).
+        let spam_life: Vec<String> =
+            vec!["b:hello".into(), "b:agenda".into(), "b:project".into(), "x:tld:life".into()];
+        for _ in 0..20 {
+            db.inc_total_spam().unwrap();
+            db.train(&spam_life, true).unwrap();
+        }
+        // 3 spam from an abuse-only `.work` TLD (weak tier — thin evidence).
+        let spam_work: Vec<String> = vec!["b:hello".into(), "b:agenda".into(), "x:tld:work".into()];
+        for _ in 0..3 {
+            db.inc_total_spam().unwrap();
+            db.train(&spam_work, true).unwrap();
+        }
+        db
+    }
+
+    // Held-out phishing: ham-shaped body, `.life` (strong) sender, homoglyph flag.
+    fn rail_msg() -> Vec<String> {
+        vec![
+            "x:tld:life".into(),
+            "x:confusable".into(),
+            "b:hello".into(),
+            "b:agenda".into(),
+            "b:project".into(),
+            "b:meeting".into(),
+            "b:report".into(),
+        ]
+    }
+
+    // The same, but sending from the WEAK `.work` TLD.
+    fn rail_msg_weak(with_coflag: bool) -> Vec<String> {
+        let mut m: Vec<String> = vec![
+            "x:tld:work".into(),
+            "b:hello".into(),
+            "b:agenda".into(),
+            "b:project".into(),
+            "b:meeting".into(),
+            "b:report".into(),
+        ];
+        if with_coflag {
+            m.push("x:brandmiss:apple".into());
+        }
+        m
+    }
+
+    fn rail_on() -> Params {
+        Params { rail: true, ..Default::default() } // min_spam=2, strong_spam=15
+    }
+
+    #[test]
+    fn test_rail_off_by_default_no_change() {
+        let db = setup_rail_db();
+        let (v_off, s_off) = classify(&db, &rail_msg(), &Params::default()).unwrap();
+        assert!(s_off < 0.95, "base score should be sub-floor, got {s_off}");
+        assert_eq!(v_off, Verdict::Good, "default (rail off) leaves it GOOD");
+    }
+
+    #[test]
+    fn test_rail_strong_tier_fires_without_coflag() {
+        let db = setup_rail_db();
+        // Strong abuse TLD (.life spam=20 >= strong 15), NO co-flag → fires alone.
+        let msg: Vec<String> = vec![
+            "x:tld:life".into(),
+            "b:hello".into(),
+            "b:agenda".into(),
+            "b:project".into(),
+            "b:meeting".into(),
+            "b:report".into(),
+        ];
+        let base = classify(&db, &msg, &Params::default()).unwrap().1;
+        let (v, s) = classify(&db, &msg, &rail_on()).unwrap();
+        assert_eq!(s, base.max(0.95));
+        assert!(s >= 0.95 && v == Verdict::Spam, "strong tier floors without co-flag");
+        let hit = classify_explain(&db, &msg, &rail_on()).unwrap().rail.unwrap();
+        assert!(hit.strong, "should be flagged strong tier");
+        assert_eq!(hit.co_flag, "(none)");
+    }
+
+    #[test]
+    fn test_rail_weak_tier_needs_coflag() {
+        let db = setup_rail_db();
+        // Weak abuse TLD (.work spam=3, 2<=3<15) WITHOUT co-flag → must NOT fire.
+        let base = classify(&db, &rail_msg_weak(false), &Params::default()).unwrap();
+        assert_eq!(
+            classify(&db, &rail_msg_weak(false), &rail_on()).unwrap(),
+            base,
+            "weak tier without co-flag is inert (the cold-start FP guard)"
+        );
+        // WITH a co-flag → fires, flagged weak tier.
+        let (v, s) = classify(&db, &rail_msg_weak(true), &rail_on()).unwrap();
+        assert!(s >= 0.95 && v == Verdict::Spam, "weak tier + co-flag fires");
+        let hit = classify_explain(&db, &rail_msg_weak(true), &rail_on()).unwrap().rail.unwrap();
+        assert!(!hit.strong, "should be flagged weak tier");
+        assert_eq!(hit.tld_token, "x:tld:work");
+        assert_eq!(hit.co_flag, "x:brandmiss:apple");
+    }
+
+    #[test]
+    fn test_rail_requires_abuse_only_tld() {
+        let db = setup_rail_db();
+        // co-flag present, but the only TLD is `com.au` (good>0) → not abuse-only.
+        let msg: Vec<String> = vec![
+            "x:tld:com.au".into(),
+            "x:confusable".into(),
+            "b:hello".into(),
+            "b:agenda".into(),
+            "b:project".into(),
+        ];
+        let base = classify(&db, &msg, &Params::default()).unwrap();
+        assert_eq!(classify(&db, &msg, &rail_on()).unwrap(), base, "ham-bearing TLD → inert");
+    }
+
+    #[test]
+    fn test_rail_min_spam_floor() {
+        let db = setup_rail_db(); // .life spam=20
+        // rail_min_spam above the TLD's spam count → below the floor → no fire.
+        let strict = Params { rail: true, rail_min_spam: 25, rail_strong_spam: 25, ..Default::default() };
+        let base = classify(&db, &rail_msg(), &Params::default()).unwrap();
+        assert_eq!(classify(&db, &rail_msg(), &strict).unwrap(), base, "spam below min → inert");
+        // default (min=2) → the strong .life fires.
+        assert!(classify(&db, &rail_msg(), &rail_on()).unwrap().1 >= 0.95);
+    }
+
+    #[test]
+    fn test_rail_strong_spam_threshold_demotes_to_weak() {
+        let db = setup_rail_db();
+        // Raise strong threshold above .life's spam (20) → .life becomes WEAK →
+        // now needs a co-flag. The co-flag-free strong message stops firing.
+        let msg: Vec<String> = vec![
+            "x:tld:life".into(),
+            "b:hello".into(),
+            "b:agenda".into(),
+            "b:project".into(),
+            "b:meeting".into(),
+            "b:report".into(),
+        ];
+        let demote = Params { rail: true, rail_strong_spam: 100, ..Default::default() };
+        let base = classify(&db, &msg, &Params::default()).unwrap();
+        assert_eq!(classify(&db, &msg, &demote).unwrap(), base, "demoted to weak, no co-flag → inert");
+        // Same TLD WITH a co-flag fires under the raised threshold (weak path).
+        assert!(classify(&db, &rail_msg(), &demote).unwrap().1 >= 0.95);
+    }
+
+    #[test]
+    fn test_rail_pure_relax_fires_weak_tld_alone() {
+        let db = setup_rail_db();
+        // rail_require_coflag=false collapses tiers → weak .work fires with no co-flag.
+        let relaxed = Params { rail: true, rail_require_coflag: false, ..Default::default() };
+        assert!(
+            classify(&db, &rail_msg_weak(false), &relaxed).unwrap().1 >= 0.95,
+            "pure relax fires on a thin TLD alone (trades away the guard)"
+        );
+        let hit = classify_explain(&db, &rail_msg_weak(false), &relaxed).unwrap().rail.unwrap();
+        assert_eq!(hit.co_flag, "(none)");
+    }
+
+    #[test]
+    fn test_rail_explain_agrees_with_classify() {
+        let db = setup_rail_db();
+        let expl = classify_explain(&db, &rail_msg(), &rail_on()).unwrap();
+        let hit = expl.rail.clone().expect("rail should have fired");
+        assert_eq!(hit.tld_token, "x:tld:life");
+        assert_eq!(hit.tld_spam, 20);
+        assert_eq!(hit.co_flag, "x:confusable");
+        assert!(hit.strong);
+        let (cv, cs) = classify(&db, &rail_msg(), &rail_on()).unwrap();
+        assert_eq!(cv, expl.verdict);
+        assert!((cs - expl.score).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_rail_explain_agrees_on_empty_selection() {
+        // Regression: with min_distance forcing an empty interesting set (score_fws
+        // == None) but an abuse-only TLD present, `classify` rails to SPAM. The
+        // `explain` path must NOT short-circuit before the rail — it used to return
+        // a neutral GOOD 0.5 with rail:None, disagreeing with `classify`.
+        let db = setup_rail_db();
+        let params = Params {
+            rail: true,
+            min_distance: 0.5, // no token is >=0.5 from 0.5 → empty selection
+            min_array_size: 0,
+            ..Default::default()
+        };
+        let (cv, cs) = classify(&db, &rail_msg(), &params).unwrap();
+        let expl = classify_explain(&db, &rail_msg(), &params).unwrap();
+        assert_eq!(cv, Verdict::Spam, "classify rails the empty-selection message");
+        assert!(cs >= 0.95);
+        assert_eq!(cv, expl.verdict, "explain must agree with classify");
+        assert!((cs - expl.score).abs() < 1e-9, "explain score {} != classify {cs}", expl.score);
+        assert!(expl.rail.is_some(), "explain must surface the rail hit on the None path");
+    }
+
+    #[test]
+    fn test_load_overrides_rail_keys() {
+        let dir = std::env::temp_dir().join(format!("spamlite-rail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("params.toml"),
+            "rail = true\nrail_min_spam = 8\nrail_strong_spam = 40\nrail_floor = 0.9\nrail_require_coflag = false\n",
+        )
+        .unwrap();
+        let mut p = Params::default();
+        p.load_overrides(&dir);
+        assert!(p.rail);
+        assert_eq!(p.rail_min_spam, 8);
+        assert_eq!(p.rail_strong_spam, 40);
+        assert!((p.rail_floor - 0.9).abs() < 1e-9);
+        assert!(!p.rail_require_coflag);
+        // out-of-range floor rejected, bad bool rejected → defaults kept
+        std::fs::write(dir.join("params.toml"), "rail_floor = 1.5\nrail = nope\n").unwrap();
+        let mut q = Params::default();
+        q.load_overrides(&dir);
+        assert!((q.rail_floor - 0.95).abs() < 1e-9);
+        assert!(!q.rail);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
