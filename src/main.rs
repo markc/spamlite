@@ -111,7 +111,7 @@ fn make_params() -> Params {
 fn cmd_score() {
     let raw = read_stdin();
     let result = std::panic::catch_unwind(move || {
-        let tokens = tokenizer::tokenize(&raw);
+        let tokens = tokenizer::tokenize_env(&raw);
         let db = open_db();
         let params = make_params();
         classifier::classify(&db, &tokens, &params)
@@ -148,7 +148,7 @@ fn cmd_receive() {
     // Phase 1 — tokenize + classify, panic-isolated. Nothing is printed
     // inside the guarded region, so a fail-open can never double-print.
     let classified = std::panic::catch_unwind(move || {
-        let tokens = tokenizer::tokenize(&raw);
+        let tokens = tokenizer::tokenize_env(&raw);
         let db = open_db();
         let params = make_params();
         classifier::classify(&db, &tokens, &params).map(|(verdict, score)| {
@@ -200,7 +200,7 @@ fn cmd_receive() {
 
 fn cmd_train(is_spam: bool) {
     let raw = read_stdin();
-    let tokens = tokenizer::tokenize(&raw);
+    let tokens = tokenizer::tokenize_env(&raw);
     let db = open_db();
     let params = make_params();
 
@@ -244,7 +244,7 @@ fn cmd_train(is_spam: bool) {
 /// first. A bar visualises direction (left = ham-indicative, right = spam).
 fn cmd_explain() {
     let raw = read_stdin();
-    let tokens = tokenizer::tokenize(&raw);
+    let tokens = tokenizer::tokenize_env(&raw);
     let db = open_db();
     let params = make_params();
 
