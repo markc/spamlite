@@ -455,6 +455,11 @@ fn clone_params(p: &Params) -> Params {
         min_distance: p.min_distance,
         min_array_size: p.min_array_size,
         train_max_reps: p.train_max_reps,
+        rail: p.rail,
+        rail_min_spam: p.rail_min_spam,
+        rail_strong_spam: p.rail_strong_spam,
+        rail_floor: p.rail_floor,
+        rail_require_coflag: p.rail_require_coflag,
     }
 }
 

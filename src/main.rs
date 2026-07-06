@@ -99,6 +99,50 @@ fn make_params() -> Params {
             }
         }
     }
+    // Abuse-TLD hard-rail env flags. Applied BEFORE params.toml so a per-user
+    // file can still override, mirroring the SPAMLITE_THRESHOLD precedence. All
+    // default-off / default-value, so unset env = unchanged behaviour.
+    // Same truthy/falsy vocabulary as params.toml's bool keys.
+    let as_bool = |v: &str| -> Option<bool> {
+        match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    };
+    if let Ok(val) = std::env::var("SPAMLITE_RAIL") {
+        if let Some(b) = as_bool(&val) {
+            params.rail = b;
+        }
+    }
+    if let Ok(val) = std::env::var("SPAMLITE_RAIL_MIN_SPAM") {
+        if let Ok(n) = val.parse::<u64>() {
+            if (1..=1_000_000).contains(&n) {
+                params.rail_min_spam = n;
+            }
+        }
+    }
+    if let Ok(val) = std::env::var("SPAMLITE_RAIL_STRONG_SPAM") {
+        if let Ok(n) = val.parse::<u64>() {
+            if (1..=1_000_000).contains(&n) {
+                params.rail_strong_spam = n;
+            }
+        }
+    }
+    if let Ok(val) = std::env::var("SPAMLITE_RAIL_FLOOR") {
+        if let Ok(f) = val.parse::<f64>() {
+            if (0.5..=1.0).contains(&f) {
+                params.rail_floor = f;
+            }
+        }
+    }
+    // SPAMLITE_RAIL_COFLAG=0/false/no/off relaxes the co-flag requirement (gate
+    // lever). Default (unset) keeps the weak-tier co-flag mandatory.
+    if let Ok(val) = std::env::var("SPAMLITE_RAIL_COFLAG") {
+        if let Some(b) = as_bool(&val) {
+            params.rail_require_coflag = b;
+        }
+    }
     if let Some(parent) = db_path().parent() {
         params.load_overrides(parent);
     }
@@ -276,6 +320,15 @@ fn cmd_explain() {
         "Fisher:   H_spam={:.2}  H_ham={:.2}  P_spam={:.4}  P_ham={:.4}",
         expl.h_spam, expl.h_ham, expl.p_spam, expl.p_ham
     );
+    if let Some(hit) = &expl.rail {
+        let tier = if hit.strong { "strong" } else { "weak" };
+        // State the floor value rather than claim the score was lowered — with a
+        // score already above the floor `apply_rail` is a no-op (see Verdict line).
+        println!(
+            "Hard-rail: FIRED [{tier}] — {} (spam={}, good=0) + co-flag {}; floor={:.2}",
+            hit.tld_token, hit.tld_spam, hit.co_flag, params.rail_floor
+        );
+    }
     println!();
 
     if expl.top_tokens.is_empty() {
