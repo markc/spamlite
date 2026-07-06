@@ -30,6 +30,22 @@ pub struct TokenizerConfig {
     /// Expand header coverage: `h:to:*`, `h:cc:*`, and split received chain
     /// into `h:hrecv:*` (first hop) and `h:hrecvx:*` (all subsequent).
     pub expanded_headers: bool,
+    /// Emit `x:tld:<effective-tld>` from sender address domains. The sending
+    /// TLD is invariant across the full-domain rotation zero-day phishing uses,
+    /// so it accumulates a Bayesian prior that a rotating domain token cannot.
+    pub tld_feature: bool,
+    /// Fold Unicode confusables/homoglyphs to an ASCII skeleton so obfuscated
+    /// words (`accᴏunt`, `𝖢ustomer`) land on their trained tokens; also emit
+    /// `x:confusable` / `x:mixedscript` flags. Defeats the fresh-token evasion.
+    pub homoglyph_fold: bool,
+    /// Tokenize the From display name (`h:fromname:*`) and emit
+    /// `x:brandmiss:<brand>` when the display name impersonates a known brand
+    /// whose domain does not match. Catches `AppIe`/`AIdi` display-name spoofs.
+    pub brand_mismatch: bool,
+    /// Emit `x:auth:{spf,dkim,dmarc}_<result>` / `x:spf:<result>` from
+    /// Authentication-Results / Received-SPF when present. Inert when the
+    /// delivery path does not stamp those headers (feasibility-gated per site).
+    pub auth_tokens: bool,
 }
 
 impl Default for TokenizerConfig {
@@ -38,7 +54,42 @@ impl Default for TokenizerConfig {
             min_len: MIN_TOKEN_LEN,
             max_len: MAX_TOKEN_LEN,
             expanded_headers: false,
+            tld_feature: false,
+            homoglyph_fold: false,
+            brand_mismatch: false,
+            auth_tokens: false,
         }
+    }
+}
+
+impl TokenizerConfig {
+    /// Build a config from `SPAMLITE_*` env vars, starting from `Default`. Lets
+    /// the offline eval harness A/B individual anti-evasion features via the
+    /// stock `good`/`spam`/`score` CLI without a rebuild or code change.
+    /// Production sets none of these, so the default behaviour is unchanged.
+    pub fn from_env() -> Self {
+        let mut c = Self::default();
+        let on = |k: &str| {
+            std::env::var(k)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
+        if on("SPAMLITE_EXPANDED_HEADERS") {
+            c.expanded_headers = true;
+        }
+        if on("SPAMLITE_TLD") {
+            c.tld_feature = true;
+        }
+        if on("SPAMLITE_FOLD") {
+            c.homoglyph_fold = true;
+        }
+        if on("SPAMLITE_BRAND") {
+            c.brand_mismatch = true;
+        }
+        if on("SPAMLITE_AUTH") {
+            c.auth_tokens = true;
+        }
+        c
     }
 }
 
@@ -53,6 +104,13 @@ fn host_to_string(host: &Host<'_>) -> String {
 /// Extract tokens from a raw email message (RFC 5322) using the default config.
 pub fn tokenize(raw: &[u8]) -> Vec<String> {
     tokenize_with_config(raw, &TokenizerConfig::default())
+}
+
+/// Extract tokens using a config resolved from `SPAMLITE_*` env vars. The CLI
+/// train/score/receive paths use this so anti-evasion features can be A/B'd in
+/// the offline harness; with no env vars set it is identical to `tokenize`.
+pub fn tokenize_env(raw: &[u8]) -> Vec<String> {
+    tokenize_with_config(raw, &TokenizerConfig::from_env())
 }
 
 /// Extract tokens from a raw email message with explicit configuration.
@@ -71,7 +129,7 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         let words: Vec<String> = extract_words(subject).filter(|w| valid(w)).collect();
 
         for w in &words {
-            tokens.push(format!("h:subject:{w}"));
+            push_word(&mut tokens, "h:subject:", w, config);
         }
 
         // Bigrams for subject
@@ -83,7 +141,7 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
     // From header
     if let Some(from) = message.from() {
         for addr in from.iter() {
-            push_addr(&mut tokens, "h:from:", addr, &valid);
+            push_addr(&mut tokens, "h:from:", addr, &valid, config);
         }
     }
 
@@ -92,12 +150,12 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
     // by push_addr, same as From. Default-on: additive per-sender signal.
     if let Some(reply_to) = message.reply_to() {
         for addr in reply_to.iter() {
-            push_addr(&mut tokens, "h:replyto:", addr, &valid);
+            push_addr(&mut tokens, "h:replyto:", addr, &valid, config);
         }
     }
     if let Some(sender) = message.sender() {
         for addr in sender.iter() {
-            push_addr(&mut tokens, "h:sender:", addr, &valid);
+            push_addr(&mut tokens, "h:sender:", addr, &valid, config);
         }
     }
 
@@ -105,12 +163,12 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
     if config.expanded_headers {
         if let Some(to) = message.to() {
             for addr in to.iter() {
-                push_addr(&mut tokens, "h:to:", addr, &valid);
+                push_addr(&mut tokens, "h:to:", addr, &valid, config);
             }
         }
         if let Some(cc) = message.cc() {
             for addr in cc.iter() {
-                push_addr(&mut tokens, "h:cc:", addr, &valid);
+                push_addr(&mut tokens, "h:cc:", addr, &valid, config);
             }
         }
     }
@@ -154,6 +212,40 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         }
     }
 
+    // Authentication metadata — SPF/DKIM/DMARC outcomes are content-independent
+    // and cannot be rotated by the attacker. Emit only when the header is
+    // present; absence emits nothing (never a "missing auth" penalty). Inert on
+    // delivery paths that don't stamp Authentication-Results (site feasibility).
+    if config.auth_tokens {
+        let root_headers = message
+            .parts
+            .first()
+            .map(|p| p.headers.as_slice())
+            .unwrap_or(&[]);
+        for header in root_headers {
+            let name = header.name.as_str();
+            if name.eq_ignore_ascii_case("Authentication-Results")
+                || name.eq_ignore_ascii_case("ARC-Authentication-Results")
+            {
+                if let Some(text) = header_text(&header.value) {
+                    emit_auth_tokens(&mut tokens, &text);
+                }
+            } else if name.eq_ignore_ascii_case("Received-SPF") {
+                if let Some(text) = header_text(&header.value) {
+                    let res: String = text
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphabetic())
+                        .flat_map(|c| c.to_lowercase())
+                        .collect();
+                    if !res.is_empty() {
+                        tokens.push(format!("x:spf:{res}"));
+                    }
+                }
+            }
+        }
+    }
+
     // Body parts. Bodies are the only unbounded token source (headers are
     // small), so the MAX_RAW_TOKENS cap is enforced here.
     for part in message.text_bodies() {
@@ -175,7 +267,7 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
                 break;
             }
             if valid(&w) {
-                tokens.push(format!("b:{w}"));
+                push_word(&mut tokens, "b:", &w, config);
             }
         }
     }
@@ -200,7 +292,7 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
                 break;
             }
             if valid(&w) {
-                tokens.push(format!("b:{w}"));
+                push_word(&mut tokens, "b:", &w, config);
             }
         }
     }
@@ -251,12 +343,14 @@ fn push_addr<F: Fn(&str) -> bool>(
     prefix: &str,
     addr: &Addr<'_>,
     valid: &F,
+    config: &TokenizerConfig,
 ) {
     let Some(email) = addr.address.as_deref() else { return };
     let email_lower = email.to_lowercase();
     if valid(&email_lower) {
         tokens.push(format!("{prefix}{email_lower}"));
     }
+    let mut domain_brand: Option<String> = None;
     if let Some(domain) = email_lower.split('@').nth(1) {
         if valid(domain) {
             tokens.push(format!("{prefix}{domain}"));
@@ -271,6 +365,263 @@ fn push_addr<F: Fn(&str) -> bool>(
             }
             if brand.len() >= 2 && brand.len() <= MAX_TOKEN_LEN {
                 tokens.push(format!("{prefix}{brand}"));
+            }
+            domain_brand = Some(brand);
+        }
+        // Effective TLD — invariant across the attacker's full-domain rotation.
+        if config.tld_feature {
+            if let Some(tld) = effective_tld(domain) {
+                tokens.push(format!("x:tld:{tld}"));
+            }
+        }
+    }
+
+    // Display-name tokens + brand-impersonation flag — From only. The display
+    // name is where `AppIe`/`AIdi` brand spoofs live; it was previously discarded.
+    if config.brand_mismatch && prefix == "h:from:" {
+        if let Some(name) = addr.name.as_deref() {
+            for w in extract_words(name) {
+                if valid(&w) {
+                    push_word(tokens, "h:fromname:", &w, config);
+                }
+            }
+            if let Some(claimed) = claimed_brand(name) {
+                let domain_matches = domain_brand
+                    .as_deref()
+                    .map(|b| brand_canonical(b).contains(&claimed))
+                    .unwrap_or(false);
+                if !domain_matches {
+                    tokens.push(format!("x:brandmiss:{claimed}"));
+                }
+            }
+        }
+    }
+}
+
+/// Effective public-suffix of a host (`spammer.life` → `life`,
+/// `flybuys.com.au` → `com.au`, `apple.com` → `com`). Uses the same two-level
+/// SLD table as `decompose_host`. `None` for IPs / single-label hosts.
+fn effective_tld(host: &str) -> Option<String> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    let n = labels.len();
+    if n < 2 {
+        return None;
+    }
+    let two_level =
+        n >= 3 && labels[n - 1].len() == 2 && TWO_LEVEL_SLDS.contains(&labels[n - 2]);
+    if two_level {
+        Some(format!("{}.{}", labels[n - 2], labels[n - 1]))
+    } else {
+        Some(labels[n - 1].to_string())
+    }
+}
+
+/// Push a word token and, when `homoglyph_fold` is on and the word is not pure
+/// ASCII, its confusable-folded ASCII skeleton (so `accᴏunt`/`𝖢ustomer` land on
+/// the trained `account`/`customer`) plus the `x:confusable` / `x:mixedscript`
+/// flags. The raw token is always kept — folding only ever ADDS tokens.
+fn push_word(tokens: &mut Vec<String>, prefix: &str, word: &str, config: &TokenizerConfig) {
+    tokens.push(format!("{prefix}{word}"));
+    if !config.homoglyph_fold || word.is_ascii() {
+        return;
+    }
+    if let Some(skel) = fold_skeleton(word) {
+        if skel.len() >= config.min_len && skel.len() <= config.max_len {
+            tokens.push(format!("{prefix}{skel}"));
+        }
+        tokens.push("x:confusable".to_string());
+    }
+    if is_mixed_script(word) {
+        tokens.push("x:mixedscript".to_string());
+    }
+}
+
+/// Fold a word's Unicode confusables to an ASCII skeleton. Returns `Some` only
+/// when at least one character folded AND the result is pure ASCII (so accented
+/// Latin like `café`/`Müller` and CJK fold to themselves → `None`, no flag).
+fn fold_skeleton(word: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(word.len());
+    for c in word.chars() {
+        match map_confusable(c) {
+            Some(t) => {
+                out.push(t);
+                changed = true;
+            }
+            None => out.push(c),
+        }
+    }
+    if changed && out.is_ascii() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// True when a word mixes ASCII Latin letters with Cyrillic/Greek/Armenian —
+/// the whole-script-swap-is-legit / mixed-script-is-hostile heuristic. A fully
+/// non-Latin word (real Russian/Greek text) is NOT flagged.
+fn is_mixed_script(word: &str) -> bool {
+    let mut has_latin = false;
+    let mut has_other = false;
+    for c in word.chars() {
+        if c.is_ascii_alphabetic() {
+            has_latin = true;
+        } else {
+            let cp = c as u32;
+            if (0x0400..=0x04FF).contains(&cp)   // Cyrillic
+                || (0x0370..=0x03FF).contains(&cp) // Greek
+                || (0x0530..=0x058F).contains(&cp)
+            {
+                // Armenian
+                has_other = true;
+            }
+        }
+    }
+    has_latin && has_other
+}
+
+/// Map one Unicode confusable to its ASCII-lowercase base letter/digit, or
+/// `None` if it is not a handled confusable.
+fn map_confusable(c: char) -> Option<char> {
+    let cp = c as u32;
+    if (0x1D400..=0x1D7FF).contains(&cp) {
+        return map_math_alnum(cp);
+    }
+    CONFUSABLE_TABLE
+        .iter()
+        .find(|&&(k, _)| k == c)
+        .map(|&(_, v)| v)
+}
+
+/// Fold a Mathematical Alphanumeric Symbols code point (U+1D400–U+1D7FF) to its
+/// ASCII base. The block is laid out as fixed-offset runs, so this is pure
+/// arithmetic — assigned code points keep their natural offset even where a
+/// reserved hole exists (the hole letters live in Letterlike Symbols and are
+/// handled by CONFUSABLE_TABLE, not here). Upper- and lowercase both fold to
+/// lowercase, matching `extract_words`' lowercasing.
+fn map_math_alnum(cp: u32) -> Option<char> {
+    // 13 alphabetic styles, each 52 code points: A–Z then a–z.
+    const ALPHA_STARTS: [u32; 13] = [
+        0x1D400, 0x1D434, 0x1D468, 0x1D49C, 0x1D4D0, 0x1D504, 0x1D538, 0x1D56C, 0x1D5A0, 0x1D5D4,
+        0x1D608, 0x1D63C, 0x1D670,
+    ];
+    for &s in &ALPHA_STARTS {
+        if cp >= s && cp <= s + 51 {
+            let off = (cp - s) as u8;
+            let base = if off < 26 { b'a' + off } else { b'a' + (off - 26) };
+            return Some(base as char);
+        }
+    }
+    // 5 digit styles, each 10 code points: 0–9.
+    const DIGIT_STARTS: [u32; 5] = [0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6];
+    for &s in &DIGIT_STARTS {
+        if cp >= s && cp <= s + 9 {
+            return Some((b'0' + (cp - s) as u8) as char);
+        }
+    }
+    None
+}
+
+/// Curated confusable → ASCII-lowercase map: the Mathematical-Alphanumeric
+/// reserved-hole letters that live in Letterlike Symbols, small-caps/phonetic
+/// look-alikes, and the common Cyrillic/Greek Latin homoglyphs. Scoped to what
+/// obfuscated phishing actually uses — deliberately NOT a full TR39 table.
+#[rustfmt::skip]
+const CONFUSABLE_TABLE: &[(char, char)] = &[
+    // Letterlike Symbols (Math-Alphanumeric reserved holes appear here).
+    ('ℎ','h'),('ℬ','b'),('ℰ','e'),('ℱ','f'),('ℋ','h'),('ℐ','i'),('ℒ','l'),('ℳ','m'),
+    ('ℯ','e'),('ℊ','g'),('ℴ','o'),('ℭ','c'),('ℌ','h'),('ℑ','i'),('ℜ','r'),('ℨ','z'),
+    ('ℂ','c'),('ℍ','h'),('ℕ','n'),('ℙ','p'),('ℚ','q'),('ℝ','r'),('ℤ','z'),
+    // Small-caps / phonetic (U+1D00 block) — `accᴏunt` uses U+1D0F.
+    ('ᴀ','a'),('ʙ','b'),('ᴄ','c'),('ᴅ','d'),('ᴇ','e'),('ꜰ','f'),('ɢ','g'),('ʜ','h'),
+    ('ɪ','i'),('ᴊ','j'),('ᴋ','k'),('ʟ','l'),('ᴍ','m'),('ɴ','n'),('ᴏ','o'),('ᴘ','p'),
+    ('ʀ','r'),('ᴛ','t'),('ᴜ','u'),('ᴠ','v'),('ᴡ','w'),('ʏ','y'),('ᴢ','z'),
+    // Cyrillic look-alikes.
+    ('а','a'),('е','e'),('о','o'),('р','p'),('с','c'),('х','x'),('у','y'),('ѕ','s'),
+    ('і','i'),('ј','j'),('А','a'),('В','b'),('Е','e'),('К','k'),('М','m'),('Н','h'),
+    ('О','o'),('Р','p'),('С','c'),('Т','t'),('Х','x'),('У','y'),
+    // Greek look-alikes.
+    ('ο','o'),('ρ','p'),('α','a'),('ν','v'),('Α','a'),('Β','b'),('Ε','e'),('Ζ','z'),
+    ('Η','h'),('Ι','i'),('Κ','k'),('Μ','m'),('Ν','n'),('Ο','o'),('Ρ','p'),('Τ','t'),
+    ('Υ','y'),('Χ','x'),
+];
+
+/// Known brands worth impersonating (AU-centric, matching this cluster's mail).
+#[rustfmt::skip]
+const BRANDS: &[&str] = &[
+    "apple","paypal","aldi","coles","woolworths","netflix","amazon","microsoft",
+    "google","anz","nab","commbank","westpac","auspost","linkt","telstra","optus",
+    "mygov","medicare","ato","facebook","instagram","ebay","kmart","bunnings",
+    "qantas","suncorp","bupa","unisuper","dhl","fedex","norton","mcafee","binance",
+    "coinbase","outlook","office365",
+];
+
+/// Canonicalise a token for brand matching: lowercase, collapse the ASCII
+/// letter/glyph look-alikes phishers use (i/l/1 → l, 0 → o, 5 → s, 3 → e), and
+/// keep only alphanumerics. Scoped to brand detection ONLY — never applied to
+/// the general token stream, where i/l/1 folding would be far too noisy.
+fn brand_canonical(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| c.to_lowercase())
+        .filter_map(|c| match c {
+            'i' | 'l' | '1' | '|' => Some('l'),
+            '0' => Some('o'),
+            '5' => Some('s'),
+            '3' => Some('e'),
+            c if c.is_ascii_alphanumeric() => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// If any whole word in a display name canonicalises to a known brand, return
+/// that brand (its own canonical form). Whole-word (not substring) match keeps
+/// `appleseed`-style legit names from tripping the brand-mismatch flag.
+fn claimed_brand(name: &str) -> Option<String> {
+    // Fold Unicode confusables first (e.g. `𝖠pple`), then split on non-letters.
+    let folded: String = name
+        .chars()
+        .map(|c| map_confusable(c).unwrap_or(c))
+        .collect();
+    for word in folded.split(|c: char| !c.is_alphanumeric()) {
+        if word.is_empty() {
+            continue;
+        }
+        let canon = brand_canonical(word);
+        for &b in BRANDS {
+            if canon == brand_canonical(b) {
+                return Some(brand_canonical(b));
+            }
+        }
+    }
+    None
+}
+
+/// Extract the flat text of an unstructured header value (Authentication-Results,
+/// Received-SPF) for substring scanning.
+fn header_text(v: &HeaderValue<'_>) -> Option<String> {
+    match v {
+        HeaderValue::Text(t) => Some(t.to_string()),
+        HeaderValue::TextList(l) => Some(l.join(" ")),
+        _ => None,
+    }
+}
+
+/// Parse `method=result` pairs out of an Authentication-Results header and emit
+/// `x:auth:<method>_<result>` tokens for spf/dkim/dmarc.
+fn emit_auth_tokens(tokens: &mut Vec<String>, ar: &str) {
+    let ar = ar.to_lowercase();
+    for method in ["spf", "dkim", "dmarc"] {
+        let needle = format!("{method}=");
+        if let Some(idx) = ar.find(&needle) {
+            let after = &ar[idx + needle.len()..];
+            let val: String = after.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+            if !val.is_empty() {
+                tokens.push(format!("x:auth:{method}_{val}"));
             }
         }
     }
@@ -551,5 +902,130 @@ mod tests {
         let tokens = tokenize(email);
         let count = tokens.iter().filter(|t| *t == "b:unsubscribe").count();
         assert_eq!(count, 1, "repeated word must produce a single token: {tokens:?}");
+    }
+
+    // ---- anti-evasion features (all default-off; opt in per config) ----
+
+    fn cfg(f: impl Fn(&mut TokenizerConfig)) -> TokenizerConfig {
+        let mut c = TokenizerConfig::default();
+        f(&mut c);
+        c
+    }
+
+    #[test]
+    fn test_features_off_by_default() {
+        let c = TokenizerConfig::default();
+        assert!(!c.tld_feature && !c.homoglyph_fold && !c.brand_mismatch && !c.auth_tokens);
+        // A homoglyph/throwaway-TLD message must tokenize identically to before
+        // when no feature flag is set — production behaviour is unchanged.
+        let email = "From: WB <at@spammer.life>\r\nSubject: your accᴏunt\r\n\r\nciick now\r\n".as_bytes();
+        let toks = tokenize(email);
+        assert!(!toks.iter().any(|t| t.starts_with("x:")));
+    }
+
+    #[test]
+    fn test_tld_feature() {
+        let email = b"From: WB <at@spammer.life>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let toks = tokenize_with_config(email, &cfg(|c| c.tld_feature = true));
+        assert!(toks.iter().any(|t| t == "x:tld:life"), "{toks:?}");
+    }
+
+    #[test]
+    fn test_tld_two_level_stays_neutral_token() {
+        let email = b"From: Flybuys <hello@flybuys.com.au>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let toks = tokenize_with_config(email, &cfg(|c| c.tld_feature = true));
+        assert!(toks.iter().any(|t| t == "x:tld:com.au"), "{toks:?}");
+    }
+
+    #[test]
+    fn test_effective_tld() {
+        assert_eq!(effective_tld("spammer.life").as_deref(), Some("life"));
+        assert_eq!(effective_tld("flybuys.com.au").as_deref(), Some("com.au"));
+        assert_eq!(effective_tld("apple.com").as_deref(), Some("com"));
+        assert_eq!(effective_tld("sub.survey.qatarairways.com.qa").as_deref(), Some("com.qa"));
+        assert_eq!(effective_tld("192.168.0.1"), None);
+        assert_eq!(effective_tld("localhost"), None);
+    }
+
+    #[test]
+    fn test_homoglyph_fold_small_caps() {
+        // `accᴏunt` (U+1D0F) must fold onto the trained `account`.
+        let email = "From: x@y.com\r\nSubject: your accᴏunt\r\n\r\nreview your accᴏunt now\r\n".as_bytes();
+        let toks = tokenize_with_config(email, &cfg(|c| c.homoglyph_fold = true));
+        assert!(toks.iter().any(|t| t == "b:account"), "skeleton missing: {toks:?}");
+        assert!(toks.iter().any(|t| t == "h:subject:account"), "{toks:?}");
+        assert!(toks.iter().any(|t| t == "x:confusable"), "{toks:?}");
+    }
+
+    #[test]
+    fn test_homoglyph_fold_math_alnum() {
+        // `𝖢ustomer 𝖱ewards` (Math sans-serif U+1D5A2/U+1D5B1) → customer/rewards.
+        let email = "From: x@y.com\r\nSubject: hi\r\n\r\n𝖢ustomer 𝖱ewards waiting\r\n".as_bytes();
+        let toks = tokenize_with_config(email, &cfg(|c| c.homoglyph_fold = true));
+        assert!(toks.iter().any(|t| t == "b:customer"), "{toks:?}");
+        assert!(toks.iter().any(|t| t == "b:rewards"), "{toks:?}");
+    }
+
+    #[test]
+    fn test_homoglyph_fold_letterlike_hole() {
+        // Script capital H lives at U+210B (a reserved-hole letter), not in the
+        // Math-Alphanumeric block — must still fold to `h`.
+        assert_eq!(fold_skeleton("ℋello").as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_fold_leaves_accented_latin_and_cjk_alone() {
+        // Legit accented Latin / CJK must NOT fold and must NOT flag — this is
+        // the false-positive guard for intl senders.
+        assert_eq!(fold_skeleton("café"), None);
+        assert_eq!(fold_skeleton("Müller"), None);
+        assert_eq!(fold_skeleton("東京"), None);
+        let email = "From: x@y.com\r\nSubject: réservation\r\n\r\nMüller café 東京\r\n".as_bytes();
+        let toks = tokenize_with_config(email, &cfg(|c| c.homoglyph_fold = true));
+        assert!(!toks.iter().any(|t| t == "x:confusable"), "{toks:?}");
+    }
+
+    #[test]
+    fn test_mixed_script_flag() {
+        // Cyrillic 'а' spliced into Latin "pаypal".
+        let email = "From: x@y.com\r\nSubject: hi\r\n\r\nsecure pаypal login\r\n".as_bytes();
+        let toks = tokenize_with_config(email, &cfg(|c| c.homoglyph_fold = true));
+        assert!(toks.iter().any(|t| t == "x:mixedscript"), "{toks:?}");
+        // ...and it folds onto the real word.
+        assert!(toks.iter().any(|t| t == "b:paypal"), "{toks:?}");
+    }
+
+    #[test]
+    fn test_brand_mismatch_flag() {
+        // "AIdi" (ASCII cap-I for l) from a throwaway domain → brandmiss:aldi.
+        let email = b"From: AIdi Administrator <amkfm@throwaway.info>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let toks = tokenize_with_config(email, &cfg(|c| c.brand_mismatch = true));
+        assert!(toks.iter().any(|t| t == "x:brandmiss:aldl"), "{toks:?}");
+        assert!(toks.iter().any(|t| t.starts_with("h:fromname:")), "{toks:?}");
+    }
+
+    #[test]
+    fn test_brand_mismatch_not_fired_for_legit_brand_domain() {
+        // Real Apple from apple.com must NOT flag (domain brand matches).
+        let email = b"From: Apple <no-reply@apple.com>\r\nSubject: receipt\r\n\r\nbody\r\n";
+        let toks = tokenize_with_config(email, &cfg(|c| c.brand_mismatch = true));
+        assert!(!toks.iter().any(|t| t.starts_with("x:brandmiss:")), "{toks:?}");
+    }
+
+    #[test]
+    fn test_auth_tokens_present() {
+        let email = b"From: x@y.com\r\nAuthentication-Results: mx.example.com; spf=fail smtp.mailfrom=y.com; dkim=none; dmarc=fail\r\nSubject: hi\r\n\r\nbody\r\n";
+        let toks = tokenize_with_config(email, &cfg(|c| c.auth_tokens = true));
+        assert!(toks.iter().any(|t| t == "x:auth:spf_fail"), "{toks:?}");
+        assert!(toks.iter().any(|t| t == "x:auth:dkim_none"), "{toks:?}");
+        assert!(toks.iter().any(|t| t == "x:auth:dmarc_fail"), "{toks:?}");
+    }
+
+    #[test]
+    fn test_auth_tokens_absent_emit_nothing() {
+        // No Authentication-Results → no x:auth tokens (never a "missing" penalty).
+        let email = b"From: x@y.com\r\nSubject: hi\r\n\r\nbody\r\n";
+        let toks = tokenize_with_config(email, &cfg(|c| c.auth_tokens = true));
+        assert!(!toks.iter().any(|t| t.starts_with("x:auth:")), "{toks:?}");
     }
 }
