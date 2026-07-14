@@ -312,14 +312,24 @@ impl Database {
             // Parse: goodCount,spamCount,flags,"word"
             if let Some((good, spam, word)) = parse_csv_line(line) {
                 if word == "__total__" {
-                    // Set meta totals from export
+                    // Totals ADD, matching the token rows above (`good = good + ?2`).
+                    //
+                    // These used to be INSERT OR REPLACE, which is only correct when
+                    // importing into an empty database. Importing to MERGE a second corpus
+                    // — the obvious way to give a user extra ham coverage — kept every
+                    // merged token count but overwrote the totals with the incoming file's,
+                    // so a ham-only donor (spam=0) set the target's `total_spam` to 0 and
+                    // every message scored GOOD. Adding is correct in both cases: a restore
+                    // into an empty db is 0 + N = N.
                     tx.execute(
-                        "INSERT OR REPLACE INTO meta (key, value) VALUES ('total_good', ?1)",
-                        params![good.to_string()],
+                        "INSERT INTO meta (key, value) VALUES ('total_good', ?1)
+                         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?1",
+                        params![good as i64],
                     )?;
                     tx.execute(
-                        "INSERT OR REPLACE INTO meta (key, value) VALUES ('total_spam', ?1)",
-                        params![spam.to_string()],
+                        "INSERT INTO meta (key, value) VALUES ('total_spam', ?1)
+                         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?1",
+                        params![spam as i64],
                     )?;
                 } else {
                     stmt.execute(params![word, good as i64, spam as i64, now])?;
@@ -382,6 +392,28 @@ mod tests {
         assert!(Database::open_existing(&db).is_ok());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Importing a second corpus must ADD to the totals, not overwrite them. It used to
+    /// overwrite: merging a ham-only donor (spam=0) set the target total_spam to 0, and
+    /// with no spam corpus every message scores GOOD. Tokens merged, totals lied.
+    #[test]
+    fn import_merges_totals_additively() {
+        let db = test_db();
+        db.train_message(&["alpha".to_string()], false).unwrap();   // 1 good
+        db.train_message(&["beta".to_string()], true).unwrap();     // 1 spam
+        assert_eq!(db.total_good().unwrap(), 1);
+        assert_eq!(db.total_spam().unwrap(), 1);
+
+        // a ham-only donor corpus: 50 good, 0 spam
+        let donor = "50,0,E,\"__total__\"\n3,0,E,\"gamma\"\n";
+        db.import(Cursor::new(donor)).unwrap();
+
+        assert_eq!(db.total_good().unwrap(), 51, "totals must add, not replace");
+        assert_eq!(db.total_spam().unwrap(), 1, "a ham-only import must NOT zero total_spam");
+
+        let counts = db.lookup_tokens(&["gamma".to_string()]).unwrap();
+        assert_eq!(counts.get("gamma"), Some(&(3, 0)));
     }
 
     #[test]
