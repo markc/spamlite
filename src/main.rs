@@ -85,6 +85,23 @@ fn open_db() -> Database {
     })
 }
 
+/// Open for the read-only commands. Never creates the database — a mistyped `-d`
+/// must be an error, not a silently-conjured empty corpus that scores every message
+/// a neutral `GOOD 0.500000`. Returns Err so the caller decides: the sieve hot path
+/// (`score`) fails open and delivers the message; the diagnostic commands exit 1.
+fn open_db_ro() -> Result<Database, String> {
+    Database::open_existing(&db_path())
+}
+
+/// Exit-1-on-missing wrapper for the diagnostic commands (counts/explain/export),
+/// which have no delivery to protect and should fail loudly.
+fn open_db_ro_or_exit() -> Database {
+    open_db_ro().unwrap_or_else(|e| {
+        eprintln!("spamlite: {e}");
+        process::exit(1);
+    })
+}
+
 /// Build runtime params. Threshold priority, weakest first:
 /// compiled default < SPAMLITE_THRESHOLD env < `<db_dir>/params.toml`
 /// per-user override < `-t` CLI flag. The env var is applied BEFORE the
@@ -156,16 +173,19 @@ fn cmd_score() {
     let raw = read_stdin();
     let result = std::panic::catch_unwind(move || {
         let tokens = tokenizer::tokenize_env(&raw);
-        let db = open_db();
+        // A missing db is now an error rather than an empty one conjured on the spot.
+        // Fail open: deliver the message unfiltered and say so loudly, exactly as for
+        // a panic — never junk mail because the corpus went walkabout.
+        let db = open_db_ro().map_err(|e| {
+            eprintln!("spamlite: {e} (fail-open, message delivered unfiltered)");
+            e
+        })?;
         let params = make_params();
-        classifier::classify(&db, &tokens, &params)
+        classifier::classify(&db, &tokens, &params).map_err(|e| e.to_string())
     });
     match result {
         Ok(Ok((verdict, score))) => print!("{verdict} {score:.6}"),
-        Ok(Err(e)) => {
-            eprintln!("spamlite: classification error (fail-open): {e}");
-            print!("{FAIL_OPEN_VERDICT}");
-        }
+        Ok(Err(_)) => print!("{FAIL_OPEN_VERDICT}"),
         Err(_) => {
             eprintln!("spamlite: internal panic (fail-open, message scored neutral)");
             print!("{FAIL_OPEN_VERDICT}");
@@ -289,7 +309,7 @@ fn cmd_train(is_spam: bool) {
 fn cmd_explain() {
     let raw = read_stdin();
     let tokens = tokenizer::tokenize_env(&raw);
-    let db = open_db();
+    let db = open_db_ro_or_exit();
     let params = make_params();
 
     let expl = match classifier::classify_explain(&db, &tokens, &params) {
@@ -376,7 +396,7 @@ fn cmd_explain() {
 }
 
 fn cmd_counts() {
-    let db = open_db();
+    let db = open_db_ro_or_exit();
     match db.counts() {
         Ok(c) => {
             println!("Good messages:  {}", c.total_good);
@@ -407,7 +427,7 @@ fn cmd_cleanup(args: &[String]) {
 }
 
 fn cmd_export() {
-    let db = open_db();
+    let db = open_db_ro_or_exit();
     let mut stdout = io::stdout().lock();
     if let Err(e) = db.export(&mut stdout) {
         eprintln!("spamlite: export error: {e}");

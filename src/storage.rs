@@ -25,7 +25,27 @@ pub struct Database {
 }
 
 impl Database {
-    /// Open (or create) the database at the given path with WAL mode
+    /// Open the database at `path`, failing if it does not already exist.
+    ///
+    /// For the read-only commands (`score`, `explain`, `counts`, `export`). `open()`
+    /// creates the file *and* its parent directories, which makes a mistyped `-d` look
+    /// like an empty corpus rather than an error: every message scores a neutral
+    /// `GOOD 0.500000` and nothing complains. It is worse than cosmetic — running
+    /// `counts` against a path that did not exist materialised a whole directory tree
+    /// plus an empty db under `/srv`, and the baseline-deploy script guards only with
+    /// `[[ -f $BASELINE_DB ]]`, so that empty db would have been copied onto every
+    /// newly provisioned user. A read-only command must never bring a database into
+    /// existence.
+    pub fn open_existing(path: &Path) -> Result<Self, String> {
+        if !path.is_file() {
+            return Err(format!("no database at {}", path.display()));
+        }
+        Database::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))
+    }
+
+    /// Open (or create) the database at the given path with WAL mode.
+    /// Creates the file and its parent directories — use `open_existing` for
+    /// anything that only reads.
     pub fn open(path: &Path) -> SqlResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -339,6 +359,29 @@ mod tests {
 
     fn test_db() -> Database {
         Database::open(Path::new(":memory:")).unwrap()
+    }
+
+    /// `open()` creates parent directories — which is right for training, and wrong for
+    /// anything that only reads. A `counts` against a mistyped path once materialised a
+    /// whole tree plus an empty db under /srv, and the baseline-deploy script's only
+    /// guard is `[[ -f $BASELINE_DB ]]`, so that empty db was one provisioning run away
+    /// from being copied onto every new user.
+    #[test]
+    fn open_existing_refuses_to_create_anything() {
+        let root = std::env::temp_dir().join(format!("spamlite-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let db = root.join("nested").join("db.sqlite");
+
+        assert!(Database::open_existing(&db).is_err());
+        assert!(!root.exists(), "open_existing created {}", root.display());
+
+        // open() may still create — the training path depends on it.
+        Database::open(&db).unwrap();
+        assert!(db.is_file());
+        // and now that it exists, open_existing is happy.
+        assert!(Database::open_existing(&db).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
