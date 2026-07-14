@@ -40,7 +40,29 @@ struct Args {
     write: bool,
     json: bool,
     limit: Option<usize>,
+    fp_weight: f64,
+    min_test_spam: usize,
 }
+
+/// Relative cost of a false positive against a false negative in the objective.
+///
+/// 1.0 reproduces plain balanced error exactly, and that is the default ON PURPOSE.
+/// Raising it is tempting — an FP really is worse than an FN — but the only FP
+/// signal available here is the held-out Maildir count, and that number does not
+/// track reality: the user whose holdout shows 280 FPs is running at 278 GOOD /
+/// 73 SPAM in production with zero rescues in eight days. Tuning harder against a
+/// metric that disagrees with the live filter is how you break a working system.
+///
+/// Raising this also degenerates on a thin spam holdout: at w=10 with 11 held-out
+/// spam, the sweep picks a config with 0 FPs that catches 1 spam in 11. Use
+/// `--fp-weight` to experiment, but validate against real TRAIN corrections — not
+/// against this corpus — before changing the default.
+const DEFAULT_FP_WEIGHT: f64 = 1.0;
+
+/// Minimum held-out spam before a parameter change is allowed. 0 = no floor,
+/// matching prior behaviour. Worth raising only alongside `--fp-weight`, for the
+/// reason above: a thin spam holdout can't estimate a false-negative rate.
+const DEFAULT_MIN_TEST_SPAM: usize = 0;
 
 fn usage_and_exit() -> ! {
     eprintln!(
@@ -68,6 +90,8 @@ fn parse_args() -> Args {
     let mut write = false;
     let mut json = false;
     let mut limit: Option<usize> = None;
+    let mut fp_weight = DEFAULT_FP_WEIGHT;
+    let mut min_test_spam = DEFAULT_MIN_TEST_SPAM;
 
     let mut i = 1;
     let need = |i: usize, flag: &str| -> String {
@@ -117,6 +141,14 @@ fn parse_args() -> Args {
                 limit = Some(need(i, a).parse().expect("usize"));
                 i += 2;
             }
+            "--fp-weight" => {
+                fp_weight = need(i, a).parse().expect("f64");
+                i += 2;
+            }
+            "--min-test-spam" => {
+                min_test_spam = need(i, a).parse().expect("usize");
+                i += 2;
+            }
             "-h" | "--help" | "help" => usage_and_exit(),
             other => {
                 eprintln!("spamlite-tune: unknown argument '{other}'");
@@ -143,6 +175,8 @@ fn parse_args() -> Args {
         write,
         json,
         limit,
+        fp_weight,
+        min_test_spam,
     }
 }
 
@@ -267,15 +301,40 @@ impl EvalResult {
     fn spam_n(&self) -> u32 {
         self.fn_ + self.tp
     }
-    /// Balanced error rate: (fp_rate + fn_rate) / 2. Treats the two error
-    /// classes as equally costly regardless of class sizes — required when the
-    /// corpus is imbalanced (e.g. jaz has 31k ham vs 200 spam, where raw error
-    /// minimisation collapses to "always predict ham"). Lower is better; range
-    /// [0, 1].
+    /// Balanced error rate: (fp_rate + fn_rate) / 2. Reported, but NOT the
+    /// tuning objective — see `weighted_err`. Kept because the JSON log has
+    /// always carried it and the history is worth being able to compare against.
     fn balanced_err(&self) -> f64 {
         let h = self.ham_n().max(1) as f64;
         let s = self.spam_n().max(1) as f64;
         (self.fp as f64 / h + self.fn_ as f64 / s) / 2.0
+    }
+
+    /// The tuning objective: class-rate-normalised error with an explicit false
+    /// positive penalty.
+    ///
+    ///     (w·fp_rate + fn_rate) / (w + 1)
+    ///
+    /// Normalising by class size (rather than using raw counts) stops the search
+    /// collapsing to "always predict the majority class" on a lopsided corpus —
+    /// that was the original reason for `balanced_err`, and it still holds.
+    ///
+    /// But plain balanced error sets the FP/FN exchange rate to the *sample's*
+    /// class ratio, and that ratio is an artefact of mailbox hygiene, not of the
+    /// user's real mail. The corpus comes from the live Maildir: INBOX/cur
+    /// accumulates forever while .Junk/cur is expunged after 7 days, so a typical
+    /// holdout lands around 800 ham / 11 spam. Balanced error therefore prices one
+    /// spam catch at ~73 false positives, and the tuner duly bought them — it
+    /// accepted a config taking one user from 92 to 281 held-out FPs to clear 7 FNs,
+    /// and logged it as an improvement.
+    ///
+    /// `w` states the real cost ratio instead of inheriting an accidental one.
+    fn weighted_err(&self, fp_weight: f64) -> f64 {
+        let h = self.ham_n().max(1) as f64;
+        let s = self.spam_n().max(1) as f64;
+        let fp_rate = self.fp as f64 / h;
+        let fn_rate = self.fn_ as f64 / s;
+        (fp_weight * fp_rate + fn_rate) / (fp_weight + 1.0)
     }
 }
 
@@ -313,7 +372,12 @@ fn evaluate(
 /// total errors. This keeps the tuner from collapsing to "always predict the
 /// majority class" on imbalanced corpora — which is exactly what bit the first
 /// version of this tool on jaz's 31k-ham / 38-spam train split.
-fn tune(samples: &[Sample], total_good: u64, total_spam: u64) -> (Params, EvalResult) {
+fn tune(
+    samples: &[Sample],
+    total_good: u64,
+    total_spam: u64,
+    fp_weight: f64,
+) -> (Params, EvalResult) {
     let threshold_grid = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85];
     let good_bias_grid = [1.0, 1.5, 2.0, 2.5, 3.0];
     let strength_grid = [0.3, 0.5, 1.0, 1.5, 2.0];
@@ -331,7 +395,7 @@ fn tune(samples: &[Sample], total_good: u64, total_spam: u64) -> (Params, EvalRe
             let mut p = clone_params(&best);
             p.threshold = t;
             let r = evaluate(samples, total_good, total_spam, &p);
-            if r.balanced_err() < best_r.balanced_err() {
+            if r.weighted_err(fp_weight) < best_r.weighted_err(fp_weight) {
                 best = p;
                 best_r = r;
                 improved = true;
@@ -341,7 +405,7 @@ fn tune(samples: &[Sample], total_good: u64, total_spam: u64) -> (Params, EvalRe
             let mut p = clone_params(&best);
             p.good_bias = g;
             let r = evaluate(samples, total_good, total_spam, &p);
-            if r.balanced_err() < best_r.balanced_err() {
+            if r.weighted_err(fp_weight) < best_r.weighted_err(fp_weight) {
                 best = p;
                 best_r = r;
                 improved = true;
@@ -351,7 +415,7 @@ fn tune(samples: &[Sample], total_good: u64, total_spam: u64) -> (Params, EvalRe
             let mut p = clone_params(&best);
             p.strength = s;
             let r = evaluate(samples, total_good, total_spam, &p);
-            if r.balanced_err() < best_r.balanced_err() {
+            if r.weighted_err(fp_weight) < best_r.weighted_err(fp_weight) {
                 best = p;
                 best_r = r;
                 improved = true;
@@ -361,7 +425,7 @@ fn tune(samples: &[Sample], total_good: u64, total_spam: u64) -> (Params, EvalRe
             let mut p = clone_params(&best);
             p.unknown_prob = u;
             let r = evaluate(samples, total_good, total_spam, &p);
-            if r.balanced_err() < best_r.balanced_err() {
+            if r.weighted_err(fp_weight) < best_r.weighted_err(fp_weight) {
                 best = p;
                 best_r = r;
                 improved = true;
@@ -371,7 +435,7 @@ fn tune(samples: &[Sample], total_good: u64, total_spam: u64) -> (Params, EvalRe
             let mut p = clone_params(&best);
             p.max_interesting = m;
             let r = evaluate(samples, total_good, total_spam, &p);
-            if r.balanced_err() < best_r.balanced_err() {
+            if r.weighted_err(fp_weight) < best_r.weighted_err(fp_weight) {
                 best = p;
                 best_r = r;
                 improved = true;
@@ -381,7 +445,7 @@ fn tune(samples: &[Sample], total_good: u64, total_spam: u64) -> (Params, EvalRe
             let mut p = clone_params(&best);
             p.min_word_count = mwc;
             let r = evaluate(samples, total_good, total_spam, &p);
-            if r.balanced_err() < best_r.balanced_err() {
+            if r.weighted_err(fp_weight) < best_r.weighted_err(fp_weight) {
                 best = p;
                 best_r = r;
                 improved = true;
@@ -463,23 +527,75 @@ fn clone_params(p: &Params) -> Params {
     }
 }
 
+/// The six keys the tuner sweeps. Everything else in a params.toml was put there
+/// by a human and is none of the tuner's business.
+const MANAGED_KEYS: [&str; 6] = [
+    "strength",
+    "unknown_prob",
+    "max_interesting",
+    "threshold",
+    "good_bias",
+    "min_word_count",
+];
+
+/// Rewrite only the managed keys, preserving every other line — hand-written
+/// keys, comments, and blank lines — verbatim and in place.
+///
+/// This used to be an unconditional `fs::write` of the six managed keys, which
+/// silently deleted anything else in the file. `combine_mode` and `train_max_reps`
+/// are not tunable and so were not in the six: a user hand-tuned onto the
+/// non-saturating geometric combiner (with the reasoning written up in comments
+/// above it) would have had that quietly reverted the first night they had enough
+/// corpus for the tuner to run on them, taking the comments with it.
 fn write_params_toml(db_dir: &Path, params: &Params) -> std::io::Result<()> {
     let path = db_dir.join("params.toml");
-    let body = format!(
-        "# spamlite per-user params (generated by spamlite-tune)\n\
-         strength = {}\n\
-         unknown_prob = {}\n\
-         max_interesting = {}\n\
-         threshold = {}\n\
-         good_bias = {}\n\
-         min_word_count = {}\n",
-        params.strength,
-        params.unknown_prob,
-        params.max_interesting,
-        params.threshold,
-        params.good_bias,
-        params.min_word_count
-    );
+
+    let managed_value = |k: &str| -> String {
+        match k {
+            "strength" => params.strength.to_string(),
+            "unknown_prob" => params.unknown_prob.to_string(),
+            "max_interesting" => params.max_interesting.to_string(),
+            "threshold" => params.threshold.to_string(),
+            "good_bias" => params.good_bias.to_string(),
+            "min_word_count" => params.min_word_count.to_string(),
+            _ => unreachable!("managed_value called with unmanaged key {k}"),
+        }
+    };
+
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    if existing.trim().is_empty() {
+        out.push("# spamlite per-user params (generated by spamlite-tune)".to_string());
+    }
+
+    for raw in existing.lines() {
+        // Match on the key only; keep the line untouched if it isn't one of ours.
+        let key = raw
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split_once('=')
+            .map(|(k, _)| k.trim());
+        match key {
+            Some(k) if MANAGED_KEYS.contains(&k) => {
+                out.push(format!("{k} = {}", managed_value(k)));
+                seen.insert(MANAGED_KEYS.iter().find(|m| **m == k).unwrap());
+            }
+            _ => out.push(raw.to_string()),
+        }
+    }
+
+    // Any managed key the file didn't already carry gets appended.
+    for k in MANAGED_KEYS {
+        if !seen.contains(k) {
+            out.push(format!("{k} = {}", managed_value(k)));
+        }
+    }
+
+    let mut body = out.join("\n");
+    body.push('\n');
     fs::write(&path, body)?;
     Ok(())
 }
@@ -527,36 +643,70 @@ fn main() {
         "spamlite-tune: train ham={train_ham} spam={train_spam} | test ham={test_ham} spam={test_spam}",
     );
 
-    // Baseline = Params::default() with production threshold (0.6 by default).
-    // Reported on TEST set — the only set whose numbers actually mean anything.
-    let baseline = Params {
+    // Baseline = the params this user is ACTUALLY RUNNING, which is an installed
+    // params.toml if they have one, else the defaults at the production threshold.
+    // Comparing against `Params::default()` regardless — as this did — meant a
+    // re-tune never checked its candidate against the config it was about to
+    // overwrite, so it could replace a good params.toml with a worse one and still
+    // report an improvement.
+    let mut baseline = Params {
         threshold: args.baseline_threshold,
         ..Default::default()
     };
+    baseline.load_overrides(&args.db_dir);
     let baseline_test = evaluate(&test, total_good, total_spam, &baseline);
 
     let t1 = Instant::now();
-    let (best, best_train) = tune(&train, total_good, total_spam);
+    let (best, best_train) = tune(&train, total_good, total_spam, args.fp_weight);
     let tune_elapsed = t1.elapsed().as_secs_f64();
     let best_test = evaluate(&test, total_good, total_spam, &best);
 
-    // Decision: did tuning actually generalise? If test balanced-error didn't
-    // improve, the "best" params are an overfit and we refuse to write them.
-    let generalised = best_test.balanced_err() < baseline_test.balanced_err();
+    // Three independent conditions, all of which must hold to write.
+    //
+    // 1. The objective improved on held-out data (not an overfit).
+    // 2. False positives did not go up. A pure objective win is not enough: the
+    //    weighting says what we'd *trade*, this says what we won't *regress*. Junking
+    //    a user's legitimate mail to catch more spam is not an improvement we accept
+    //    silently, whatever the arithmetic says.
+    // 3. The holdout carries enough spam to estimate a false-negative rate at all.
+    let improved = best_test.weighted_err(args.fp_weight) < baseline_test.weighted_err(args.fp_weight);
+    let no_fp_regression = best_test.fp <= baseline_test.fp;
+    let enough_spam = test_spam >= args.min_test_spam;
+    let generalised = improved && no_fp_regression && enough_spam;
+
+    // Why we refused, so the log says something more useful than "generalised: false".
+    let refused = if generalised {
+        String::new()
+    } else if !enough_spam {
+        format!("test_spam {test_spam} < min_test_spam {}", args.min_test_spam)
+    } else if !no_fp_regression {
+        format!(
+            "fp regression {} -> {} (+{})",
+            baseline_test.fp,
+            best_test.fp,
+            best_test.fp - baseline_test.fp
+        )
+    } else {
+        "no held-out improvement".to_string()
+    };
 
     if args.json {
         println!(
-            "{{\"holdout\":{},\"train\":{{\"ham\":{},\"spam\":{}}},\"test\":{{\"ham\":{},\"spam\":{}}},\"baseline\":{{\"threshold\":{},\"strength\":{},\"unknown_prob\":{},\"max_interesting\":{},\"good_bias\":{},\"min_word_count\":{},\"test_fp\":{},\"test_fn\":{},\"test_balanced_err\":{:.6}}},\"best\":{{\"threshold\":{},\"strength\":{},\"unknown_prob\":{},\"max_interesting\":{},\"good_bias\":{},\"min_word_count\":{},\"train_fp\":{},\"train_fn\":{},\"train_balanced_err\":{:.6},\"test_fp\":{},\"test_fn\":{},\"test_balanced_err\":{:.6}}},\"generalised\":{},\"tune_elapsed_s\":{:.3}}}",
+            "{{\"holdout\":{},\"fp_weight\":{},\"train\":{{\"ham\":{},\"spam\":{}}},\"test\":{{\"ham\":{},\"spam\":{}}},\"baseline\":{{\"threshold\":{},\"strength\":{},\"unknown_prob\":{},\"max_interesting\":{},\"good_bias\":{},\"min_word_count\":{},\"test_fp\":{},\"test_fn\":{},\"test_balanced_err\":{:.6},\"test_weighted_err\":{:.6}}},\"best\":{{\"threshold\":{},\"strength\":{},\"unknown_prob\":{},\"max_interesting\":{},\"good_bias\":{},\"min_word_count\":{},\"train_fp\":{},\"train_fn\":{},\"train_balanced_err\":{:.6},\"test_fp\":{},\"test_fn\":{},\"test_balanced_err\":{:.6},\"test_weighted_err\":{:.6}}},\"generalised\":{},\"refused_because\":\"{}\",\"tune_elapsed_s\":{:.3}}}",
             args.holdout,
+            args.fp_weight,
             train_ham, train_spam, test_ham, test_spam,
             baseline.threshold, baseline.strength, baseline.unknown_prob,
             baseline.max_interesting, baseline.good_bias, baseline.min_word_count,
             baseline_test.fp, baseline_test.fn_, baseline_test.balanced_err(),
+            baseline_test.weighted_err(args.fp_weight),
             best.threshold, best.strength, best.unknown_prob,
             best.max_interesting, best.good_bias, best.min_word_count,
             best_train.fp, best_train.fn_, best_train.balanced_err(),
             best_test.fp, best_test.fn_, best_test.balanced_err(),
+            best_test.weighted_err(args.fp_weight),
             generalised,
+            refused,
             tune_elapsed,
         );
     } else {
@@ -597,9 +747,7 @@ fn main() {
 
     if args.write {
         if !generalised {
-            eprintln!(
-                "spamlite-tune: refusing to write params.toml — tuned params did not improve held-out test set"
-            );
+            eprintln!("spamlite-tune: refusing to write params.toml — {refused}");
             process::exit(2);
         }
         if let Err(e) = write_params_toml(&args.db_dir, &best) {
@@ -609,4 +757,85 @@ fn main() {
         eprintln!("spamlite-tune: wrote {}/params.toml", args.db_dir.display());
     }
     let _ = classifier::Verdict::Good; // keep `classifier` use anchored
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(fp: u32, fn_: u32, tp: u32, tn: u32) -> EvalResult {
+        EvalResult { fp, fn_, tp, tn }
+    }
+
+    /// The default must not silently change the objective: w=1 IS balanced error.
+    #[test]
+    fn default_fp_weight_reproduces_balanced_err() {
+        for r in [ev(92, 7, 4, 708), ev(281, 0, 11, 519), ev(0, 38, 0, 31_000)] {
+            assert!((r.weighted_err(DEFAULT_FP_WEIGHT) - r.balanced_err()).abs() < 1e-12);
+        }
+    }
+
+    /// The FP-weighting mechanism works when asked for. On a 800-ham/11-spam holdout
+    /// balanced error prices one spam catch at ~73 false positives, and will trade
+    /// 189 extra FPs for 7 FNs. At w=10 it won't. (Not the default — see the const.)
+    #[test]
+    fn fp_weight_can_reject_a_bad_fp_trade() {
+        let installed = ev(92, 7, 4, 708);
+        let tuned = ev(281, 0, 11, 519);
+        assert!(tuned.balanced_err() < installed.balanced_err());
+        assert!(tuned.weighted_err(10.0) > installed.weighted_err(10.0));
+    }
+
+    /// Whatever the weight, the objective must not collapse to "always predict the
+    /// majority class" on a lopsided corpus — the failure balanced_err was introduced
+    /// to prevent (jaz: 31k ham, 38 spam).
+    #[test]
+    fn weighted_err_still_beats_always_predict_ham() {
+        let always_ham = ev(0, 38, 0, 31_000);
+        let sensible = ev(100, 10, 28, 30_900);
+        for w in [1.0, 10.0] {
+            assert!(sensible.weighted_err(w) < always_ham.weighted_err(w), "w={w}");
+        }
+    }
+
+    #[test]
+    fn write_params_toml_preserves_unmanaged_keys_and_comments() {
+        let dir = std::env::temp_dir().join(format!("spamlite-tune-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("params.toml");
+        fs::write(
+            &path,
+            "# hand-written, do not clobber\ncombine_mode = geometric\ntrain_max_reps = 5\nthreshold = 0.9\n",
+        )
+        .unwrap();
+
+        let p = Params { threshold: 0.65, ..Default::default() };
+        write_params_toml(&dir, &p).unwrap();
+        let got = fs::read_to_string(&path).unwrap();
+
+        // Unmanaged keys and the comment survive untouched.
+        assert!(got.contains("# hand-written, do not clobber"));
+        assert!(got.contains("combine_mode = geometric"));
+        assert!(got.contains("train_max_reps = 5"));
+        // The managed key is updated in place, not duplicated.
+        assert!(got.contains("threshold = 0.65"));
+        assert!(!got.contains("threshold = 0.9"));
+        assert_eq!(got.matches("threshold =").count(), 1);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_params_toml_creates_a_fresh_file_when_none_exists() {
+        let dir = std::env::temp_dir().join(format!("spamlite-tune-fresh-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        write_params_toml(&dir, &Params::default()).unwrap();
+        let got = fs::read_to_string(dir.join("params.toml")).unwrap();
+        for k in MANAGED_KEYS {
+            assert!(got.contains(&format!("{k} =")), "missing {k} in {got:?}");
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }
