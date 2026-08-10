@@ -252,6 +252,26 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         if tokens.len() >= MAX_RAW_TOKENS {
             break;
         }
+
+        // When a message has no text/plain alternative, mail-parser's
+        // `text_bodies()` falls back to the text/html part — the same part
+        // `html_bodies()` yields below. Tokenizing it here would process the raw
+        // markup: tag names, attribute names and values, CSS properties, CSS
+        // values, class names and undecoded entities all become `b:` tokens.
+        //
+        // That systematically condemned legitimate HTML-only mail. Ham corpora
+        // are seeded from `.Sent`, which is plain or multipart, so markup tokens
+        // landed almost entirely on the spam side (`b:style` 300 good / 1285 spam,
+        // `b:nbsp` 173/910, `b:helvetica` 166/729 on one real user) and there are
+        // enough of them to fill the interesting-token budget. secretary@
+        // had an auditor's notification pinned at SPAM 0.98 while every
+        // sender-specific token in it was strongly ham -- markup outvoted content.
+        //
+        // The `html_bodies()` loop below handles these parts properly, so skip.
+        if part.is_text_html() {
+            continue;
+        }
+
         let text = part.text_contents().unwrap_or_default();
 
         // URLs in plain-text bodies carry the same signal as HTML hrefs —
@@ -835,6 +855,82 @@ mod tests {
         assert!(
             tokens.iter().any(|t| t == "u:https://example.com/offer"),
             "expected u: token from plain-text body, got {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn test_html_only_body_yields_no_markup_tokens() {
+        // An HTML-only message has no text/plain alternative, so mail-parser hands
+        // the same part to both text_bodies() and html_bodies(). Without the
+        // is_text_html() guard the text loop tokenizes the raw markup and every
+        // tag, attribute, CSS property, CSS value and class name becomes a `b:`
+        // token -- which outvoted real content and condemned HTML-only ham.
+        let email = b"From: x@y.com\r\nSubject: hi\r\nContent-Type: text/html\r\n\r\n\
+            <html><head><meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">\
+            <style type=\"text/css\">.promo { margin-top: 13px; font-family: helvetica, arial; }\
+            </style></head><body><p>Hello&nbsp;there uniquewordalpha</p></body></html>\r\n";
+        let tokens = tokenize(email);
+
+        for markup in [
+            "b:html",
+            "b:head",
+            "b:meta",
+            "b:style",
+            "b:body",
+            "b:http-equiv",
+            "b:x-ua-compatible",
+            "b:edge",
+            "b:margin-top",
+            "b:13px",
+            "b:font-family",
+            "b:helvetica",
+            "b:arial",
+            "b:promo",
+            "b:nbsp",
+        ] {
+            assert!(
+                !tokens.iter().any(|t| t == markup),
+                "markup token {markup} leaked from an HTML-only body: {tokens:?}"
+            );
+        }
+
+        // The actual content must still survive.
+        assert!(
+            tokens.iter().any(|t| t == "b:uniquewordalpha"),
+            "expected body content token, got {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn test_multipart_alternative_prefers_plain_text() {
+        // The plain part is tokenized and the html sibling is stripped, so neither
+        // route may produce markup. This case was already correct -- the test is
+        // here so the is_text_html() guard cannot be "fixed" by dropping html
+        // parts from scoring altogether.
+        let email = b"From: x@y.com\r\nSubject: hi\r\n\
+            Content-Type: multipart/alternative; boundary=\"BB\"\r\n\r\n\
+            --BB\r\nContent-Type: text/plain\r\n\r\nHello there uniquewordalpha\r\n\
+            --BB\r\nContent-Type: text/html\r\n\r\n\
+            <html><body><p>Hello there <a href=\"https://example.com/go\">uniquewordbeta</a></p></body></html>\r\n\
+            --BB--\r\n";
+        let tokens = tokenize(email);
+
+        assert!(
+            !tokens.iter().any(|t| t == "b:body" || t == "b:html"),
+            "markup leaked from multipart/alternative: {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "b:uniquewordalpha"),
+            "expected plain-text content, got {tokens:?}"
+        );
+        // The html sibling still contributes its stripped text and its URLs.
+        assert!(
+            tokens.iter().any(|t| t == "b:uniquewordbeta"),
+            "expected stripped html content, got {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "u:https://example.com/go"),
+            "expected u: token from html href, got {tokens:?}"
         );
     }
 
