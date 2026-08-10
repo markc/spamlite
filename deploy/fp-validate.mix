@@ -1,0 +1,179 @@
+#!/opt/cosmix/bin/mix
+-- fp-validate.mix <days> <addr> [<addr>...] — is each "confirmed false positive"
+-- actually ham?
+--
+-- WHY THIS EXISTS. fp-rank.mix ranks users by `TRAIN: user <msgid> -> good`, i.e. the
+-- user dragged the message out of Junk. That is the only *explicit user action* in the
+-- logs, so it is tempting to treat it as ground truth — and it is NOT. Measured on the
+-- fleet's apparent worst-affected mailbox: 24 "confirmed FPs", and every one of the 5
+-- that survived on disk was plain dropship spam on a throwaway TLD, sitting in **Trash**
+-- — moved Junk -> INBOX, then deleted. That user was poisoning their own ham corpus, not
+-- suffering false positives. Ranking them #1 worst-FP user on the fleet was a metric
+-- artefact.
+--
+-- So: a rescue means "the user touched it", not "the filter was wrong". Every rescue
+-- needs eyes before it becomes evidence, and certainly before it becomes training data.
+-- This prints the identity of each one, flags the obvious junk, and reports WHERE the
+-- message ended up — Trash/Junk is the user contradicting their own rescue.
+--
+-- Speed: fp-rescued.mix greps once per Maildir FILE to build a msgid index (fine for a
+-- 1.7k mailbox, hopeless for a 14k one). This greps once per USER: one `grep -F -f`
+-- pass over the whole Maildir with all msgids as patterns, then reads headers only from
+-- the handful of files that hit.
+
+$av = args()
+$DAYS = to_number($av[0] ?? "28")
+
+$addrs = []
+$i = 1
+while $i < length($av)
+  push($addrs, $av[$i])
+  $i = $i + 1
+end
+if length($addrs) == 0 then
+  eprint "usage: fp-validate.mix <days> <addr> [<addr>...]"
+  exit(1)
+end
+
+-- Cheap junk tells. Not a classifier — just enough to say "this rescue is not evidence".
+-- The abuse TLDs are the same set the (dead) abuse-TLD rail targeted; here they are only
+-- used to FLAG a rescue for review, never to make a delivery decision.
+$abuse = [".lol", ".store", ".cloud", ".space", ".shop", ".click", ".top", ".xyz", ".online", ".site", ".fun", ".live", ".biz"]
+
+fn cap1($pat, $s)
+  $r = regex_find($pat, $s)
+  if length($r) == 0 then return nil end
+  return $r[0].groups[0]
+end
+
+fn hdr($file, $name)
+  $c = "grep -m1 -i " .. shell_quote("^" .. $name .. ":") .. " " .. shell_quote($file) .. " 2>/dev/null || true"
+  $v = trim(run_rc($c).stdout)
+  if $v == "" then return "" end
+  return trim(split($v, ":")[1] ?? "")
+end
+
+for each $addr in $addrs
+  $u = split($addr, "@")[0]
+  $d = split($addr, "@")[1]
+  $home = "/srv/" .. $d .. "/msg/" .. $u
+  -- Key scratch paths on the FULL address. Keying on the local part silently collided
+  -- two different domains' `admin@` mailboxes and one clobbered the other's lists.
+  $slug = $u .. "_at_" .. $d
+
+  -- 1. deduped rescue msgids from the journal
+  -- `grep -F '-> good'` looks like a FLAG to grep (the pattern starts with `-`) and
+  -- silently matches nothing. Anchor the extraction on the msgid instead, so every
+  -- pattern begins with a harmless character.
+  $cmd = "/usr/bin/journalctl --since '" .. ("" .. $DAYS) .. " days ago' --no-pager 2>/dev/null"
+  $cmd = $cmd .. " | grep -F 'TRAIN: " .. $addr .. " '"
+  $cmd = $cmd .. " | grep -oE '<[^>]*> [-]> good' || true"
+  $mids = []
+  $seen = {}
+  for each $l in split(trim(run_rc($cmd).stdout), "\n")
+    $m = trim(split(trim($l), ">")[0] ?? "")
+    if $m != "" then
+      $m = substr($m, 1, length($m) - 1)
+      if $seen[$m] == nil then
+        $seen[$m] = true
+        push($mids, $m)
+      end
+    end
+  end
+
+  print "=== " .. $addr .. " — " .. ("" .. length($mids)) .. " deduped rescues in " .. ("" .. $DAYS) .. "d"
+  if length($mids) == 0 then
+    print ""
+    -- next user
+  end
+  if length($mids) > 0 then
+    -- 2. ONE grep pass over the Maildir with every msgid as a fixed pattern.
+    $pf = "/var/tmp/fp-audit/.mids." .. $slug
+    write_file($pf, join($mids, "\n") .. "\n")
+    $find = "find " .. shell_quote($home .. "/Maildir") .. " -type d \\( -name cur -o -name new \\)"
+    $find = $find .. " -exec find {} -maxdepth 1 -type f \\; 2>/dev/null"
+    $find = $find .. " | tr '\\n' '\\0' | xargs -0 -r grep -l -F -f " .. shell_quote($pf) .. " 2>/dev/null || true"
+    $hits = []
+    for each $p in split(trim(run_rc($find).stdout), "\n")
+      if trim($p) != "" then push($hits, trim($p)) end
+    end
+
+    $flagged = 0
+    $ham = 0
+    $rows = []
+    for each $p in $hits
+      -- A hit can be a DIFFERENT message quoting the msgid in References/In-Reply-To.
+      -- Only count files whose OWN Message-ID is in the rescued set.
+      $own = cap1("(?i)<([^>]*)>", trim(run_rc("grep -m1 -i '^Message-ID:' " .. shell_quote($p) .. " 2>/dev/null || true").stdout))
+      if $own != nil then
+        if $seen[$own] == true then
+          $from = hdr($p, "From")
+          $subj = hdr($p, "Subject")
+          $where = "INBOX"
+          $fold = cap1("/Maildir/\\.([^/]+)/", $p)
+          if $fold != nil then $where = $fold end
+          $flag = "  "
+          for each $t in $abuse
+            if contains(lower($from), $t .. ">") then $flag = "SP" end
+          end
+          -- The user contradicting their own rescue is the strongest tell of all.
+          if $where == "Trash" then $flag = "SP" end
+          if $where == "Junk" then $flag = "SP" end
+          if $flag == "SP" then
+            $flagged = $flagged + 1
+          else
+            $ham = $ham + 1
+          end
+          push($rows, {f: $flag, w: $where, p: $p, from: substr($from, 0, 44), s: substr($subj, 0, 46)})
+        end
+      end
+    end
+
+    for each $r in $rows
+      print "  " .. $r["f"] .. " " .. rpad($r["w"], 11) .. rpad($r["from"], 46) .. $r["s"]
+    end
+    $sum = "  -> on disk " .. ("" .. length($rows)) .. "/" .. ("" .. length($mids))
+    $sum = $sum .. "   looks-ham " .. ("" .. $ham) .. "   FLAGGED spam-or-self-contradicted " .. ("" .. $flagged)
+    print $sum
+
+    -- Emit the harness inputs, but ONLY the validated-ham rescues. Feeding a flagged
+    -- rescue into watch.list would tell htmlfix-eval.mix to "fix" a message that the
+    -- filter got RIGHT, and the fix would score as a regression for doing its job.
+    $od = "/var/tmp/fp-audit/v-" .. $slug
+    $mk = run_rc("mkdir -p " .. shell_quote($od))
+    if $mk.rc != 0 then
+      eprint "ERROR: cannot create " .. $od .. " — skipping list output for " .. $addr
+      eprint $mk.stderr
+    end
+    $wl = []
+    for each $r in $rows
+      if $r["f"] != "SP" then
+        push($wl, $r["p"] .. "\t" .. $r["from"] .. " | " .. $r["s"])
+      end
+    end
+    write_file($od .. "/watch.list", join($wl, "\n") .. "\n")
+
+    -- Regression set: INBOX mail that was NOT rescued, i.e. the filter already got it
+    -- right. The fix must not push any of these over the line. Newest first, capped.
+    $inb = "find " .. shell_quote($home .. "/Maildir/cur") .. " -maxdepth 1 -type f -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -150 | cut -d' ' -f2- || true"
+    -- Exclude the rescued messages themselves: a rescue LANDS in INBOX, so leaving them
+    -- in would double-count the very messages watch.list is measuring and mask a real
+    -- regression behind an intended improvement.
+    $isresc = {}
+    for each $r in $rows
+      $isresc[$r["p"]] = true
+    end
+    $hl = []
+    for each $p in split(trim(run_rc($inb).stdout), "\n")
+      if trim($p) != "" then
+        if $isresc[trim($p)] == nil then push($hl, trim($p)) end
+      end
+    end
+    write_file($od .. "/ham-regress.list", join($hl, "\n") .. "\n")
+    print "     lists: " .. $od .. " (watch " .. ("" .. length($wl)) .. ", ham-regress " .. ("" .. length($hl)) .. ")"
+    print ""
+  end
+end
+
+print "SP = From is on an abuse TLD, or the user later moved it to Junk/Trash."
+print "Rescues not on disk cannot be judged — treat the ham/flagged split as a SAMPLE."
