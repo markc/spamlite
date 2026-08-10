@@ -4,20 +4,30 @@
 # Invocation (from /etc/dovecot/sieve/global.sieve):
 #   spamfilter /srv/{domain}/msg/{user} receive
 #
-# Shadow mode runs a candidate binary alongside the primary for users listed
-# in /etc/spamlite-shadow.allow. A literal `*` line enables shadowing
-# cluster-wide. The candidate is always invoked as `score` (read-only, no db
-# writes) and its verdict is logged to the user's .spamlite/shadow.jsonl.
-# Shadow failures are silent; stdout and exit code are determined entirely
+# Shadow mode scores a candidate alongside the primary for users listed in
+# /etc/spamlite-shadow.allow (a literal `*` line = whole cluster) and logs its verdict to
+# the user's .spamlite/shadow.jsonl. The candidate is always invoked as `score` (read-only,
+# no db writes). Shadow failures are silent; stdout and exit code are determined entirely
 # by the primary path.
+#
+# The candidate may be a rival BINARY or a rival CORPUS. It is currently a binary
+# (/usr/local/bin/spamlite-candidate) scored against the user's own live db — see the
+# shadow block below. Shadowing a binary is only worth the 2x classify cost when the binary
+# actually changes scoring: 0.8.1 vs 0.8.0 alone was verified identical on 555 messages
+# (the only diff is an is_file() guard before the same db open), so shadowing THAT would
+# have logged a 100%-agreement tautology. The current candidate adds the HTML-markup
+# tokenizer fix, which changes scoring materially. A classify is ~23ms, so the 2s timeout
+# has ~87x headroom and the doubled cost is not a delivery risk.
 #
 # Side benefit: lowercases $DIR before use, working around a pre-existing
 # sieve-script bug where ${lhs}/${rhs} aren't lowercased and uppercase
 # recipient addresses (e.g. SCOTT@EXAMPLE.COM.AU) would land in a path
 # that does not exist.
 
-CANDIDATE_VER="0.8.0"
-CANDIDATE_BIN="/usr/local/bin/spamlite-${CANDIDATE_VER}"
+# 2026-07-14: 0.8.0 is primary.
+# 2026-08-10: the shadow candidate is a BINARY again — 0.8.1 + the HTML-markup tokenizer
+# fix (a13e2c1), scored against the user's OWN live db so the corpus is controlled for.
+# The disproven .spamlite-ham corpus candidate is retired. See the shadow block below.
 
 DIR="$1"; shift
 CMD="$1"; shift
@@ -54,8 +64,52 @@ else
 fi
 PRIMARY_RC=$?
 
-# Shadow mode — observability only, best-effort, never affects delivery
+# Shadow mode — observability only, best-effort, never affects delivery.
+#
+# 2026-08-10: the candidate is a BINARY again — 0.8.1 + the HTML-markup tokenizer fix
+# (commit a13e2c1), installed as /usr/local/bin/spamlite-candidate. It scores the user's
+# OWN live db, so the corpus is identical on both sides and any divergence is attributable
+# to the tokenizer alone. (0.8.1 vs the 0.8.0 primary was verified identical on 555
+# messages, so the version gap contributes nothing.)
+#
+# The bug: mail-parser's `text_bodies()` falls back to the text/html part when a message
+# has no text/plain alternative — the same part `html_bodies()` yields — so HTML-only mail
+# was tokenized twice, once raw. Tag names, CSS properties, font names and undecoded
+# entities became `b:` tokens, and there are enough of them in one message to fill the
+# 150-token interesting budget and outvote the actual content. One user's audit-portal
+# notification stayed pinned at 0.981707 through six rescues on `b:x-ua-compatible`,
+# `b:nbsp`, `b:style` and `b:helvetica` while every content token read strongly ham.
+#
+# Why shadow rather than just deploy: the fix is NOT uniformly ham-positive. Its direction
+# per user depends on where that user's corpus has put markup — users seeded from `.Sent`
+# (plain text) gain a lot, users whose newsletter-heavy INBOX was auto-trained as ham have
+# near-neutral markup, and for them those tokens were damping the interesting-token budget
+# rather than voting, so removing them lets spammier real vocabulary in. Measured
+# `b:style` good:spam ratio predicts it: 0.23 (large win, a business user seeded from .Sent)
+# through 0.86 (slight cost, a user with a 44k-message newsletter INBOX auto-trained as
+# ham). Spam also gives up top-band margin (`>=0.999` 311 → 215 of 600 donor spam), which
+# costs little at t=0.5 but +3.2pt FN at 0.75 and +4.5pt at 0.8 — so the users already
+# moved to raised thresholds pay the most. Hence: observe against real TRAIN corrections,
+# then promote — and re-measure every raised per-user threshold (currently four users
+# between 0.55 and 0.80) downward when promoting, because the fix recovers the very FP
+# margin those thresholds were bought with.
+#
+# The previous candidate was a CORPUS (`.spamlite-ham`, live db + ~2,500 donor ham). It was
+# disproven three times: donor ham shares markup with spam, so it moved markup toward the
+# middle rather than teaching the user's vocabulary — it was treating this bug's symptom.
+# The 206 `.spamlite-ham` dirs are left in place, unused. Old log lines are kept in the same
+# shadow.jsonl and are told apart by the `v` tag, so filter on it before comparing.
+#
+# Safety: `score` uses Storage::open_existing(), which refuses to CREATE a db but still
+# opens read-write (it runs the same CREATE TABLE IF NOT EXISTS / PRAGMA batch as the
+# primary). That is only safe because HEAD has no schema drift from 0.8.0 — verified: the
+# only SQL change since is in the `import` path, which shadow never invokes. If a future
+# candidate changes the schema, it must NOT be shadowed against the live db.
+CANDIDATE_BIN="/usr/local/bin/spamlite-candidate"
+CANDIDATE_TAG="htmlfix-a13e2c1"
+
 if [[ -x "$CANDIDATE_BIN" ]] \
+   && [[ -f "$DIR/.spamlite/db.sqlite" ]] \
    && [[ -d "$DIR/.spamlite" ]] \
    && [[ "$CMD" == "receive" || "$CMD" == "score" ]] \
    && [[ -r /etc/spamlite-shadow.allow ]]; then
@@ -64,25 +118,24 @@ if [[ -x "$CANDIDATE_BIN" ]] \
     USER_ID="${USER_NAME}@${DOMAIN_NAME}"
     if grep -qxF '*' /etc/spamlite-shadow.allow 2>/dev/null \
        || grep -qxF "$USER_ID" /etc/spamlite-shadow.allow 2>/dev/null; then
-        # Mirror the primary's per-user threshold logic: users with a
-        # params.toml own their threshold (candidate -t would defeat it and
-        # every divergence would be a threshold artefact, not a signal).
+        # Mirror the primary's per-user threshold logic exactly — same db, so literally the
+        # same rule: a user with params.toml owns their threshold and must NOT get a `-t`,
+        # or every divergence would be a threshold artefact rather than a tokenizer signal.
         CARGS=(-d "$DIR/.spamlite")
         [[ -f "$DIR/.spamlite/params.toml" ]] || CARGS+=(-t 0.5)
         CAND=$(timeout 2s "$CANDIDATE_BIN" "${CARGS[@]}" score < "$TMP" 2>/dev/null)
         if [[ -n "$CAND" ]]; then
             TS=$(date -u +%FT%TZ)
-            # Extract Message-ID for cross-referencing shadow events with
-            # mail.log TRAIN/DELIVERY. Best-effort: grep first matching header
-            # line, strip prefix, drop CR, JSON-escape backslashes + quotes,
-            # cap at 200 chars. Empty if not found.
+            # Message-ID is the join key back to the TRAIN corrections in journald, which are
+            # the ONLY untainted ground truth for who was right — a divergence on its own says
+            # nothing about correctness.
             MSGID=$(grep -i -m1 '^message-id:' "$TMP" 2>/dev/null \
                 | sed -E 's/^[Mm]essage-[Ii][Dd]:[[:space:]]*//' \
                 | tr -d '\r' \
                 | sed 's/\\/\\\\/g; s/"/\\"/g' \
                 | head -c 200)
             printf '{"t":"%s","v":"%s","cmd":"%s","user":"%s","msgid":"%s","primary":"%s","cand":"%s"}\n' \
-                "$TS" "$CANDIDATE_VER" "$CMD" "$USER_ID" "$MSGID" "$PRIMARY" "$CAND" \
+                "$TS" "$CANDIDATE_TAG" "$CMD" "$USER_ID" "$MSGID" "$PRIMARY" "$CAND" \
                 >> "$DIR/.spamlite/shadow.jsonl" 2>/dev/null
         fi
     fi
