@@ -87,6 +87,23 @@ Costs, unlike benefits, generalised cleanly: top-band spam margin (`≥0.999`) f
 database measured, with no new false negatives at the default threshold. So the cost is
 pure headroom — which is exactly what users on raised thresholds are spending.
 
+## Trap 5 — a broken join reads exactly like "not enough data yet"
+
+An A/B harness that adjudicates a candidate against user corrections has to join two
+independent sources: the log line recording the user's action, and the record written at
+delivery time. Those two sources format the message-ID differently — one keeps the angle
+brackets from the header, the other has already stripped them — and joining them raw
+produces **no matches, no error, and no warning**.
+
+Every adjudication counter reads zero. That is indistinguishable from an honest "the canary
+has not accumulated evidence yet", and it is worse than a crash: a rescue-lag guard, or any
+other legitimate reason for low early counts, supplies the zero with a convincing excuse.
+Left alone it runs the whole trial period and reports "no evidence either way".
+
+**Print the join hit count.** One line — how many records matched any ground-truth key —
+turns a silent permanent zero into a visible defect. Any counter that can be zero for two
+different reasons needs a second number that tells them apart.
+
 ## Practical sequence
 
 1. Rank candidates by deduped rescues, treating it as a **shortlist, not a finding**.
