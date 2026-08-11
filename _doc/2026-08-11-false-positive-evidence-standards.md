@@ -104,6 +104,27 @@ Left alone it runs the whole trial period and reports "no evidence either way".
 turns a silent permanent zero into a visible defect. Any counter that can be zero for two
 different reasons needs a second number that tells them apart.
 
+## Trap 6 — two ham-leaning knobs don't compose, they spend the same headroom
+
+Two users diagnosed as needing a raised threshold — every message the filter junked in the
+0.5–0.9 band over 28 days was legitimate, and their genuine spam sat at ≥0.999 — were moved
+to `threshold = 0.9`. That fixed the great majority: delivered-inbox false positives fell
+26 → 3 and 7 → 2, with no genuine spam released.
+
+A handful of stragglers remained above 0.9, so the obvious next move was the *other*
+ham-leaning knob: weighting ham evidence in the per-token probability (spamprobe's
+`good_bias = 2.0`). It fixed the stragglers spectacularly — 0.94 → 0.0016, 0.9998 → 0.54 —
+and destroyed the spam side: held-out spam false negatives at the same threshold went
+**9.2% → 44.0%** for one user and **11.0% → 44.8%** for the other, and 9 of 14 messages in
+one user's own Junk folder were released.
+
+The lesson isn't "that parameter is bad". It's that a threshold raise and a ham bias are
+**two ways of spending the same margin**. Once the threshold sits near the top of the score
+range, the headroom is already committed; a second ham-leaning knob on top has nothing left
+to spend and starts deleting the spam side instead. Pick one lever per user, measure it, and
+treat a residual as a residual — some messages need a different kind of fix, not more of the
+same one.
+
 ## Practical sequence
 
 1. Rank candidates by deduped rescues, treating it as a **shortlist, not a finding**.
