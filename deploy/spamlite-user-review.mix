@@ -3,10 +3,14 @@
 -- emailed to markc@renta.net. Fleet-generic (mbc/mrn/mbx): mailbox access is
 -- doveadm-based so Maildir and mdbox hosts work identically.
 --
---   spamlite-user-review.mix <user@domain> [dryrun]
+--   spamlite-user-review.mix <user@domain> [--to addr] [dryrun]
+--
+-- --to sends the report to the mailbox owner (or anyone) instead of the
+-- default markc@renta.net; when the recipient isn't markc, markc is Cc'd so
+-- the ops canary keeps flying.
 --
 -- Cron (per host, one line per reviewed user), e.g.:
---   0 15 * * * root /opt/cosmix/bin/mix /usr/local/bin/spamlite-user-review.mix brett@brettclarke.com
+--   0 15 * * * root /opt/cosmix/bin/mix /usr/local/bin/spamlite-user-review.mix brett@brettclarke.com --to brett@brettclarke.com
 --
 -- Reconciler-stack edition (spamlite 0.9.0): the actionable item is the
 -- BORDERLINE JUNK list — junk scored inside [threshold, threshold+0.25), the
@@ -23,6 +27,7 @@ $SL = "/usr/local/bin/spamlite"
 $RLOG = "/var/log/spamlite-reconcile.log"
 
 $U = ""
+$TO = "markc@renta.net"
 $DRY = 0
 $a = args()
 $i = 0
@@ -30,8 +35,13 @@ while $i < len($a)
   if $a[$i] == "dryrun" then
     $DRY = 1
   else
-    if pos("@", $a[$i]) > 0 then
-      $U = $a[$i]
+    if $a[$i] == "--to" then
+      $i = $i + 1
+      $TO = $a[$i]
+    else
+      if pos("@", $a[$i]) > 0 then
+        $U = $a[$i]
+      end
     end
   end
   $i = $i + 1
@@ -313,7 +323,11 @@ if $DRY == 1 then
   print($r)
 else
   $eml = "/dev/shm/spamlite-review." .. $up[0] .. ".eml"
-  write_file($eml, "To: markc@renta.net\nFrom: root@" .. $fqdn .. "\nSubject: spamlite 24h " .. $U .. " (" .. $fqdn .. ")\n\n" .. $r)
+  $cc = ""
+  if $TO != "markc@renta.net" then
+    $cc = "Cc: markc@renta.net\n"
+  end
+  write_file($eml, "To: " .. $TO .. "\n" .. $cc .. "From: root@" .. $fqdn .. "\nSubject: spamlite daily review " .. $U .. "\n\n" .. $r)
   run_argv(["/usr/sbin/sendmail", "-t"], {stdin: {file: $eml}})
   run_argv(["rm", "-f", $eml])
   write_file($BASE, strip($st.stdout) .. "\n")
