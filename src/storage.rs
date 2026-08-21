@@ -20,6 +20,21 @@ pub struct Counts {
     pub unique_tokens: u64,
 }
 
+/// Extended statistics for the `stats` command. `last_seen_*` are unix epochs
+/// over the tokens table (0 when the table is empty); `seen_recent` counts
+/// tokens whose last_seen falls inside the caller-supplied window — the
+/// "own vocabulary" marker: `receive`/`score` never write last_seen, so a
+/// token seen recently was necessarily trained recently.
+#[derive(Debug)]
+pub struct Stats {
+    pub total_good: u64,
+    pub total_spam: u64,
+    pub unique_tokens: u64,
+    pub last_seen_min: u64,
+    pub last_seen_max: u64,
+    pub seen_recent: u64,
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -37,10 +52,17 @@ impl Database {
     /// newly provisioned user. A read-only command must never bring a database into
     /// existence.
     pub fn open_existing(path: &Path) -> Result<Self, String> {
+        // The friendly error first; the OPEN flags below are the actual
+        // guarantee — without SQLITE_OPEN_CREATE the open cannot conjure a
+        // database even if the file vanishes between this check and the open
+        // (backup rotation, a concurrent cleanup).
         if !path.is_file() {
             return Err(format!("no database at {}", path.display()));
         }
-        Database::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))
+        let flags = rusqlite::OpenFlags::default().difference(rusqlite::OpenFlags::SQLITE_OPEN_CREATE);
+        let conn = Connection::open_with_flags(path, flags)
+            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        Self::init(conn).map_err(|e| format!("failed to open {}: {e}", path.display()))
     }
 
     /// Open (or create) the database at the given path with WAL mode.
@@ -51,7 +73,12 @@ impl Database {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path)?;
+        Self::init(conn)
+    }
 
+    /// Shared pragmas + schema/meta initialisation for both open paths. The
+    /// CREATE IF NOT EXISTS statements are no-ops on an existing db.
+    fn init(conn: Connection) -> SqlResult<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -205,6 +232,66 @@ impl Database {
             params![key],
         )?;
         tx.commit()
+    }
+
+    /// Train a batch of messages as one class in a SINGLE transaction: every
+    /// message's token counts +1 and the class total +N, atomically. This is
+    /// the bulk path for `train-dir` — one commit for the whole batch instead
+    /// of one per message, so a nightly reconciler run is a few WAL write
+    /// bursts rather than hundreds of tiny commits on the mailstore disk.
+    /// All-or-nothing: if the commit fails, NOTHING in this batch trained —
+    /// callers must not record per-message success (e.g. a dedupe sidecar)
+    /// until this returns Ok. The commit is forced durable (synchronous=FULL
+    /// for this connection): under the default WAL+NORMAL a host crash could
+    /// lose a committed batch AFTER the caller's sidecar recorded it, and
+    /// those messages would never be retrained.
+    pub fn train_messages(&self, messages: &[Vec<String>], is_spam: bool) -> SqlResult<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        let tx = self.conn.unchecked_transaction()?;
+        for words in messages {
+            Self::upsert_tokens(&tx, words, is_spam)?;
+        }
+        let key = if is_spam { "total_spam" } else { "total_good" };
+        tx.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + ?2 AS TEXT) WHERE key = ?1",
+            params![key, messages.len() as i64],
+        )?;
+        tx.commit()
+    }
+
+    /// Extended statistics. `recent_secs` is the window for `seen_recent`
+    /// (tokens with last_seen inside the last `recent_secs` seconds). One SQL
+    /// statement, so the token aggregates and the meta totals are a single
+    /// consistent snapshot even with concurrent training on other connections.
+    pub fn stats(&self, recent_secs: u64) -> SqlResult<Stats> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now - recent_secs as i64;
+        self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(MIN(last_seen), 0),
+                    COALESCE(MAX(last_seen), 0),
+                    COALESCE(SUM(last_seen >= ?1), 0),
+                    COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'total_good'), 0),
+                    COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'total_spam'), 0)
+             FROM tokens",
+            params![cutoff],
+            |row| {
+                Ok(Stats {
+                    unique_tokens: row.get::<_, i64>(0)? as u64,
+                    last_seen_min: row.get::<_, i64>(1)? as u64,
+                    last_seen_max: row.get::<_, i64>(2)? as u64,
+                    seen_recent: row.get::<_, i64>(3)? as u64,
+                    total_good: row.get::<_, i64>(4)? as u64,
+                    total_spam: row.get::<_, i64>(5)? as u64,
+                })
+            },
+        )
     }
 
     /// Get database statistics
@@ -496,6 +583,44 @@ mod tests {
         let count = db2.import(std::io::BufReader::new(reader)).unwrap();
         assert_eq!(count, 2);
         assert_eq!(db2.total_good().unwrap(), 1);
+    }
+
+    /// Bulk training: one transaction, token counts per message, class total +N.
+    #[test]
+    fn test_train_messages_bulk() {
+        let db = test_db();
+        let msgs: Vec<Vec<String>> = vec![
+            vec!["b:one".into(), "b:two".into()],
+            vec!["b:two".into()],
+        ];
+        db.train_messages(&msgs, true).unwrap();
+        assert_eq!(db.total_spam().unwrap(), 2);
+        assert_eq!(db.total_good().unwrap(), 0);
+        let found = db
+            .lookup_tokens(&["b:one".to_string(), "b:two".to_string()])
+            .unwrap();
+        assert_eq!(found["b:one"], (0, 1));
+        assert_eq!(found["b:two"], (0, 2));
+        // Empty batch is a no-op, not an error.
+        db.train_messages(&[], false).unwrap();
+        assert_eq!(db.total_good().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_stats() {
+        let db = test_db();
+        let s = db.stats(86400).unwrap();
+        assert_eq!(s.unique_tokens, 0);
+        assert_eq!(s.last_seen_min, 0);
+        assert_eq!(s.last_seen_max, 0);
+        assert_eq!(s.seen_recent, 0);
+
+        db.train_message(&["b:x".to_string()], false).unwrap();
+        let s = db.stats(86400).unwrap();
+        assert_eq!(s.total_good, 1);
+        assert_eq!(s.unique_tokens, 1);
+        assert_eq!(s.seen_recent, 1, "a just-trained token is inside any sane window");
+        assert!(s.last_seen_min > 0 && s.last_seen_max >= s.last_seen_min);
     }
 
     #[test]
