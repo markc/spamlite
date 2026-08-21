@@ -3,31 +3,40 @@
 --
 -- Folder state is the label source, not imapsieve events (events lose ~97% of
 -- corrections; state cannot lie — ~/.ns mbc _journal/2026-08-21 session 3):
---   spam: everything in Maildir/.Junk/{cur,new}
---   ham:  everything in Maildir/cur older than RIPEN (survived triage) and
---         younger than WINDOW (older mail either trained already or missed)
---   never: Trash (deletion is not a class signal), new/ (unseen)
+--   spam: everything in Junk
+--   ham:  everything in INBOX older than RIPEN (survived triage) and younger
+--         than WINDOW (older mail either trained already or missed)
+--   never: Trash (deletion is not a class signal), unseen new/ mail
+--
+-- Mailbox access per user dir (auto-detected):
+--   Maildir/  — direct file globs (Junk = .Junk/{cur,new}, ham = cur/ by
+--               basename epoch), staged as symlinks.
+--   mdbox/    — via doveadm (login derived from the path:
+--               <root>/<domain>/msg/<user> -> user@domain): enumeration with
+--               `doveadm fetch "uid hdr.message-id hdr.from" <query>`, ham
+--               window with `savedsince/savedbefore`, selected messages
+--               fetched into staging files named by uid.
 --
 -- Sidecar .spamlite/reconciled.log ("class epoch key" per line, last entry
 -- wins) makes each message train once per class. One corrective retrain is
--- allowed on a class flip (ham-ripened mail later dragged to Junk, or a
--- rescue); after 2 entries a key is frozen (flip-flop guard).
+-- allowed on a class flip; after 2 entries a key is frozen (flip-flop guard).
+-- Keys: lowercased Message-ID without <>, else f:<maildir-basename> /
+-- f:<uid> (fallback keys don't survive folder moves — accepted).
 --
 -- Rails: per-night per-class cap (default 200, oldest first, remainder next
--- night); BOTH classes trained each night when both have candidates (one-
--- sided mass over time shifts scores — F9; within-batch ORDER is irrelevant,
--- token counts are commutative, so batch-per-class training is exact);
--- X-Spam-Status/X-SpamProbe stripped in-binary by train-dir; a user with an
--- empty corpus side is skipped (seed decision needed first); WAL/shm/log
--- chowned back to the mail user after a root run.
+-- night); both classes trained each night when both have candidates (batch
+-- order is irrelevant — token counts are commutative; F9's real hazard is
+-- one-sided training over TIME); label headers stripped in-binary by
+-- train-dir; a user with an empty corpus side is skipped; a
+-- `.spamlite/reconcile-ham-only` marker file trains the HAM SIDE ONLY — for
+-- users whose Junk cannot be trusted as spam (the junk-as-ham sick cohort:
+-- their Junk holds their ham; ham-only reconciliation grows retention ham
+-- until their FP situation clears, then the marker comes off);
+-- WAL/shm/log chowned back to the mail user after a root run.
 --
--- Engine: spamlite >= 0.9.0 — `stats` (rail check), `msgids` (key extraction,
--- replaced reconcile-keyext.awk), `train-dir` (bulk training via a /dev/shm
--- symlink staging dir, one durable transaction per chunk, replaced the
--- per-message strip.awk|spamlite exec loop). Sidecar keys stay
--- keyext-compatible: lowercased Message-ID without <>, f:<basename> fallback.
--- train-dir's ok rows are printed post-commit, so a sidecar entry is only
--- ever written for a durably trained message.
+-- Engine: spamlite >= 0.9.0 (stats / msgids / train-dir). train-dir's ok
+-- rows print post-commit, so a sidecar entry is only ever written for a
+-- durably trained message.
 --
 -- Usage: spamlite-reconcile.mix [--dry-run] [--cap N] [--root DIR] [path-substring-filter]
 
@@ -65,10 +74,6 @@ $HAM_HI = $NOW - $RIPEN
 $HAM_LO = $NOW - $WINDOW
 $STAGE = "/dev/shm/slrec." .. $NOW
 
--- basename of a path, with the maildir ":2,flags" suffix removed — the
--- f:<basename> fallback key must be stable across a new/ -> cur/ move.
--- (Defined inline where used; Mix has no user functions.)
-
 $users = glob($ROOT .. "/*/msg/*")
 $u = 0
 while $u < len($users)
@@ -82,9 +87,25 @@ while $u < len($users)
   if is_file($d .. "/.spamlite/db.sqlite") == false then
     $go = 0
   end
+  $mode = ""
+  if $go == 1 then
+    if is_dir($d .. "/Maildir") then
+      $mode = "maildir"
+    else
+      if is_dir($d .. "/mdbox") then
+        $mode = "mdbox"
+      else
+        $go = 0
+      end
+    end
+  end
   if $go == 1 then
     $db = $d .. "/.spamlite"
     $log = $db .. "/reconciled.log"
+    $hamonly = 0
+    if is_file($db .. "/reconcile-ham-only") then
+      $hamonly = 1
+    end
 
     -- rail: both corpus sides must be non-empty (one stats call, one snapshot)
     $st = run_argv([$SL, "-d", $db, "stats"])
@@ -134,32 +155,41 @@ while $u < len($users)
       end
     end
 
-    -- candidates
-    $junk = concat(glob($d .. "/Maildir/.Junk/cur/*"), glob($d .. "/Maildir/.Junk/new/*"))
-    $inbox = []
-    $all = glob($d .. "/Maildir/cur/*")
-    $ai = 0
-    while $ai < len($all)
-      $ps = split($all[$ai], "/")
-      $b = $ps[len($ps) - 1]
-      $e = to_number(substr($b, 0, 10))
-      if $e >= $HAM_LO then
-        if $e <= $HAM_HI then
-          push($inbox, $all[$ai])
-        end
-      end
-      $ai = $ai + 1
-    end
+    -- ============ enumeration: candidates as "SORT|CLS|ID|BN" ============
+    -- ID: maildir = source path; mdbox = "<box> <uid>". BN: staging basename
+    -- (maildir basename sans :2,flags / uid) — the join key for key/from maps.
+    $cand = []
+    $key_bn = {}
+    $from_bn = {}
+    $njunk = 0
+    $nham = 0
 
-    $cand = concat($junk, $inbox)
-    if len($cand) == 0 then
-      print($d .. ": nothing in scope")
-    else
-      -- keys via `spamlite msgids` per source dir. The inbox window is a
-      -- SUBSET of Maildir/cur, so it is staged as symlinks first — msgids
-      -- scans whole directories. A file expunged mid-run makes msgids exit
-      -- non-zero; its remaining output is still valid, and the vanished file
-      -- simply cannot train tonight, so rc is deliberately ignored here.
+    if $mode == "maildir" then
+      $junk = []
+      if $hamonly == 0 then
+        $junk = concat(glob($d .. "/Maildir/.Junk/cur/*"), glob($d .. "/Maildir/.Junk/new/*"))
+      end
+      $inbox = []
+      $all = glob($d .. "/Maildir/cur/*")
+      $ai = 0
+      while $ai < len($all)
+        $ps = split($all[$ai], "/")
+        $b = $ps[len($ps) - 1]
+        $e = to_number(substr($b, 0, 10))
+        if $e >= $HAM_LO then
+          if $e <= $HAM_HI then
+            push($inbox, $all[$ai])
+          end
+        end
+        $ai = $ai + 1
+      end
+      $njunk = len($junk)
+      $nham = len($inbox)
+
+      -- keys via `spamlite msgids`: Junk dirs scanned whole; the inbox window
+      -- is a subset of cur/, so it is staged as symlinks for its scan. A file
+      -- expunged mid-run makes msgids exit non-zero; the remaining output is
+      -- still valid, so rc is deliberately ignored.
       $scan = $STAGE .. ".scan"
       remove_dir($scan)
       mkdir($scan)
@@ -167,23 +197,21 @@ while $u < len($users)
         run_argv(concat(["ln", "-s", "-t", $scan], $inbox))
       end
       $kl = []
-      if len(glob($d .. "/Maildir/.Junk/cur/*")) > 0 then
-        $r = run_argv([$SL, "msgids", $d .. "/Maildir/.Junk/cur"], {timeout: 300})
-        $kl = concat($kl, split(strip($r.stdout), "\n"))
-      end
-      if len(glob($d .. "/Maildir/.Junk/new/*")) > 0 then
-        $r = run_argv([$SL, "msgids", $d .. "/Maildir/.Junk/new"], {timeout: 300})
-        $kl = concat($kl, split(strip($r.stdout), "\n"))
+      if $hamonly == 0 then
+        if len(glob($d .. "/Maildir/.Junk/cur/*")) > 0 then
+          $r = run_argv([$SL, "msgids", $d .. "/Maildir/.Junk/cur"], {timeout: 300})
+          $kl = concat($kl, split(strip($r.stdout), "\n"))
+        end
+        if len(glob($d .. "/Maildir/.Junk/new/*")) > 0 then
+          $r = run_argv([$SL, "msgids", $d .. "/Maildir/.Junk/new"], {timeout: 300})
+          $kl = concat($kl, split(strip($r.stdout), "\n"))
+        end
       end
       if len($inbox) > 0 then
         $r = run_argv([$SL, "msgids", $scan], {timeout: 300})
         $kl = concat($kl, split(strip($r.stdout), "\n"))
       end
       remove_dir($scan)
-
-      -- maps: basename -> key (keyext-compatible), basename -> From
-      $key_bn = {}
-      $from_bn = {}
       $ki = 0
       while $ki < len($kl)
         $p = split($kl[$ki], "\t")
@@ -207,179 +235,240 @@ while $u < len($users)
         $ki = $ki + 1
       end
 
-      -- decide actions: "EPOCH|CLASS|CORR|PATH|KEY"
-      $actions = []
-      $skip_done = 0
-      $skip_frozen = 0
-      $ji = 0
-      while $ji < len($junk)
-        $f = $junk[$ji]
-        $ps = split($f, "/")
-        $b = $ps[len($ps) - 1]
-        $bn = $b
-        $fl = pos(":2,", $bn)
-        if $fl > 0 then
-          $bn = substr($bn, 0, $fl - 1)
+      $sets = [["S", $junk], ["G", $inbox]]
+      $si = 0
+      while $si < len($sets)
+        $cls = $sets[$si][0]
+        $files = $sets[$si][1]
+        $fi = 0
+        while $fi < len($files)
+          $f = $files[$fi]
+          $ps = split($f, "/")
+          $b = $ps[len($ps) - 1]
+          $bn = $b
+          $fl = pos(":2,", $bn)
+          if $fl > 0 then
+            $bn = substr($bn, 0, $fl - 1)
+          end
+          push($cand, substr($b, 0, 10) .. "|" .. $cls .. "|" .. $f .. "|" .. $bn)
+          $fi = $fi + 1
         end
-        $key = $key_bn[$bn]
-        if $key != nil then
-          $c = $seen[$key]
-          $corr = 0
-          $want = 1
-          if $c == "S" then
-            $want = 0
-            $skip_done = $skip_done + 1
-          end
-          if $c == "G" then
-            $n = $cnt[$key]
-            if $n >= 2 then
-              $want = 0
-              $skip_frozen = $skip_frozen + 1
-            else
-              $corr = 1
-            end
-          end
-          if $want == 1 then
-            push($actions, substr($b, 0, 10) .. "|S|" .. $corr .. "|" .. $f .. "|" .. $key)
-          end
-        end
-        $ji = $ji + 1
+        $si = $si + 1
       end
-      $hi = 0
-      while $hi < len($inbox)
-        $f = $inbox[$hi]
-        $ps = split($f, "/")
-        $b = $ps[len($ps) - 1]
-        $bn = $b
-        $fl = pos(":2,", $bn)
-        if $fl > 0 then
-          $bn = substr($bn, 0, $fl - 1)
-        end
-        $key = $key_bn[$bn]
-        if $key != nil then
-          $c = $seen[$key]
-          $corr = 0
-          $want = 1
-          if $c == "G" then
-            $want = 0
-            $skip_done = $skip_done + 1
-          end
-          if $c == "S" then
-            $n = $cnt[$key]
-            if $n >= 2 then
-              $want = 0
-              $skip_frozen = $skip_frozen + 1
-            else
-              $corr = 1
-            end
-          end
-          if $want == 1 then
-            push($actions, substr($b, 0, 10) .. "|G|" .. $corr .. "|" .. $f .. "|" .. $key)
-          end
-        end
-        $hi = $hi + 1
-      end
+    end
 
-      -- time-sort, apply per-class caps oldest-first, collect per class
-      $actions = sort($actions)
+    if $mode == "mdbox" then
+      -- login from the path: <root>/<domain>/msg/<user>
+      $ps = split($d, "/")
+      $login = $ps[len($ps) - 1] .. "@" .. $ps[len($ps) - 3]
+      $plans = []
+      if $hamonly == 0 then
+        push($plans, ["S", "Junk", ["mailbox", "Junk"]])
+      end
+      push($plans, ["G", "INBOX", ["mailbox", "INBOX", "savedsince", "" .. $HAM_LO, "savedbefore", "" .. $HAM_HI]])
+      $pi = 0
+      while $pi < len($plans)
+        $cls = $plans[$pi][0]
+        $box = $plans[$pi][1]
+        $q = $plans[$pi][2]
+        $r = run_argv(concat(["doveadm", "fetch", "-u", $login, "uid hdr.message-id hdr.from"], $q), {timeout: 600})
+        $uid = ""
+        $mid = ""
+        $frm = ""
+        $last = ""
+        $ls = []
+        if strip($r.stdout) != "" then
+          $ls = split($r.stdout, "\n")
+        end
+        push($ls, "uid: END")
+        $li = 0
+        while $li < len($ls)
+          $line = $ls[$li]
+          if pos("uid: ", $line) == 1 then
+            if $uid != "" then
+              $key = lower(replace(replace(replace($mid, "<", ""), ">", ""), " ", ""))
+              if $key == "" then
+                $key = "f:" .. $uid
+              end
+              $key_bn[$uid] = $key
+              $from_bn[$uid] = $frm
+              $z = "0000000000" .. $uid
+              push($cand, substr($z, len($z) - 10, 10) .. "|" .. $cls .. "|" .. $box .. " " .. $uid .. "|" .. $uid)
+              if $cls == "S" then
+                $njunk = $njunk + 1
+              else
+                $nham = $nham + 1
+              end
+            end
+            $uid = strip(substr($line, 5, len($line) - 5))
+            $mid = ""
+            $frm = ""
+            $last = ""
+          else
+            if pos("hdr.message-id:", $line) == 1 then
+              $mid = strip(substr($line, 15, len($line) - 15))
+              $last = "mid"
+            else
+              if pos("hdr.from:", $line) == 1 then
+                $frm = strip(substr($line, 9, len($line) - 9))
+                $last = "frm"
+              else
+                if pos(" ", $line) == 1 then
+                  -- folded header continuation
+                  if $last == "mid" then
+                    $mid = $mid .. strip($line)
+                  end
+                end
+                if pos("\t", $line) == 1 then
+                  if $last == "mid" then
+                    $mid = $mid .. strip($line)
+                  end
+                end
+              end
+            end
+          end
+          $li = $li + 1
+        end
+        $pi = $pi + 1
+      end
+    end
+
+    if len($cand) == 0 then
+      print($d .. ": nothing in scope")
+    else
+      -- ============ policy: dedupe, flips, caps (mode-independent) ============
+      $cand = sort($cand)
       $ns = 0
       $ng = 0
       $ncorr = 0
       $defer = 0
       $fail = 0
+      $skip_done = 0
+      $skip_frozen = 0
       $sample_s = 0
       $sample_g = 0
-      $stage_s = []
-      $stage_g = []
-      $key_of_bn = {}
+      $sel_s = []
+      $sel_g = []
       $corr_of_bn = {}
       $ti = 0
-      while $ti < len($actions)
-        $p = split($actions[$ti], "|")
+      while $ti < len($cand)
+        $p = split($cand[$ti], "|")
         $cls = $p[1]
-        $corr = $p[2]
-        $f = $p[3]
-        $key = $p[4]
-        $room = 1
-        if $cls == "S" then
-          if $ns >= $CAP then
-            $room = 0
+        $id = $p[2]
+        $bn = $p[3]
+        $key = $key_bn[$bn]
+        $want = 0
+        $corr = 0
+        if $key != nil then
+          $c = $seen[$key]
+          $want = 1
+          $other = "G"
+          if $cls == "G" then
+            $other = "S"
           end
-        else
-          if $ng >= $CAP then
-            $room = 0
+          if $c == $cls then
+            $want = 0
+            $skip_done = $skip_done + 1
+          end
+          if $c == $other then
+            $n = $cnt[$key]
+            if $n >= 2 then
+              $want = 0
+              $skip_frozen = $skip_frozen + 1
+            else
+              $corr = 1
+            end
           end
         end
-        if $room == 0 then
-          $defer = $defer + 1
-        else
-          $ps = split($f, "/")
-          $bn = $ps[len($ps) - 1]
-          $fl = pos(":2,", $bn)
-          if $fl > 0 then
-            $bn = substr($bn, 0, $fl - 1)
-          end
-          if $DRY == 1 then
-            $show = 0
-            if $cls == "S" then
-              $ns = $ns + 1
-              if $sample_s < 5 then
-                $sample_s = $sample_s + 1
-                $show = 1
-              end
-            else
-              $ng = $ng + 1
-              if $sample_g < 5 then
-                $sample_g = $sample_g + 1
-                $show = 1
-              end
-            end
-            if $corr == "1" then
-              $ncorr = $ncorr + 1
-            end
-            if $show == 1 then
-              $fr = $from_bn[$bn]
-              if $fr == nil then
-                $fr = "-"
-              end
-              print("  would-train " .. $cls .. " corr=" .. $corr .. " From: " .. $fr)
+        if $want == 1 then
+          $room = 1
+          if $cls == "S" then
+            if $ns >= $CAP then
+              $room = 0
             end
           else
-            $key_of_bn[$bn] = $key
-            $corr_of_bn[$bn] = $corr
+            if $ng >= $CAP then
+              $room = 0
+            end
+          end
+          if $room == 0 then
+            $defer = $defer + 1
+          else
             if $cls == "S" then
-              push($stage_s, $f)
               $ns = $ns + 1
             else
-              push($stage_g, $f)
               $ng = $ng + 1
+            end
+            if $corr == 1 then
+              $ncorr = $ncorr + 1
+              $corr_of_bn[$bn] = 1
+            end
+            if $DRY == 1 then
+              $show = 0
+              if $cls == "S" then
+                if $sample_s < 5 then
+                  $sample_s = $sample_s + 1
+                  $show = 1
+                end
+              else
+                if $sample_g < 5 then
+                  $sample_g = $sample_g + 1
+                  $show = 1
+                end
+              end
+              if $show == 1 then
+                $fr = $from_bn[$bn]
+                if $fr == nil then
+                  $fr = "-"
+                end
+                print("  would-train " .. $cls .. " corr=" .. $corr .. " From: " .. $fr)
+              end
+            else
+              if $cls == "S" then
+                push($sel_s, [$id, $bn])
+              else
+                push($sel_g, [$id, $bn])
+              end
             end
           end
         end
         $ti = $ti + 1
       end
 
-      -- bulk-train each class from a symlink staging dir. Sidecar entries are
-      -- written ONLY from train-dir's post-commit ok rows; err rows and files
-      -- that vanished mid-run count as failed and retry next night.
+      -- ============ staging + train-dir + sidecar (mode-aware staging) ============
       if $DRY == 0 then
         $ns = 0
         $ng = 0
-        $sets = 0
-        while $sets < 2
-          $cls = "S"
-          $cmd = "spam"
-          $stage_files = $stage_s
-          if $sets == 1 then
-            $cls = "G"
-            $cmd = "good"
-            $stage_files = $stage_g
-          end
-          if len($stage_files) > 0 then
+        $sets = [["spam", "S", $sel_s], ["good", "G", $sel_g]]
+        $si = 0
+        while $si < len($sets)
+          $cmd = $sets[$si][0]
+          $cls = $sets[$si][1]
+          $sel = $sets[$si][2]
+          if len($sel) > 0 then
             $sd = $STAGE .. "." .. $cmd
             remove_dir($sd)
             mkdir($sd)
-            run_argv(concat(["ln", "-s", "-t", $sd], $stage_files))
+            if $mode == "maildir" then
+              $paths = []
+              $xi = 0
+              while $xi < len($sel)
+                push($paths, $sel[$xi][0])
+                $xi = $xi + 1
+              end
+              run_argv(concat(["ln", "-s", "-t", $sd], $paths))
+            else
+              $ps = split($d, "/")
+              $login = $ps[len($ps) - 1] .. "@" .. $ps[len($ps) - 3]
+              $xi = 0
+              while $xi < len($sel)
+                $bp = split($sel[$xi][0], " ")
+                run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $bp[0], "uid", $bp[1]], {stdout: {file: $sd .. "/raw"}})
+                run_argv(["sed", "1d", $sd .. "/raw"], {stdout: {file: $sd .. "/" .. $sel[$xi][1]}})
+                $xi = $xi + 1
+              end
+              run_argv(["rm", "-f", $sd .. "/raw"])
+            end
             $tr = run_argv([$SL, "-d", $db, "train-dir", $sd, $cmd], {timeout: 1800})
             $tl = []
             if strip($tr.stdout) != "" then
@@ -390,22 +479,19 @@ while $u < len($users)
               $p = split($tl[$tli], "\t")
               if len($p) >= 3 then
                 if $p[0] == "ok" then
-                  $ps = split($p[2], "/")
-                  $bn = $ps[len($ps) - 1]
+                  $ps2 = split($p[2], "/")
+                  $bn = $ps2[len($ps2) - 1]
                   $fl = pos(":2,", $bn)
                   if $fl > 0 then
                     $bn = substr($bn, 0, $fl - 1)
                   end
-                  $key = $key_of_bn[$bn]
+                  $key = $key_bn[$bn]
                   if $key != nil then
                     append_file($log, $cls .. " " .. $NOW .. " " .. $key .. "\n")
                     if $cls == "S" then
                       $ns = $ns + 1
                     else
                       $ng = $ng + 1
-                    end
-                    if $corr_of_bn[$bn] == "1" then
-                      $ncorr = $ncorr + 1
                     end
                   end
                 else
@@ -414,18 +500,22 @@ while $u < len($users)
               end
               $tli = $tli + 1
             end
-            $fail = $fail + (len($stage_files) - len($tl))
+            $fail = $fail + (len($sel) - len($tl))
             remove_dir($sd)
           end
-          $sets = $sets + 1
+          $si = $si + 1
         end
       end
 
-      $mode = "trained"
-      if $DRY == 1 then
-        $mode = "would-train"
+      $modetag = $mode
+      if $hamonly == 1 then
+        $modetag = $mode .. "/HAM-ONLY"
       end
-      print($d .. ": junk=" .. len($junk) .. " inbox-window=" .. len($inbox) .. " | " .. $mode .. " spam=" .. $ns .. " good=" .. $ng .. " (corrective=" .. $ncorr .. ") | already=" .. $skip_done .. " frozen=" .. $skip_frozen .. " deferred=" .. $defer .. " failed=" .. $fail)
+      $verb = "trained"
+      if $DRY == 1 then
+        $verb = "would-train"
+      end
+      print($d .. " [" .. $modetag .. "]: junk=" .. $njunk .. " inbox-window=" .. $nham .. " | " .. $verb .. " spam=" .. $ns .. " good=" .. $ng .. " (corrective=" .. $ncorr .. ") | already=" .. $skip_done .. " frozen=" .. $skip_frozen .. " deferred=" .. $defer .. " failed=" .. $fail)
 
       -- root-run hygiene: give WAL/shm/log back to the mail user
       if $DRY == 0 then
