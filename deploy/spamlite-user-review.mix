@@ -1,31 +1,68 @@
 #!/opt/cosmix/bin/mix
--- spamlite-mbx-review.mix — daily 24h review for admin@spiderweb.com.au on mbx
--- (cron: /etc/cron.d/spamlite-mbx-review-daily, 15:00 AEST; emails markc@renta.net).
+-- spamlite-user-review.mix — daily 24h review of one user's spamlite filtering,
+-- emailed to markc@renta.net. Fleet-generic (mbc/mrn/mbx): mailbox access is
+-- doveadm-based so Maildir and mdbox hosts work identically.
+--
+--   spamlite-user-review.mix <user@domain> [dryrun]
+--
+-- Cron (per host, one line per reviewed user), e.g.:
+--   0 15 * * * root /opt/cosmix/bin/mix /usr/local/bin/spamlite-user-review.mix brett@brettclarke.com
 --
 -- Reconciler-stack edition (spamlite 0.9.0): the actionable item is the
--- BORDERLINE JUNK list (0.60-0.85 -> Junk = the false-positive risk band at
--- admin's 0.6 threshold; confident >=0.85 junk is not worth reading). The
--- summary also carries last night's reconciler line, corpus deltas from
--- `spamlite stats` (baseline: /root/spamlite-mbx-baseline.txt, refreshed each
--- non-dry run), imapsieve retrain counts, and error count.
+-- BORDERLINE JUNK list — junk scored inside [threshold, threshold+0.25), the
+-- false-positive risk band; confident junk above that is not worth reading.
+-- The threshold comes from the user's params.toml when present, else 0.5
+-- (the fleet wrapper default). The summary carries last night's reconciler
+-- line, corpus deltas from `spamlite stats` (baseline:
+-- /root/spamlite-review-<user>.txt, refreshed each non-dry run), imapsieve
+-- retrain counts, and error count.
 --
--- Run with arg "dryrun" to print without emailing or touching the baseline.
+-- "dryrun" prints without emailing or touching the baseline.
 
-$U = "admin@spiderweb.com.au"
-$DB = "/srv/spiderweb.com.au/msg/admin/.spamlite"
 $SL = "/usr/local/bin/spamlite"
-$BASE = "/root/spamlite-mbx-baseline.txt"
 $RLOG = "/var/log/spamlite-reconcile.log"
 
+$U = ""
 $DRY = 0
 $a = args()
 $i = 0
 while $i < len($a)
   if $a[$i] == "dryrun" then
     $DRY = 1
+  else
+    if pos("@", $a[$i]) > 0 then
+      $U = $a[$i]
+    end
   end
   $i = $i + 1
 end
+if $U == "" then
+  print("usage: spamlite-user-review.mix <user@domain> [dryrun]")
+else
+
+$up = split($U, "@")
+$DB = "/srv/" .. $up[1] .. "/msg/" .. $up[0] .. "/.spamlite"
+$BASE = "/root/spamlite-review-" .. $U .. ".txt"
+
+-- threshold: params.toml wins, else the fleet wrapper default 0.5
+$T = 0.5
+if is_file($DB .. "/params.toml") then
+  $pl = read_lines($DB .. "/params.toml")
+  $pi = 0
+  while $pi < len($pl)
+    $l = strip($pl[$pi])
+    if pos("threshold", $l) == 1 then
+      $eq = split($l, "=")
+      if len($eq) >= 2 then
+        $T = to_number(strip($eq[1]))
+      end
+    end
+    $pi = $pi + 1
+  end
+end
+$BHI = $T + 0.25
+$bandlo = substr("" .. $T .. "00", 0, 4)
+$bandhi = substr("" .. $BHI .. "00", 0, 4)
 
 -- ---- journald: this user's dovecot lines, last 24h ----
 $jr = run_argv(["journalctl", "--since", "1 day ago", "--no-pager", "-g", $U], {timeout: 120})
@@ -70,18 +107,18 @@ while $li < len($lines)
       if $sc < 0.1 then
         $b_lo = $b_lo + 1
       else
-        if $sc < 0.6 then
+        if $sc < $T then
           $b_mid = $b_mid + 1
         else
-          if $sc < 0.85 then
+          if $sc < $BHI then
             $b_rev = $b_rev + 1
           else
             $b_hi = $b_hi + 1
           end
         end
       end
-      if $sc >= 0.6 then
-        if $sc < 0.85 then
+      if $sc >= $T then
+        if $sc < $BHI then
           if $sess != "" then
             $score_by_sess[$sess] = $parts[1]
           end
@@ -135,7 +172,7 @@ while $li < len($lines)
   $li = $li + 1
 end
 
--- ---- errors, cluster-wide spamlite complaints ----
+-- ---- errors, host-wide spamlite complaints ----
 $er = run_argv(["journalctl", "--since", "1 day ago", "--no-pager", "-g", "spamlite"], {timeout: 120})
 $errs = 0
 if strip($er.stdout) != "" then
@@ -161,11 +198,14 @@ end
 -- ---- last reconciler run for this user ----
 $rline = ""
 if is_file($RLOG) then
+  $needle = "/msg/" .. $up[0] .. " ["
   $rls = read_lines($RLOG)
   $ri = 0
   while $ri < len($rls)
-    if pos("/msg/admin [", $rls[$ri]) > 0 then
-      $rline = $rls[$ri]
+    if pos($needle, $rls[$ri]) > 0 then
+      if pos("/" .. $up[1] .. "/", $rls[$ri]) > 0 then
+        $rline = $rls[$ri]
+      end
     end
     $ri = $ri + 1
   end
@@ -237,11 +277,13 @@ if $old["good"] != nil then
 end
 
 -- ---- report ----
+-- FQDN, not -s: mbc and mrn are both short-named "mail"
+$fqdn = strip(run_argv(["hostname", "-f"]).stdout)
 $ts = strip(run_argv(["date", "+%Y-%m-%d %H:%M %Z"]).stdout)
-$r = "spamlite 24h - " .. $U .. " (mbx) - " .. $ts .. "\n\n"
+$r = "spamlite 24h - " .. $U .. " (" .. $fqdn .. ") - " .. $ts .. "\n\n"
 $r = $r .. "SUMMARY\n"
 $r = $r .. "  inbound       " .. $n .. " scored: " .. $inbox .. " inbox, " .. $junk .. " junk\n"
-$r = $r .. "  needs review  " .. len($flagged) .. " borderline junk (0.60-0.85, listed below)\n"
+$r = $r .. "  needs review  " .. len($flagged) .. " borderline junk (" .. $bandlo .. "-" .. $bandhi .. ", listed below)\n"
 $r = $r .. "  reconciler    " .. $rsum .. "\n"
 $r = $r .. "  corpus        good " .. $now["good"] .. " (" .. $dg .. ")  spam " .. $now["spam"] .. " (" .. $ds .. ")\n"
 $r = $r .. "  user retrains " .. $tg .. " good, " .. $tspam .. " spam (imapsieve)\n"
@@ -260,7 +302,7 @@ else
   end
 end
 $r = $r .. "\nDETAIL\n"
-$r = $r .. "  score bands: <0.10 " .. $b_lo .. " | 0.10-0.59 " .. $b_mid .. " | 0.60-0.84 " .. $b_rev .. " | >=0.85 " .. $b_hi .. "\n"
+$r = $r .. "  threshold " .. $bandlo .. "  score bands: <0.10 " .. $b_lo .. " | 0.10-under " .. $b_mid .. " | band " .. $b_rev .. " | >=" .. $bandhi .. " " .. $b_hi .. "\n"
 $r = $r .. "  tokens " .. $now["tokens"] .. "  trained-last-30d " .. $now["seen_30d"] .. "  db_bytes " .. $now["db_bytes"] .. "\n"
 if $rline != "" then
   $r = $r .. "  " .. $rline .. "\n"
@@ -270,10 +312,12 @@ if $DRY == 1 then
   print("=== DRY RUN (no email, baseline untouched) ===")
   print($r)
 else
-  $eml = "/dev/shm/mbx-review.eml"
-  write_file($eml, "To: markc@renta.net\nFrom: root@mbx.renta.net\nSubject: spamlite mbx 24h (admin@spiderweb)\n\n" .. $r)
+  $eml = "/dev/shm/spamlite-review." .. $up[0] .. ".eml"
+  write_file($eml, "To: markc@renta.net\nFrom: root@" .. $fqdn .. "\nSubject: spamlite 24h " .. $U .. " (" .. $fqdn .. ")\n\n" .. $r)
   run_argv(["/usr/sbin/sendmail", "-t"], {stdin: {file: $eml}})
   run_argv(["rm", "-f", $eml])
   write_file($BASE, strip($st.stdout) .. "\n")
   print("emailed + baseline refreshed " .. $ts)
+end
+
 end
