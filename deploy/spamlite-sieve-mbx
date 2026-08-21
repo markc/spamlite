@@ -1,4 +1,9 @@
 #!/bin/bash
+# RETIRED 2026-08-21: the 0.6.0 shadow's verdict was superseded by the 0.9.0
+# rollout (primary now carries htmlfix); mbx's /etc/dovecot/sieve/spamlite
+# symlink points straight at /usr/local/bin/spamlite again. Kept for the
+# shadow-harness pattern only — do not redeploy.
+#
 # spamlite-sieve — mbx transparent passthrough + shadow-candidate observation.
 #
 # mbx has no spamfilter dispatch wrapper: /etc/dovecot/sieve/spamlite symlinks
