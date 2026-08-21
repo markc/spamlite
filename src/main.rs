@@ -449,6 +449,338 @@ fn cmd_import() {
     }
 }
 
+/// Remove the filter's own label headers (X-Spam-Status, X-SpamProbe — plus
+/// their folded continuation lines) from a raw message before training. The
+/// structured tokenizer never reads these headers, but the fallback tokenizer
+/// for unparseable messages tokenizes ALL raw text — and a "SPAM"/"GOOD" label
+/// stamped by a previous classification is exactly the label leak a trainer
+/// must never learn from. Done in the binary so the safety rule cannot be
+/// forgotten by a caller (it replaces the reconciler's reconcile-strip.awk).
+fn strip_label_headers(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skipping = false;
+    let mut in_headers = true;
+    for line in raw.split_inclusive(|&b| b == b'\n') {
+        if in_headers {
+            let is_blank = line == b"\r\n" || line == b"\n";
+            if is_blank {
+                in_headers = false;
+                skipping = false;
+            } else if line[0] == b' ' || line[0] == b'\t' {
+                // Folded continuation belongs to the previous header.
+                if skipping {
+                    continue;
+                }
+            } else {
+                let lower: Vec<u8> = line
+                    .iter()
+                    .take(16)
+                    .map(|b| b.to_ascii_lowercase())
+                    .collect();
+                skipping = lower.starts_with(b"x-spam-status:")
+                    || lower.starts_with(b"x-spamprobe:");
+                if skipping {
+                    continue;
+                }
+            }
+        }
+        out.extend_from_slice(line);
+    }
+    out
+}
+
+/// Read one message file, bounded by the same cap as stdin. A file above the
+/// cap is truncated with a warning (matching the stdin path) — the prefix
+/// still carries the discriminating tokens of any real message.
+fn read_message_file(path: &std::path::Path) -> io::Result<Vec<u8>> {
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    f.take(MAX_STDIN_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_STDIN_BYTES {
+        buf.truncate(MAX_STDIN_BYTES as usize);
+        eprintln!(
+            "spamlite: {} truncated at {MAX_STDIN_BYTES} bytes",
+            path.display()
+        );
+    }
+    Ok(buf)
+}
+
+/// Directory scan result: regular message files (sorted), per-path stat
+/// failures, and the count of unreadable directory entries (no name known).
+struct DirScan {
+    files: Vec<PathBuf>,
+    stat_errors: Vec<(PathBuf, String)>,
+    entry_errors: u64,
+}
+
+/// List the regular files directly inside `dir`, sorted by filename for a
+/// deterministic report order. Subdirectories are NOT descended — the intended
+/// input is a flat staging dir (or a Maildir cur/new), never a Maildir root.
+/// Symlinks are followed (staging dirs are built from symlinks), so metadata
+/// failures and unreadable entries are surfaced rather than silently dropped:
+/// on a flaky mailstore a partial scan reported as complete would make the
+/// caller mark unscanned messages as handled.
+fn list_message_files(dir: &str) -> DirScan {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!("spamlite: cannot read directory {dir}: {e}");
+            process::exit(1);
+        }
+    };
+    let mut scan = DirScan {
+        files: Vec::new(),
+        stat_errors: Vec::new(),
+        entry_errors: 0,
+    };
+    for entry in rd {
+        let path = match entry {
+            Ok(e) => e.path(),
+            Err(_) => {
+                scan.entry_errors += 1;
+                continue;
+            }
+        };
+        // fs::metadata follows symlinks — a staging symlink to a mail file
+        // counts as a regular file. Non-file types (dirs, fifos) are skipped
+        // by design; only a failed stat is an error.
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => scan.files.push(path),
+            Ok(_) => {}
+            Err(e) => scan.stat_errors.push((path, e.to_string())),
+        }
+    }
+    scan.files.sort();
+    scan
+}
+
+/// Make a string safe as one TSV column: squeeze out tab/newline/CR, which
+/// would otherwise let a hostile filename forge report rows.
+fn tsv_safe(s: String) -> String {
+    if s.contains(['\t', '\n', '\r']) {
+        s.chars()
+            .map(|c| if matches!(c, '\t' | '\n' | '\r') { '?' } else { c })
+            .collect()
+    } else {
+        s
+    }
+}
+
+/// Extract the Message-ID (without angle brackets) from raw message bytes,
+/// with tabs/newlines squeezed out so it is always safe in a TSV column.
+fn extract_msgid(raw: &[u8]) -> Option<String> {
+    let parser = mail_parser::MessageParser::default();
+    let message = parser.parse(raw)?;
+    let id = message.message_id()?.trim().trim_matches(['<', '>']).to_string();
+    let id: String = id.chars().filter(|c| !c.is_whitespace()).collect();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// train-dir = bulk-train every message file in a directory as ONE class.
+/// Replaces the per-message exec loop (fork + db open + commit per message)
+/// with a single process and one durable transaction per chunk of
+/// `TRAIN_CHUNK` messages — chunking bounds memory (tokens are held only for
+/// the current chunk; a directory of huge messages cannot balloon the
+/// process) while keeping commits rare.
+///
+/// stdout: one TSV line per file — `ok\t<msgid|->\t<path>` for messages in a
+/// committed chunk, `err\t<reason>\t<path>` for files that could not be read
+/// or tokenized (excluded from the batch, never fatal). The msgid column is
+/// the message's identity for dedupe purposes; the path column is
+/// informational only (tab/newline sanitised, lossy for non-UTF-8 names).
+/// Each chunk's report is printed AFTER its commit, so every `ok` line ever
+/// printed is durably trained — callers may record them (e.g. a reconciler
+/// sidecar) as they stream. Exit 0 additionally means the directory scan was
+/// complete. The one gap callers must own: if this process dies after a
+/// commit but before its report lands (broken pipe, kill), those messages
+/// trained unrecorded, and a retry trains them a second time — a report-fed
+/// sidecar gives at-least-once, not exactly-once, so callers must tolerate an
+/// occasional duplicate training (bounded: one extra count per message per
+/// crash, the same tolerance the reconciler already extends to imapsieve).
+/// Refuses to create a database: bulk training into a mistyped -d must be an
+/// error, not a silently-conjured corpus (cold starts use the stdin verbs).
+const TRAIN_CHUNK: usize = 500;
+
+/// Additional flush trigger: commit the current chunk early once its
+/// accumulated token count crosses this budget, so 500 pathological
+/// max-token messages cannot hold tens of millions of Strings resident.
+/// Real mail runs well under 10k raw tokens; this only bites synthetic input.
+const TRAIN_CHUNK_TOKEN_BUDGET: usize = 1_000_000;
+
+fn cmd_train_dir(args: &[String]) {
+    let (dir, class) = match (args.first(), args.get(1)) {
+        (Some(d), Some(c)) if c == "spam" || c == "good" => (d.as_str(), c.as_str()),
+        _ => {
+            eprintln!("spamlite: usage: train-dir <dir> spam|good");
+            process::exit(1);
+        }
+    };
+    let is_spam = class == "spam";
+    let db = open_db_ro_or_exit();
+
+    let scan = list_message_files(dir);
+    let mut ok = 0u64;
+    let mut failed = 0u64;
+
+    for (path, e) in &scan.stat_errors {
+        failed += 1;
+        println!("err\tstat: {e}\t{}", tsv_safe(path.display().to_string()));
+    }
+
+    // (trained?, msgid-or-reason, tsv-safe path) — tokens live only until the
+    // next flush; a flush commits then prints, so ok lines are always durable.
+    let mut report: Vec<(bool, String, String)> = Vec::new();
+    let mut batch: Vec<Vec<String>> = Vec::new();
+    let mut batch_tokens = 0usize;
+
+    let flush = |batch: &mut Vec<Vec<String>>,
+                     report: &mut Vec<(bool, String, String)>,
+                     ok: &mut u64,
+                     failed: &mut u64| {
+        if let Err(e) = db.train_messages(batch, is_spam) {
+            // Prior chunks are committed and reported — those ok lines stand.
+            eprintln!(
+                "spamlite: train-dir transaction failed, this chunk NOT trained \
+                 (earlier ok lines remain valid): {e}"
+            );
+            process::exit(1);
+        }
+        for (trained, info, path) in report.iter() {
+            if *trained {
+                *ok += 1;
+                println!("ok\t{info}\t{path}");
+            } else {
+                *failed += 1;
+                println!("err\t{info}\t{path}");
+            }
+        }
+        batch.clear();
+        report.clear();
+    };
+
+    for path in &scan.files {
+        let safe_path = tsv_safe(path.display().to_string());
+        let raw = match read_message_file(path) {
+            Ok(r) => r,
+            Err(e) => {
+                report.push((false, format!("read: {e}"), safe_path));
+                continue;
+            }
+        };
+        let stripped = strip_label_headers(&raw);
+        let msgid = extract_msgid(&stripped).unwrap_or_else(|| "-".to_string());
+        // Panic-isolated per message: one pathological file must not sink
+        // the batch (the v0.2.0 tokenizer panic shipped that failure mode).
+        let toks = std::panic::catch_unwind(|| tokenizer::tokenize_env(&stripped));
+        match toks {
+            Ok(tokens) if !tokens.is_empty() => {
+                batch_tokens += tokens.len();
+                batch.push(tokens);
+                report.push((true, msgid, safe_path));
+            }
+            Ok(_) => report.push((false, "no tokens".to_string(), safe_path)),
+            Err(_) => report.push((false, "tokenizer panic".to_string(), safe_path)),
+        }
+        if batch.len() >= TRAIN_CHUNK || batch_tokens >= TRAIN_CHUNK_TOKEN_BUDGET {
+            flush(&mut batch, &mut report, &mut ok, &mut failed);
+            batch_tokens = 0;
+        }
+    }
+    flush(&mut batch, &mut report, &mut ok, &mut failed);
+
+    eprintln!("spamlite: trained {ok} {class} ({failed} failed)");
+    if scan.entry_errors > 0 {
+        eprintln!(
+            "spamlite: {} unreadable directory entries — the scan was INCOMPLETE, \
+             do not treat this directory as fully handled",
+            scan.entry_errors
+        );
+        process::exit(1);
+    }
+}
+
+/// msgids = header scan of every message file in a directory. Read-only, no
+/// database. stdout: `<msgid|->\t<from|->\t<path>` per file. Replaces the
+/// reconciler's reconcile-keyext.awk (and its From-sampling grep) with a
+/// parser that actually understands folding and encoded words.
+fn cmd_msgids(args: &[String]) {
+    let Some(dir) = args.first() else {
+        eprintln!("spamlite: usage: msgids <dir>");
+        process::exit(1);
+    };
+    // Headers only — 64 KiB covers any sane header block, and mail-parser
+    // handles a truncated body without complaint.
+    const HEADER_READ_BYTES: u64 = 64 * 1024;
+    let parser = mail_parser::MessageParser::default();
+    let scan = list_message_files(dir);
+    let mut incomplete = scan.entry_errors > 0;
+    for (path, e) in &scan.stat_errors {
+        eprintln!("spamlite: cannot stat {}: {e}", path.display());
+        incomplete = true;
+    }
+    for path in &scan.files {
+        let raw = match std::fs::File::open(path).and_then(|f| {
+            let mut buf = Vec::new();
+            f.take(HEADER_READ_BYTES).read_to_end(&mut buf)?;
+            Ok(buf)
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("spamlite: skipping {}: {e}", path.display());
+                incomplete = true;
+                continue;
+            }
+        };
+        let msgid = extract_msgid(&raw).unwrap_or_else(|| "-".to_string());
+        let from = parser
+            .parse(&raw)
+            .and_then(|m| {
+                m.from()
+                    .and_then(|f| f.first())
+                    .and_then(|a| a.address.as_deref().map(|s| s.to_lowercase()))
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let from: String = from.chars().filter(|c| !c.is_whitespace()).collect();
+        println!("{msgid}\t{from}\t{}", tsv_safe(path.display().to_string()));
+    }
+    // A partial listing must not exit 0 — a caller diffing it against a
+    // sidecar would treat the unlisted files as absent.
+    if incomplete {
+        process::exit(1);
+    }
+}
+
+/// stats = machine-readable database statistics, one `key value` per line.
+/// The `counts` verb stays as the human-facing view; this one is for scripts
+/// (replaces ad-hoc `sqlite3` queries against the db). `seen_30d` counts
+/// tokens trained in the last 30 days — score/receive never write last_seen,
+/// so it is an exact "own vocabulary is growing" marker.
+fn cmd_stats() {
+    let db = open_db_ro_or_exit();
+    let s = match db.stats(30 * 86400) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("spamlite: error reading stats: {e}");
+            process::exit(1);
+        }
+    };
+    let path = db_path();
+    let db_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    println!("db {}", path.display());
+    println!("good {}", s.total_good);
+    println!("spam {}", s.total_spam);
+    println!("tokens {}", s.unique_tokens);
+    println!("db_bytes {db_bytes}");
+    println!("last_seen_min {}", s.last_seen_min);
+    println!("last_seen_max {}", s.last_seen_max);
+    println!("seen_30d {}", s.seen_recent);
+}
+
 fn usage() {
     eprintln!(
         "spamlite {} — per-user Bayesian spam filter
@@ -461,6 +793,12 @@ Usage:
   spamlite [-d DIR] [-t THRESHOLD] explain             Verbose token-level breakdown (debug)
   spamlite [-d DIR] spam                               Train message from stdin as spam
   spamlite [-d DIR] good                               Train message from stdin as good/ham
+  spamlite [-d DIR] train-dir <MSGDIR> spam|good       Bulk-train every file in MSGDIR (durable
+                                                       transaction per 500-message chunk; label
+                                                       headers stripped; TSV report on stdout,
+                                                       printed post-commit; db must exist)
+  spamlite msgids <MSGDIR>                             Print msgid/from/path TSV per file
+  spamlite [-d DIR] stats                              Machine-readable stats (key value lines)
   spamlite [-d DIR] counts                             Show database statistics
   spamlite [-d DIR] cleanup [N] [D]                    Remove tokens: count <= N or unseen in D days
   spamlite [-d DIR] export                             Export database to CSV on stdout
@@ -573,6 +911,9 @@ fn main() {
         "explain" => cmd_explain(),
         "spam" => cmd_train(true),
         "good" => cmd_train(false),
+        "train-dir" => cmd_train_dir(&args[1..]),
+        "msgids" => cmd_msgids(&args[1..]),
+        "stats" => cmd_stats(),
         "counts" => cmd_counts(),
         "cleanup" => cmd_cleanup(&args[1..]),
         "export" => cmd_export(),
