@@ -1,0 +1,327 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-reconcile.mix — nightly STATE-based trainer.
+--
+-- Folder state is the label source, not imapsieve events (events lose ~97% of
+-- corrections; state cannot lie — ~/.ns mbc _journal/2026-08-21 session 3):
+--   spam: everything in Maildir/.Junk/{cur,new}
+--   ham:  everything in Maildir/cur older than RIPEN (survived triage) and
+--         younger than WINDOW (older mail either trained already or missed)
+--   never: Trash (deletion is not a class signal), new/ (unseen)
+--
+-- Sidecar .spamlite/reconciled.log ("class epoch key" per line, last entry
+-- wins) makes each message train once per class. One corrective retrain is
+-- allowed on a class flip (ham-ripened mail later dragged to Junk, or a
+-- rescue); after 2 entries a key is frozen (flip-flop guard).
+--
+-- Rails: per-night per-class cap (default 200, oldest first, remainder next
+-- night); ham and spam applied INTERLEAVED by delivery time (one-sided mass
+-- shifts scores — F9); X-Spam-Status/X-SpamProbe stripped before training;
+-- a user with an empty corpus side is skipped (seed decision needed first);
+-- WAL/shm/log chowned back to the mail user after a root run.
+--
+-- Usage: spamlite-reconcile.mix [--dry-run] [--cap N] [--root DIR] [path-substring-filter]
+
+$SL = "/usr/local/bin/spamlite"
+$KEYEXT = "/usr/local/lib/spamlite/reconcile-keyext.awk"
+$STRIP = "/usr/local/lib/spamlite/reconcile-strip.awk"
+$RIPEN = 259200
+$WINDOW = 2592000
+$CAP = 200
+$DRY = 0
+$FILTER = ""
+$ROOT = "/srv"
+
+$a = args()
+$i = 0
+while $i < len($a)
+  if $a[$i] == "--dry-run" then
+    $DRY = 1
+  else
+    if $a[$i] == "--cap" then
+      $i = $i + 1
+      $CAP = to_number($a[$i])
+    else
+    if $a[$i] == "--root" then
+      $i = $i + 1
+      $ROOT = $a[$i]
+    else
+      $FILTER = $a[$i]
+    end
+    end
+  end
+  $i = $i + 1
+end
+
+$NOW = floor(time())
+$HAM_HI = $NOW - $RIPEN
+$HAM_LO = $NOW - $WINDOW
+$TMP = "/tmp/slrec." .. $NOW .. ".tmp"
+
+$users = glob($ROOT .. "/*/msg/*")
+$u = 0
+while $u < len($users)
+  $d = $users[$u]
+  $go = 1
+  if $FILTER != "" then
+    if pos($FILTER, $d) == 0 then
+      $go = 0
+    end
+  end
+  if is_file($d .. "/.spamlite/db.sqlite") == false then
+    $go = 0
+  end
+  if $go == 1 then
+    $db = $d .. "/.spamlite"
+    $log = $db .. "/reconciled.log"
+
+    -- rail: both corpus sides must be non-empty
+    $qg = run_argv(["sqlite3", $db .. "/db.sqlite", "SELECT value FROM meta WHERE key='total_good'"])
+    $qs = run_argv(["sqlite3", $db .. "/db.sqlite", "SELECT value FROM meta WHERE key='total_spam'"])
+    $tg = to_number(strip($qg.stdout))
+    $ts = to_number(strip($qs.stdout))
+    if $tg == 0 then
+      print($d .. ": SKIP — empty good side (seed decision needed)")
+      $go = 0
+    end
+    if $ts == 0 then
+      print($d .. ": SKIP — empty spam side (seed decision needed)")
+      $go = 0
+    end
+  end
+  if $go == 1 then
+    -- load sidecar log: key -> last class, key -> entry count
+    $seen = {}
+    $cnt = {}
+    if is_file($log) then
+      $lines = read_lines($log)
+      $li = 0
+      while $li < len($lines)
+        $p = split($lines[$li], " ")
+        if len($p) >= 3 then
+          $seen[$p[2]] = $p[0]
+          $n = $cnt[$p[2]]
+          if $n == nil then
+            $n = 0
+          end
+          $cnt[$p[2]] = $n + 1
+        end
+        $li = $li + 1
+      end
+    end
+
+    -- candidates
+    $junk = concat(glob($d .. "/Maildir/.Junk/cur/*"), glob($d .. "/Maildir/.Junk/new/*"))
+    $inbox = []
+    $all = glob($d .. "/Maildir/cur/*")
+    $ai = 0
+    while $ai < len($all)
+      $ps = split($all[$ai], "/")
+      $b = $ps[len($ps) - 1]
+      $e = to_number(substr($b, 0, 10))
+      if $e >= $HAM_LO then
+        if $e <= $HAM_HI then
+          push($inbox, $all[$ai])
+        end
+      end
+      $ai = $ai + 1
+    end
+
+    $cand = concat($junk, $inbox)
+    if len($cand) == 0 then
+      print($d .. ": nothing in scope")
+    else
+      -- one awk pass: path|message-id (empty -> fallback below)
+      $kv = run_argv(concat(["awk", "-f", $KEYEXT], $cand), {timeout: 300})
+      $key_of = {}
+      $klines = split(strip($kv.stdout), "\n")
+      $ki = 0
+      while $ki < len($klines)
+        $p = split($klines[$ki], "|")
+        if len($p) >= 1 then
+          $path = $p[0]
+          $key = ""
+          if len($p) >= 2 then
+            $key = $p[1]
+          end
+          if $key == "" then
+            $ps = split($path, "/")
+            $bn = $ps[len($ps) - 1]
+            $fl = pos(":2,", $bn)
+            if $fl > 0 then
+              $bn = substr($bn, 0, $fl - 1)
+            end
+            $key = "f:" .. $bn
+          end
+          $key_of[$path] = $key
+        end
+        $ki = $ki + 1
+      end
+
+      -- decide actions: "EPOCH|CLASS|CORR|PATH|KEY"
+      $actions = []
+      $skip_done = 0
+      $skip_frozen = 0
+      $ji = 0
+      while $ji < len($junk)
+        $f = $junk[$ji]
+        $key = $key_of[$f]
+        if $key != nil then
+          $c = $seen[$key]
+          $corr = 0
+          $want = 1
+          if $c == "S" then
+            $want = 0
+            $skip_done = $skip_done + 1
+          end
+          if $c == "G" then
+            $n = $cnt[$key]
+            if $n >= 2 then
+              $want = 0
+              $skip_frozen = $skip_frozen + 1
+            else
+              $corr = 1
+            end
+          end
+          if $want == 1 then
+            $ps = split($f, "/")
+            $b = $ps[len($ps) - 1]
+            push($actions, substr($b, 0, 10) .. "|S|" .. $corr .. "|" .. $f .. "|" .. $key)
+          end
+        end
+        $ji = $ji + 1
+      end
+      $hi = 0
+      while $hi < len($inbox)
+        $f = $inbox[$hi]
+        $key = $key_of[$f]
+        if $key != nil then
+          $c = $seen[$key]
+          $corr = 0
+          $want = 1
+          if $c == "G" then
+            $want = 0
+            $skip_done = $skip_done + 1
+          end
+          if $c == "S" then
+            $n = $cnt[$key]
+            if $n >= 2 then
+              $want = 0
+              $skip_frozen = $skip_frozen + 1
+            else
+              $corr = 1
+            end
+          end
+          if $want == 1 then
+            $ps = split($f, "/")
+            $b = $ps[len($ps) - 1]
+            push($actions, substr($b, 0, 10) .. "|G|" .. $corr .. "|" .. $f .. "|" .. $key)
+          end
+        end
+        $hi = $hi + 1
+      end
+
+      -- interleave by delivery time, apply per-class caps oldest-first
+      $actions = sort($actions)
+      $ns = 0
+      $ng = 0
+      $ncorr = 0
+      $defer = 0
+      $fail = 0
+      $sample_s = 0
+      $sample_g = 0
+      $ti = 0
+      while $ti < len($actions)
+        $p = split($actions[$ti], "|")
+        $cls = $p[1]
+        $corr = $p[2]
+        $f = $p[3]
+        $key = $p[4]
+        $room = 1
+        if $cls == "S" then
+          if $ns >= $CAP then
+            $room = 0
+          end
+        else
+          if $ng >= $CAP then
+            $room = 0
+          end
+        end
+        if $room == 0 then
+          $defer = $defer + 1
+        else
+          if $DRY == 1 then
+            $show = 0
+            if $cls == "S" then
+              $ns = $ns + 1
+              if $sample_s < 5 then
+                $sample_s = $sample_s + 1
+                $show = 1
+              end
+            else
+              $ng = $ng + 1
+              if $sample_g < 5 then
+                $sample_g = $sample_g + 1
+                $show = 1
+              end
+            end
+            if $corr == "1" then
+              $ncorr = $ncorr + 1
+            end
+            if $show == 1 then
+              $fr = run_argv(["grep", "-a", "-i", "-m1", "^From:", $f])
+              print("  would-train " .. $cls .. " corr=" .. $corr .. " " .. strip($fr.stdout))
+            end
+          else
+            $sr = run_argv(["awk", "-f", $STRIP, $f], {stdout: {file: $TMP}})
+            $cmd = "good"
+            if $cls == "S" then
+              $cmd = "spam"
+            end
+            $tr = run_argv([$SL, "-d", $db, $cmd], {stdin: {file: $TMP}})
+            if $tr.ok then
+              append_file($log, $cls .. " " .. $NOW .. " " .. $key .. "\n")
+              if $cls == "S" then
+                $ns = $ns + 1
+              else
+                $ng = $ng + 1
+              end
+              if $corr == "1" then
+                $ncorr = $ncorr + 1
+              end
+            else
+              $fail = $fail + 1
+            end
+          end
+        end
+        $ti = $ti + 1
+      end
+
+      $mode = "trained"
+      if $DRY == 1 then
+        $mode = "would-train"
+      end
+      print($d .. ": junk=" .. len($junk) .. " inbox-window=" .. len($inbox) .. " | " .. $mode .. " spam=" .. $ns .. " good=" .. $ng .. " (corrective=" .. $ncorr .. ") | already=" .. $skip_done .. " frozen=" .. $skip_frozen .. " deferred=" .. $defer .. " failed=" .. $fail)
+
+      -- root-run hygiene: give WAL/shm/log back to the mail user
+      if $DRY == 0 then
+        $own = []
+        if is_file($db .. "/db.sqlite-wal") then
+          push($own, $db .. "/db.sqlite-wal")
+        end
+        if is_file($db .. "/db.sqlite-shm") then
+          push($own, $db .. "/db.sqlite-shm")
+        end
+        if is_file($log) then
+          push($own, $log)
+        end
+        if len($own) > 0 then
+          run_argv(concat(["chown", "--reference=" .. $db .. "/db.sqlite"], $own))
+        end
+      end
+    end
+  end
+  $u = $u + 1
+end
+if is_file($TMP) then
+  remove($TMP)
+end
