@@ -82,6 +82,7 @@ if strip($jr.stdout) != "" then
 end
 
 $n = 0
+$unscored = 0
 $inbox = 0
 $junk = 0
 $b_lo = 0
@@ -106,8 +107,14 @@ while $li < len($lines)
     $segs = split($line, "(")
     $body = split($segs[len($segs) - 1], ")")[0]
     $parts = split($body, " ")
+    -- unscored outcomes, e.g. "-> Trash (system recipient)", carry no number
+    $sc = nil
     if len($parts) >= 2 then
       $sc = to_number($parts[1])
+    end
+    if $sc == nil then
+      $unscored = $unscored + 1
+    else
       $n = $n + 1
       if pos("-> Junk", $line) > 0 then
         $junk = $junk + 1
@@ -293,6 +300,9 @@ $ts = strip(run_argv(["date", "+%Y-%m-%d %H:%M %Z"]).stdout)
 $r = "spamlite 24h - " .. $U .. " (" .. $fqdn .. ") - " .. $ts .. "\n\n"
 $r = $r .. "SUMMARY\n"
 $r = $r .. "  inbound       " .. $n .. " scored: " .. $inbox .. " inbox, " .. $junk .. " junk\n"
+if $unscored > 0 then
+  $r = $r .. "  unscored      " .. $unscored .. " (no score in DELIVERY line, e.g. system recipient -> Trash)\n"
+end
 $r = $r .. "  needs review  " .. len($flagged) .. " borderline junk (" .. $bandlo .. "-" .. $bandhi .. ", listed below)\n"
 $r = $r .. "  reconciler    " .. $rsum .. "\n"
 $r = $r .. "  corpus        good " .. $now["good"] .. " (" .. $dg .. ")  spam " .. $now["spam"] .. " (" .. $ds .. ")\n"
