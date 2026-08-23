@@ -1,0 +1,119 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-sent-ham-topup.mix — one-off ham top-up from a user's Sent folder.
+--
+--   spamlite-sent-ham-topup.mix <user@domain> [sentsince YYYY-MM-DD]   (default 2022-01-01)
+--
+-- Trains every Sent message sent on/after the date as GOOD, via the same
+-- staging -> train-dir -> reconciled.log sidecar path the nightly reconciler
+-- uses, so each key trains once and the reconciler never re-trains it.
+-- Why Sent: it carries the user's real correspondents (To: addresses, quoted
+-- replies, own-domain tokens) — the ham the inbox window under-supplies on a
+-- spam-heavy mailbox. Why a cutoff: decade-old mail dilutes current tokens.
+-- First use: brett@brettclarke.com 2026-08-23, 1368 msgs, 2386->3754 good.
+$a = args()
+if len($a) < 1 then print("usage: spamlite-sent-ham-topup.mix <user@domain> [YYYY-MM-DD]"); exit(1) end
+$login = $a[0]
+$SINCE = "2022-01-01"
+if len($a) >= 2 then $SINCE = $a[1] end
+$up = split($login, "@")
+$D = "/srv/" .. $up[1] .. "/msg/" .. $up[0]
+$OWNER = run_argv(["stat", "-c", "%U:%G", $D]).stdout
+$OWNER = strip($OWNER)
+$SL = "/usr/local/bin/spamlite"
+$db = $D .. "/.spamlite"
+$log = $db .. "/reconciled.log"
+$STAGE = "/root/sent-ham-stage"
+$NOW = "" .. floor(time())
+
+-- 1. already-trained keys (any class) from the sidecar
+$seen = {}
+if is_file($log) then
+  $ll = read_lines($log)
+  $i = 0
+  while $i < len($ll)
+    $p = split($ll[$i], " ")
+    if len($p) >= 3 then $seen[$p[2]] = 1 end
+    $i = $i + 1
+  end
+end
+
+-- 2. msgids wanted: doveadm search scope -> message-ids (lowercase, no <>)
+$r = run_argv(["doveadm", "fetch", "-u", $login, "hdr.message-id", "mailbox", "Sent", "sentsince", $SINCE], {timeout: 300})
+$want = {}
+$nwant = 0
+$ls = split($r.stdout, "\n")
+$i = 0
+while $i < len($ls)
+  $l = strip($ls[$i])
+  if pos("hdr.message-id:", $l) == 1 then
+    $k = lower(strip(substr($l, 15, len($l))))
+    $k = replace(replace($k, "<", ""), ">", "")
+    if $k != "" then $want[$k] = 1; $nwant = $nwant + 1 end
+  end
+  $i = $i + 1
+end
+
+-- 3. map msgid -> file via spamlite msgids over the Sent maildir
+$m = run_argv([$SL, "msgids", $D .. "/Maildir/.Sent/cur"], {timeout: 300})
+$paths = []
+$key_bn = {}
+$skipped_seen = 0
+$ml = split($m.stdout, "\n")
+$i = 0
+while $i < len($ml)
+  $p = split($ml[$i], "\t")
+  if len($p) >= 3 then
+    $k = lower(replace(replace($p[0], "<", ""), ">", ""))
+    if $want[$k] != nil then
+      if $seen[$k] != nil then
+        $skipped_seen = $skipped_seen + 1
+      else
+        $path = $p[2]
+        if pos("/", $path) != 1 then $path = $D .. "/" .. $path end
+        push($paths, $path)
+        $ps = split($path, "/")
+        $bn = $ps[len($ps) - 1]
+        $fl = pos(":2,", $bn)
+        if $fl > 0 then $bn = substr($bn, 0, $fl - 1) end
+        $key_bn[$bn] = $k
+      end
+    end
+  end
+  $i = $i + 1
+end
+print("wanted=" .. $nwant .. " mapped=" .. len($paths) .. " skipped_already_trained=" .. $skipped_seen)
+if len($paths) == 0 then print("nothing to do"); exit(0) end
+
+-- 4. stage (symlinks) + train-dir good + sidecar
+remove_dir($STAGE)
+mkdir($STAGE)
+run_argv(concat(["ln", "-s", "-t", $STAGE], $paths))
+$tr = run_argv([$SL, "-d", $db, "train-dir", $STAGE, "good"], {timeout: 1800})
+$ok = 0
+$fail = 0
+$tl = split(strip($tr.stdout), "\n")
+$i = 0
+while $i < len($tl)
+  $p = split($tl[$i], "\t")
+  if len($p) >= 3 then
+    if $p[0] == "ok" then
+      $ps2 = split($p[2], "/")
+      $bn = $ps2[len($ps2) - 1]
+      $fl = pos(":2,", $bn)
+      if $fl > 0 then $bn = substr($bn, 0, $fl - 1) end
+      $key = $key_bn[$bn]
+      if $key != nil then
+        append_file($log, "G " .. $NOW .. " " .. $key .. "\n")
+        $ok = $ok + 1
+      end
+    else
+      $fail = $fail + 1
+    end
+  end
+  $i = $i + 1
+end
+print("train-dir exit=" .. $tr.exit_code .. " ok=" .. $ok .. " fail=" .. $fail)
+if strip($tr.stderr) != "" then print("stderr: " .. strip($tr.stderr)) end
+remove_dir($STAGE)
+run_argv(["chown", "-R", $OWNER, $db])
+print(run_argv([$SL, "-d", $db, "stats"]).stdout)
