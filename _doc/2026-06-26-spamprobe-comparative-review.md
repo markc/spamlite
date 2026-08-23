@@ -17,7 +17,7 @@
 > → `0.859 geometric → GOOD 0.142 after one ham retrain`. See
 > `_journal/2026-06-26-spamprobe-improvements-impl.md`.
 
-Source-grounded synthesis of 6 verified dimension reviews. Every claim below survived adversarial verification against both codebases (`/home/markc/.gh/spamlite/src/` and `/home/markc/.gh/spamprobe-1.4d/src/`).
+Source-grounded synthesis of 6 verified dimension reviews. Every claim below survived adversarial verification against both codebases (`/home/markc/Projects/spamlite/src/` and `/home/markc/.gh/spamprobe-1.4d/src/`).
 
 ## 1. Hypothesis verdicts
 
@@ -88,4 +88,4 @@ Dropped per verifier: *Cut term cap to 27* (rejected — verified WORSE, `0.947�
 ---
 *Caveat on the source figures: the prompt's "current defaults" (strength=0.5, unknown_prob=0.45, max_interesting=50) are live `params.toml` per-user overrides, not the compiled `Params::default()` (1.0 / 0.5 / 150, `classifier.rs:43-54`). A couple of singleton-probability figures in the underlying findings (0.725/0.633) were computed at unknown_prob=0.45 while the prose said 0.5; the true code-default singleton is 0.75 — directionally identical, does not affect any verdict or ranking.*
 
-Key files: `/home/markc/.gh/spamlite/src/classifier.rs`, `/home/markc/.gh/spamlite/src/tokenizer.rs`, `/home/markc/.gh/spamlite/src/storage.rs`, `/home/markc/.gh/spamlite/src/main.rs`, `/home/markc/.gh/spamlite/src/bin/tune.rs`; spamprobe references `/home/markc/.gh/spamprobe-1.4d/src/spamprobe/SpamFilter.cc`, `.../FilterConfig.cc`, `.../parser/TraditionalMailMessageParser.cc`, `.../database/FrequencyDB.cc`.
+Key files: `/home/markc/Projects/spamlite/src/classifier.rs`, `/home/markc/Projects/spamlite/src/tokenizer.rs`, `/home/markc/Projects/spamlite/src/storage.rs`, `/home/markc/Projects/spamlite/src/main.rs`, `/home/markc/Projects/spamlite/src/bin/tune.rs`; spamprobe references `/home/markc/.gh/spamprobe-1.4d/src/spamprobe/SpamFilter.cc`, `.../FilterConfig.cc`, `.../parser/TraditionalMailMessageParser.cc`, `.../database/FrequencyDB.cc`.
