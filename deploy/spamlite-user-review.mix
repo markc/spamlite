@@ -337,6 +337,9 @@ else
   if $TO != "markc@renta.net" then
     $cc = "Cc: markc@renta.net\n"
   end
+  -- From root@ on purpose: the fleet global.sieve routes system senders to
+  -- Trash BEFORE scoring, so this spam-subject-laden report never pollutes
+  -- the corpus. Recipients check Trash for it (same as bounces). 2026-08-23.
   write_file($eml, "To: " .. $TO .. "\n" .. $cc .. "From: root@" .. $fqdn .. "\nSubject: spamlite daily review " .. $U .. "\n\n" .. $r)
   run_argv(["/usr/sbin/sendmail", "-t"], {stdin: {file: $eml}})
   run_argv(["rm", "-f", $eml])
