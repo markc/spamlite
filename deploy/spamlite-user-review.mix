@@ -337,7 +337,10 @@ else
   if $TO != "markc@renta.net" then
     $cc = "Cc: markc@renta.net\n"
   end
-  write_file($eml, "To: " .. $TO .. "\n" .. $cc .. "From: root@" .. $fqdn .. "\nSubject: spamlite daily review " .. $U .. "\n\n" .. $r)
+  -- From MUST NOT be root@/daemon@/postmaster@: the fleet global.sieve routes
+  -- those senders to Trash ("system sender"), which silently binned every
+  -- report to a filtered mailbox until 2026-08-23.
+  write_file($eml, "To: " .. $TO .. "\n" .. $cc .. "From: spamlite@" .. $fqdn .. "\nSubject: spamlite daily review " .. $U .. "\n\n" .. $r)
   run_argv(["/usr/sbin/sendmail", "-t"], {stdin: {file: $eml}})
   run_argv(["rm", "-f", $eml])
   write_file($BASE, strip($st.stdout) .. "\n")
