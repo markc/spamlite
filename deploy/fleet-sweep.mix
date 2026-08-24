@@ -1,0 +1,213 @@
+#!/opt/cosmix/bin/mix
+-- fleet-sweep.mix — offline, scoring-only fleet comparison: each user's LIVE combiner vs the
+-- tuned triple (strength 0.3 / unknown_prob 0.4 / max_interesting 27), on held-out mail.
+--
+--   fleet-sweep.mix sweep <shard> <nshards>     score users where (index % nshards) == shard
+--   fleet-sweep.mix report                       per-user table + fleet totals
+--
+-- Held-out ham  = own INBOX cur/ files with mtime in [2026-03-20, 2026-07-25): after the
+--                 March baseline training, before the reconciler's 30-day window (cap 200,
+--                 every Nth). Spam = /var/tmp/fp-audit/seed/eval.list, every 2nd (~200).
+-- Nothing is trained and no message is copied: the user's db gets ONE sqlite .backup
+-- under /var/tmp/fp-audit/fleet/<user>/, two params.toml variants, and score files.
+-- Users with no Maildir/ (mdbox) or < 30 held-out ham are skipped and listed.
+
+$SL = "/usr/local/bin/spamlite"
+$ROOT = "/var/tmp/fp-audit/fleet"
+$SEED = "/var/tmp/fp-audit/seed/eval.list"
+$HAM_CAP = 200
+$TUNED = "strength = 0.3\nunknown_prob = 0.4\nmax_interesting = 27\ngood_bias = 1\nmin_word_count = 0\n"
+
+fn readlist($f)
+  $out = []
+  if is_file($f) == false then return $out end
+  $ll = read_lines($f)
+  $i = 0
+  while $i < len($ll)
+    $p = strip($ll[$i])
+    if $p != "" then push($out, $p) end
+    $i = $i + 1
+  end
+  return $out
+end
+
+fn every_nth($list, $cap)
+  if len($list) <= $cap then return $list end
+  $n = ceil(len($list) / $cap)
+  $out = []
+  $i = 0
+  while $i < len($list)
+    if ($i % $n) == 0 then push($out, $list[$i]) end
+    $i = $i + 1
+  end
+  return $out
+end
+
+fn score_list($dir, $paths, $outfile)
+  $out = ""
+  $i = 0
+  while $i < len($paths)
+    $r = run($SL .. " -d " .. $dir .. " score < " .. shell_quote($paths[$i]) .. " 2>/dev/null || true")
+    $f = split(strip($r), " ")
+    if len($f) > 1 then $out = $out .. $f[1] .. "\t" .. $paths[$i] .. "\n" end
+    $i = $i + 1
+  end
+  write_file($outfile, $out)
+end
+
+fn user_tag($d)
+  $p = split($d, "/")
+  return $p[len($p) - 1] .. "@" .. $p[len($p) - 3]
+end
+
+fn live_threshold($ptoml)
+  $t = 0.5
+  if is_file($ptoml) then
+    $ll = read_lines($ptoml)
+    $i = 0
+    while $i < len($ll)
+      $l = strip($ll[$i])
+      if pos("threshold", $l) == 1 then
+        $kv = split($l, "=")
+        if len($kv) == 2 then $t = to_number(strip($kv[1])) end
+      end
+      $i = $i + 1
+    end
+  end
+  return $t
+end
+
+$a = args()
+if len($a) < 1 then print("usage: fleet-sweep.mix sweep <shard> <nshards> | report"); exit(1) end
+
+if $a[0] == "sweep" then
+  $shard = to_number($a[1])
+  $nsh = to_number($a[2])
+  mkdir($ROOT)
+  $spam_paths = every_nth(readlist($SEED), 200)
+  $users = sort(glob("/srv/*/msg/*"))
+  $u = 0
+  while $u < len($users)
+    $d = $users[$u]
+    if ($u % $nsh) == $shard then
+      $tag = user_tag($d)
+      $go = 1
+      if is_file($d .. "/.spamlite/db.sqlite") == false then $go = 0 end
+      if $go == 1 and is_dir($d .. "/Maildir") == false then
+        append_file($ROOT .. "/skipped.txt", $tag .. "\tno-maildir\n")
+        $go = 0
+      end
+      if $go == 1 then
+        $ham_all = split(strip(run("find " .. shell_quote($d .. "/Maildir/cur") .. " -type f -newermt 2026-03-20 ! -newermt 2026-07-25 | sort")), "\n")
+        $ham = []
+        $i = 0
+        while $i < len($ham_all)
+          if strip($ham_all[$i]) != "" then push($ham, strip($ham_all[$i])) end
+          $i = $i + 1
+        end
+        if len($ham) < 30 then
+          append_file($ROOT .. "/skipped.txt", $tag .. "\tham=" .. len($ham) .. "\n")
+        else
+          $ham = every_nth($ham, $HAM_CAP)
+          $W = $ROOT .. "/" .. $tag
+          run_argv(["rm", "-rf", $W])
+          mkdir($W)
+          mkdir($W .. "/live")
+          mkdir($W .. "/tuned")
+          run_argv(["sqlite3", $d .. "/.spamlite/db.sqlite", ".backup " .. $W .. "/live/db.sqlite"])
+          run_argv(["cp", $W .. "/live/db.sqlite", $W .. "/tuned/db.sqlite"])
+          $pt = $d .. "/.spamlite/params.toml"
+          if is_file($pt) then run_argv(["cp", $pt, $W .. "/live/params.toml"]) end
+          write_file($W .. "/tuned/params.toml", $TUNED)
+          write_file($W .. "/live-threshold", "" .. live_threshold($pt) .. "\n")
+          score_list($W .. "/live", $ham, $W .. "/live.ham.scores")
+          score_list($W .. "/live", $spam_paths, $W .. "/live.spam.scores")
+          score_list($W .. "/tuned", $ham, $W .. "/tuned.ham.scores")
+          score_list($W .. "/tuned", $spam_paths, $W .. "/tuned.spam.scores")
+          run_argv(["rm", "-f", $W .. "/live/db.sqlite", $W .. "/tuned/db.sqlite", $W .. "/live/db.sqlite-wal", $W .. "/live/db.sqlite-shm", $W .. "/tuned/db.sqlite-wal", $W .. "/tuned/db.sqlite-shm"])
+          print($tag .. " ham=" .. len($ham) .. " spam=" .. len($spam_paths))
+        end
+      end
+    end
+    $u = $u + 1
+  end
+  print("shard " .. $shard .. " done")
+  exit(0)
+end
+
+fn scores_of($f)
+  $out = []
+  $ll = readlist($f)
+  $i = 0
+  while $i < len($ll)
+    $p = split($ll[$i], "\t")
+    push($out, to_number($p[0]))
+    $i = $i + 1
+  end
+  return $out
+end
+
+fn nabove($vals, $t)
+  $c = 0
+  $i = 0
+  while $i < len($vals)
+    if $vals[$i] >= $t then $c = $c + 1 end
+    $i = $i + 1
+  end
+  return $c
+end
+
+if $a[0] == "report" then
+  $dirs = sort(glob($ROOT .. "/*@*"))
+  print(rpad("user", 44) .. rpad("t", 5) .. rpad("ham", 5) .. rpad("spm", 5) .. rpad("liveFP@t", 10) .. rpad("liveFN@t", 10) .. rpad("liveFP.5", 10) .. rpad("liveFN.5", 10) .. rpad("tunFP.5", 9) .. rpad("tunFN.5", 9) .. rpad("tunFP.6", 9) .. rpad("tunFN.6", 9) .. "verdict")
+  $tot = {lfp: 0, lfn: 0, tfp: 0, tfn: 0, tfp6: 0, tfn6: 0, ham: 0, spam: 0, users: 0, better: 0, worse: 0, same: 0, fpworse: 0}
+  $i = 0
+  while $i < len($dirs)
+    $W = $dirs[$i]
+    $ps = split($W, "/")
+    $tag = $ps[len($ps) - 1]
+    if is_file($W .. "/tuned.spam.scores") then
+      $t = to_number(strip(read_file($W .. "/live-threshold")))
+      $lh = scores_of($W .. "/live.ham.scores")
+      $ls = scores_of($W .. "/live.spam.scores")
+      $th = scores_of($W .. "/tuned.ham.scores")
+      $ts = scores_of($W .. "/tuned.spam.scores")
+      $lfp = nabove($lh, $t)
+      $lfn = len($ls) - nabove($ls, $t)
+      $lfp5 = nabove($lh, 0.5)
+      $lfn5 = len($ls) - nabove($ls, 0.5)
+      $tfp = nabove($th, 0.5)
+      $tfn = len($ts) - nabove($ts, 0.5)
+      $tfp6 = nabove($th, 0.6)
+      $tfn6 = len($ts) - nabove($ts, 0.6)
+      -- verdict: compare tuned@0.5 against what the user runs today (live@t); FP weighted 3x
+      $lcost = 3 * $lfp + $lfn
+      $tcost = 3 * $tfp + $tfn
+      $v = "same"
+      if $tcost < $lcost then $v = "BETTER" end
+      if $tcost > $lcost then $v = "worse" end
+      if $tfp > $lfp then $v = $v .. " (FP+" .. ($tfp - $lfp) .. ")" ; $tot["fpworse"] = $tot["fpworse"] + 1 end
+      print(rpad($tag, 44) .. rpad($t, 5) .. rpad(len($lh), 5) .. rpad(len($ls), 5) .. rpad($lfp, 10) .. rpad($lfn, 10) .. rpad($lfp5, 10) .. rpad($lfn5, 10) .. rpad($tfp, 9) .. rpad($tfn, 9) .. rpad($tfp6, 9) .. rpad($tfn6, 9) .. $v)
+      $tot["lfp"] = $tot["lfp"] + $lfp
+      $tot["lfn"] = $tot["lfn"] + $lfn
+      $tot["tfp"] = $tot["tfp"] + $tfp
+      $tot["tfn"] = $tot["tfn"] + $tfn
+      $tot["tfp6"] = $tot["tfp6"] + $tfp6
+      $tot["tfn6"] = $tot["tfn6"] + $tfn6
+      $tot["ham"] = $tot["ham"] + len($lh)
+      $tot["spam"] = $tot["spam"] + len($ls)
+      $tot["users"] = $tot["users"] + 1
+      if pos("BETTER", $v) == 1 then $tot["better"] = $tot["better"] + 1 end
+      if pos("worse", $v) == 1 then $tot["worse"] = $tot["worse"] + 1 end
+      if pos("same", $v) == 1 then $tot["same"] = $tot["same"] + 1 end
+    end
+    $i = $i + 1
+  end
+  print("")
+  print("users=" .. $tot["users"] .. "  ham=" .. $tot["ham"] .. "  spam=" .. $tot["spam"])
+  print("live@t   FP=" .. $tot["lfp"] .. "  FN=" .. $tot["lfn"])
+  print("tuned@.5 FP=" .. $tot["tfp"] .. "  FN=" .. $tot["tfn"])
+  print("tuned@.6 FP=" .. $tot["tfp6"] .. "  FN=" .. $tot["tfn6"])
+  print("verdict (3*FP+FN, tuned@.5 vs live@t): better=" .. $tot["better"] .. "  same=" .. $tot["same"] .. "  worse=" .. $tot["worse"] .. "  users where tuned has MORE FP=" .. $tot["fpworse"])
+  exit(0)
+end
