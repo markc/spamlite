@@ -1,0 +1,127 @@
+#!/opt/cosmix/bin/mix
+-- arm-build.mix — build one candidate db ("arm") for fp-eval.mix, using 0.9.0 train-dir.
+--
+--   arm-build.mix build <workdir> <arm> live|empty <params-file|-> <ham.list|-> <spam.list|->
+--   arm-build.mix watch <in.list> <out.list>       (path \t From | Subject, for fp-eval's watch.list)
+--
+-- live  = start from <workdir>/base (a consistent .backup of the user's live db);
+--         params.toml / reconciled.log are dropped so only <params-file> applies.
+-- empty = start from a fresh empty db (import of nothing), i.e. the part-3 rebuild.
+-- Lists are files of absolute message paths, one per line; staged as symlinks and
+-- trained in one train-dir call per class (label headers stripped in-binary).
+
+$SL = "/usr/local/bin/spamlite"
+$a = args()
+if len($a) < 1 then print("usage: arm-build.mix build|watch ..."); exit(1) end
+$mode = $a[0]
+
+fn readlist($f)
+  $out = []
+  if $f == "-" then return $out end
+  $ll = read_lines($f)
+  $i = 0
+  while $i < len($ll)
+    $p = strip($ll[$i])
+    if $p != "" then push($out, $p) end
+    $i = $i + 1
+  end
+  return $out
+end
+
+fn hdr($path, $name)
+  $r = run_argv(["grep", "-m1", "-i", "^" .. $name .. ":", $path])
+  $s = strip($r.stdout)
+  if len($s) > len($name) + 1 then $s = strip(substr($s, len($name) + 1, len($s))) end
+  if len($s) > 40 then $s = substr($s, 0, 40) end
+  return $s
+end
+
+if $mode == "watch" then
+  $paths = readlist($a[1])
+  $out = ""
+  $i = 0
+  while $i < len($paths)
+    $p = $paths[$i]
+    $out = $out .. $p .. "\t" .. hdr($p, "From") .. " | " .. hdr($p, "Subject") .. "\n"
+    $i = $i + 1
+  end
+  write_file($a[2], $out)
+  print("watch: " .. len($paths) .. " entries -> " .. $a[2])
+  exit(0)
+end
+
+if $mode == "sample" then
+  -- sample <in.list> <out.list> <every-nth>
+  $paths = readlist($a[1])
+  $n = to_number($a[3])
+  $out = ""
+  $c = 0
+  $i = 0
+  while $i < len($paths)
+    if ($i % $n) == 0 then $out = $out .. $paths[$i] .. "\n"; $c = $c + 1 end
+    $i = $i + 1
+  end
+  write_file($a[2], $out)
+  print("sample: " .. $c .. " of " .. len($paths) .. " -> " .. $a[2])
+  exit(0)
+end
+
+if $mode != "build" or len($a) < 7 then print("usage: arm-build.mix build <workdir> <arm> live|empty <params|-> <ham.list|-> <spam.list|->"); exit(1) end
+$W = $a[1]
+$arm = $a[2]
+$base = $a[3]
+$params = $a[4]
+$hamlist = $a[5]
+$spamlist = $a[6]
+$dir = $W .. "/" .. $arm
+
+run_argv(["rm", "-rf", $dir])
+if $base == "live" then
+  run_argv(["cp", "-a", $W .. "/base", $dir])
+  run_argv(["rm", "-f", $dir .. "/params.toml", $dir .. "/reconciled.log", $dir .. "/db.sqlite-wal", $dir .. "/db.sqlite-shm"])
+else
+  mkdir($dir)
+  run($SL .. " -d " .. $dir .. " import </dev/null")
+end
+if $params != "-" then run_argv(["cp", $params, $dir .. "/params.toml"]) end
+
+fn train($dir, $list, $cls)
+  $paths = readlist($list)
+  if len($paths) == 0 then return "none" end
+  $stage = "/dev/shm/arm-stage-" .. $cls
+  remove_dir($stage)
+  mkdir($stage)
+  -- ln in chunks of 1000 to stay well under ARG_MAX
+  $i = 0
+  while $i < len($paths)
+    $j = $i + 1000
+    if $j > len($paths) then $j = len($paths) end
+    $chunk = []
+    $k = $i
+    while $k < $j
+      push($chunk, $paths[$k])
+      $k = $k + 1
+    end
+    run_argv(concat(["ln", "-s", "-t", $stage], $chunk))
+    $i = $j
+  end
+  $tr = run_argv([$SL, "-d", $dir, "train-dir", $stage, $cls], {timeout: 3600})
+  $ok = 0
+  $fail = 0
+  $tl = split(strip($tr.stdout), "\n")
+  $i = 0
+  while $i < len($tl)
+    $p = split($tl[$i], "\t")
+    if len($p) >= 1 then
+      if $p[0] == "ok" then $ok = $ok + 1 else $fail = $fail + 1 end
+    end
+    $i = $i + 1
+  end
+  remove_dir($stage)
+  return "listed=" .. len($paths) .. " ok=" .. $ok .. " fail=" .. $fail .. " exit=" .. $tr.exit_code
+end
+
+print("arm " .. $arm .. " base=" .. $base .. " params=" .. $params)
+print("  ham:  " .. train($dir, $hamlist, "good"))
+print("  spam: " .. train($dir, $spamlist, "spam"))
+print("  " .. replace(strip(run_argv([$SL, "-d", $dir, "stats"]).stdout), "\n", "  "))
