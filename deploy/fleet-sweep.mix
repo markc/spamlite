@@ -159,8 +159,8 @@ end
 
 if $a[0] == "report" then
   $dirs = sort(glob($ROOT .. "/*@*"))
-  print(rpad("user", 44) .. rpad("t", 5) .. rpad("ham", 5) .. rpad("spm", 5) .. rpad("liveFP@t", 10) .. rpad("liveFN@t", 10) .. rpad("liveFP.5", 10) .. rpad("liveFN.5", 10) .. rpad("tunFP.5", 9) .. rpad("tunFN.5", 9) .. rpad("tunFP.6", 9) .. rpad("tunFN.6", 9) .. "verdict")
-  $tot = {lfp: 0, lfn: 0, tfp: 0, tfn: 0, tfp6: 0, tfn6: 0, ham: 0, spam: 0, users: 0, better: 0, worse: 0, same: 0, fpworse: 0}
+  print(rpad("user", 44) .. rpad("t", 5) .. rpad("ham", 5) .. rpad("spm", 5) .. rpad("liveFP@t", 10) .. rpad("liveFN@t", 10) .. rpad("liveFP.5", 10) .. rpad("liveFN.5", 10) .. rpad("tunFP.5", 9) .. rpad("tunFN.5", 9) .. rpad("tunFP.6", 9) .. rpad("tunFN.6", 9) .. rpad("tunFP@t", 9) .. rpad("tunFN@t", 9) .. rpad("tuned@.5 vs live@t", 22) .. "tuned@t vs live@t")
+  $tot = {lfp: 0, lfn: 0, tfp: 0, tfn: 0, tfp6: 0, tfn6: 0, tfpt: 0, tfnt: 0, ham: 0, spam: 0, users: 0, better: 0, worse: 0, same: 0, fpworse: 0, bettert: 0, worset: 0, fpworset: 0}
   $i = 0
   while $i < len($dirs)
     $W = $dirs[$i]
@@ -180,6 +180,16 @@ if $a[0] == "report" then
       $tfn = len($ts) - nabove($ts, 0.5)
       $tfp6 = nabove($th, 0.6)
       $tfn6 = len($ts) - nabove($ts, 0.6)
+      $tfpt = nabove($th, $t)
+      $tfnt = len($ts) - nabove($ts, $t)
+      $v2 = "same"
+      if (3 * $tfpt + $tfnt) < (3 * $lfp + $lfn) then $v2 = "BETTER" end
+      if (3 * $tfpt + $tfnt) > (3 * $lfp + $lfn) then $v2 = "worse" end
+      if $tfpt > $lfp then $v2 = $v2 .. "(FP+" .. ($tfpt - $lfp) .. ")"; $tot["fpworset"] = $tot["fpworset"] + 1 end
+      if pos("BETTER", $v2) == 1 then $tot["bettert"] = $tot["bettert"] + 1 end
+      if pos("worse", $v2) == 1 then $tot["worset"] = $tot["worset"] + 1 end
+      $tot["tfpt"] = $tot["tfpt"] + $tfpt
+      $tot["tfnt"] = $tot["tfnt"] + $tfnt
       -- verdict: compare tuned@0.5 against what the user runs today (live@t); FP weighted 3x
       $lcost = 3 * $lfp + $lfn
       $tcost = 3 * $tfp + $tfn
@@ -187,7 +197,7 @@ if $a[0] == "report" then
       if $tcost < $lcost then $v = "BETTER" end
       if $tcost > $lcost then $v = "worse" end
       if $tfp > $lfp then $v = $v .. " (FP+" .. ($tfp - $lfp) .. ")" ; $tot["fpworse"] = $tot["fpworse"] + 1 end
-      print(rpad($tag, 44) .. rpad($t, 5) .. rpad(len($lh), 5) .. rpad(len($ls), 5) .. rpad($lfp, 10) .. rpad($lfn, 10) .. rpad($lfp5, 10) .. rpad($lfn5, 10) .. rpad($tfp, 9) .. rpad($tfn, 9) .. rpad($tfp6, 9) .. rpad($tfn6, 9) .. $v)
+      print(rpad($tag, 44) .. rpad($t, 5) .. rpad(len($lh), 5) .. rpad(len($ls), 5) .. rpad($lfp, 10) .. rpad($lfn, 10) .. rpad($lfp5, 10) .. rpad($lfn5, 10) .. rpad($tfp, 9) .. rpad($tfn, 9) .. rpad($tfp6, 9) .. rpad($tfn6, 9) .. rpad($tfpt, 9) .. rpad($tfnt, 9) .. rpad($v, 22) .. $v2)
       $tot["lfp"] = $tot["lfp"] + $lfp
       $tot["lfn"] = $tot["lfn"] + $lfn
       $tot["tfp"] = $tot["tfp"] + $tfp
@@ -208,6 +218,8 @@ if $a[0] == "report" then
   print("live@t   FP=" .. $tot["lfp"] .. "  FN=" .. $tot["lfn"])
   print("tuned@.5 FP=" .. $tot["tfp"] .. "  FN=" .. $tot["tfn"])
   print("tuned@.6 FP=" .. $tot["tfp6"] .. "  FN=" .. $tot["tfn6"])
+  print("tuned@t  FP=" .. $tot["tfpt"] .. "  FN=" .. $tot["tfnt"] .. "   (combiner swap, user threshold kept)")
+  print("verdict (3*FP+FN, tuned@t vs live@t): better=" .. $tot["bettert"] .. "  worse=" .. $tot["worset"] .. "  users where tuned@t has MORE FP=" .. $tot["fpworset"])
   print("verdict (3*FP+FN, tuned@.5 vs live@t): better=" .. $tot["better"] .. "  same=" .. $tot["same"] .. "  worse=" .. $tot["worse"] .. "  users where tuned has MORE FP=" .. $tot["fpworse"])
   exit(0)
 end
