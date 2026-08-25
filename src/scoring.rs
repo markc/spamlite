@@ -41,6 +41,59 @@ pub enum CombineMode {
     Geometric,
 }
 
+/// Optional empirical-Bayes prior for the Robinson centre.
+pub struct BaseRatePrior {
+    pub enabled: bool,
+    pub pseudocount: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl Default for BaseRatePrior {
+    fn default() -> Self {
+        BaseRatePrior {
+            enabled: false,
+            pseudocount: 20.0,
+            min: 0.2,
+            max: 0.8,
+        }
+    }
+}
+
+/// Return the Robinson centre for a corpus. Disabled means the caller's fixed
+/// centre exactly; enabled means the observed spam rate after symmetric-Beta
+/// shrinkage and clamping. Pure and total: 0/0, an inverted band, or any
+/// non-finite prior input returns neutral 0.5 and never panics in a delivery path.
+pub fn centre_from_base_rate(
+    total_good: u64,
+    total_spam: u64,
+    fixed: f64,
+    prior: &BaseRatePrior,
+) -> f64 {
+    if !fixed.is_finite()
+        || !prior.pseudocount.is_finite()
+        || !prior.min.is_finite()
+        || !prior.max.is_finite()
+    {
+        return 0.5;
+    }
+    if !prior.enabled {
+        return fixed;
+    }
+    let k = prior.pseudocount.max(0.0);
+    let spam = total_spam as f64;
+    let good = total_good as f64;
+    let denom = spam + good + k;
+    if denom <= 0.0 {
+        return 0.5;
+    }
+    let shrunk = (spam + k / 2.0) / denom;
+    if prior.min > prior.max {
+        return 0.5;
+    }
+    shrunk.clamp(prior.min, prior.max)
+}
+
 /// Tuning parameters for the classifier.
 pub struct Params {
     /// Robinson strength parameter — how strongly we pull toward `unknown_prob`
@@ -1346,5 +1399,119 @@ mod tests {
         assert!((q.rail_floor - 0.95).abs() < 1e-9);
         assert!(!q.rail);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    mod base_rate_prior_tests {
+        use super::*;
+
+        fn prior(enabled: bool) -> BaseRatePrior {
+            BaseRatePrior {
+                enabled,
+                ..BaseRatePrior::default()
+            }
+        }
+
+        #[test]
+        fn off_is_exactly_the_old_fixed_centre() {
+            let fixed = 0.37;
+            for (good, spam) in [(0, 0), (60, 40), (50, 5000), (1, 0)] {
+                assert_eq!(
+                    centre_from_base_rate(good, spam, fixed, &prior(false)).to_bits(),
+                    fixed.to_bits(),
+                    "disabled prior moved the centre (good={good} spam={spam})"
+                );
+            }
+        }
+
+        #[test]
+        fn empty_corpus_is_neutral() {
+            assert_eq!(centre_from_base_rate(0, 0, 0.37, &prior(true)), 0.5);
+        }
+
+        #[test]
+        fn thin_corpus_is_shrunk_hard_toward_neutral() {
+            let centre = centre_from_base_rate(0, 2, 0.5, &prior(true));
+            assert!(centre < 0.60, "thin corpus escaped shrinkage: {centre}");
+            assert!(centre > 0.5, "spam evidence did not move the centre: {centre}");
+        }
+
+        #[test]
+        fn well_observed_corpus_earns_its_way_to_the_base_rate() {
+            let centre = centre_from_base_rate(200, 800, 0.5, &prior(true));
+            assert!(
+                (centre - 0.8).abs() < 0.02,
+                "well-observed corpus did not approach 0.8: {centre}"
+            );
+        }
+
+        #[test]
+        fn extreme_corpus_is_clamped() {
+            let p = prior(true);
+            assert_eq!(centre_from_base_rate(50, 5000, 0.5, &p), p.max);
+            assert_eq!(centre_from_base_rate(5000, 5, 0.5, &p), p.min);
+        }
+
+        #[test]
+        fn inverted_band_falls_back_to_neutral_rather_than_panicking() {
+            let p = BaseRatePrior {
+                enabled: true,
+                min: 0.9,
+                max: 0.1,
+                ..BaseRatePrior::default()
+            };
+            assert_eq!(centre_from_base_rate(100, 100, 0.37, &p), 0.5);
+        }
+
+        #[test]
+        fn non_finite_prior_falls_back_to_neutral_rather_than_panicking() {
+            let p = BaseRatePrior {
+                enabled: true,
+                min: f64::NAN,
+                ..BaseRatePrior::default()
+            };
+            assert_eq!(centre_from_base_rate(100, 100, 0.37, &p), 0.5);
+        }
+
+        #[test]
+        fn enabled_prior_raises_unknown_vocabulary_on_a_spam_heavy_corpus() {
+            let tokens = vec![
+                "b:nevertrained".to_string(),
+                "b:vocabulary".to_string(),
+                "b:here".to_string(),
+            ];
+            let known = HashMap::new();
+            let off_centre = centre_from_base_rate(50, 450, 0.5, &prior(false));
+            let on_centre = centre_from_base_rate(50, 450, 0.5, &prior(true));
+            let off_params = Params {
+                unknown_prob: off_centre,
+                new_word_score: off_centre,
+                ..Params::default()
+            };
+            let on_params = Params {
+                unknown_prob: on_centre,
+                new_word_score: on_centre,
+                ..Params::default()
+            };
+            let off = classify_tokens(&tokens, &known, 50, 450, &off_params);
+            let on = classify_tokens(&tokens, &known, 50, 450, &on_params);
+
+            assert!(on.score > off.score, "enabled {} <= disabled {}", on.score, off.score);
+        }
+
+        #[test]
+        fn enabled_prior_does_not_override_real_evidence() {
+            let token = "b:agenda".to_string();
+            let tokens = vec![token.clone(), token.clone(), token.clone()];
+            let known = HashMap::from([(token, (50, 0))]);
+            let centre = centre_from_base_rate(50, 450, 0.5, &prior(true));
+            let params = Params {
+                unknown_prob: centre,
+                new_word_score: centre,
+                ..Params::default()
+            };
+            let classified = classify_tokens(&tokens, &known, 50, 450, &params);
+
+            assert_eq!(classified.verdict, Verdict::Good);
+        }
     }
 }

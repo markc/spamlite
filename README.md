@@ -44,6 +44,20 @@ only filesystem access is the SQLite database itself and its parent directory.
 The default `cli` feature adds the environment and `params.toml` readers plus
 all binaries. `scoring::classify_tokens` is the DB-free entry point for
 consumers that fetch token counts through their own storage layer.
+`scoring::centre_from_base_rate` is a pure, default-off helper for deriving a
+shrunk and clamped Robinson centre; no built-in scoring path calls it yet.
+
+The shared SQLite schema is `tokens` and `meta` plus an additive `labels`
+tables. The engine does not read `labels`; consumers such as maild may use it
+for their own per-message label bookkeeping. Caller-owned transaction ops
+include `untrain` and `relabel`, with `Database` wrappers for CLI use.
+`Untrained { decremented, stranded }` makes reversal honest, not exact:
+`stranded` counts current-stream tokens that are absent or already zero on the
+old class. The FROM message total is still decremented by one, floored at zero,
+even when every token strands: the message leaves the class count regardless
+of token reach. Tokens emitted by an older tokenizer but absent from the
+current stream are invisible and can remain on the old side; exact reversal
+would require persisting the trained token set per message.
 
 ## Usage
 
@@ -56,6 +70,11 @@ Usage:
   spamlite [-d DIR] receive          Classify message (stdin → "SPAM 0.999976" / "GOOD 0.000232")
   spamlite [-d DIR] spam             Train message from stdin as spam
   spamlite [-d DIR] good             Train message from stdin as good/ham
+  spamlite [-d DIR] untrain spam|good
+                                       Remove stdin message from one class
+  spamlite [-d DIR] train-dir DIR spam|good [--from spam|good]
+                                       Bulk-train a directory, or atomically
+                                       correct each message from the old class
   spamlite [-d DIR] counts           Show database statistics
   spamlite [-d DIR] cleanup [N] [D]  Remove tokens with count <= N or not seen in D days
   spamlite [-d DIR] export           Export database to CSV on stdout

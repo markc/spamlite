@@ -22,9 +22,10 @@ pub struct Counts {
 
 /// Extended statistics for the `stats` command. `last_seen_*` are unix epochs
 /// over the tokens table (0 when the table is empty); `seen_recent` counts
-/// tokens whose last_seen falls inside the caller-supplied window — the
-/// "own vocabulary" marker: `receive`/`score` never write last_seen, so a
-/// token seen recently was necessarily trained recently.
+/// tokens whose last_seen falls inside the caller-supplied window.
+/// Training-family writes — train, untrain, and relabel — refresh `last_seen`,
+/// so `seen_recent` means touched by supervised training recently, not
+/// necessarily grown.
 #[derive(Debug)]
 pub struct Stats {
     pub total_good: u64,
@@ -35,10 +36,30 @@ pub struct Stats {
     pub seen_recent: u64,
 }
 
+/// Result of removing one or more messages from a corpus class. The FROM total
+/// is decremented once per message, floored at zero, even when every token is
+/// stranded: the message leaves the class count regardless of token reach.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Untrained {
+    pub decremented: u64,
+    pub stranded: u64,
+}
+
+fn require_distinct_classes(from_spam: bool, to_spam: bool) -> SqlResult<()> {
+    if from_spam == to_spam {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "relabel: from and to classes must differ".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub mod schema {
     use super::*;
 
     /// Apply the connection pragmas and initialise the version-1 schema.
+    /// The engine never reads `labels` in this phase; it exists so consumers
+    /// such as maild can keep per-message label bookkeeping in one shared schema.
     pub fn init(conn: &Connection) -> SqlResult<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -58,6 +79,12 @@ pub mod schema {
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS labels (
+                stamp_id TEXT PRIMARY KEY,
+                label    INTEGER NOT NULL,
+                ts       INTEGER NOT NULL
             ) WITHOUT ROWID;",
         )?;
 
@@ -188,6 +215,92 @@ pub mod ops {
             params![key, messages.len() as i64],
         )?;
         Ok(())
+    }
+
+    /// Decrement one message from a corpus class. The class total is decremented
+    /// once, floored at zero, even if every token strands. Tokens absent from
+    /// the DB or already at zero are stranded; tokens emitted by an older
+    /// tokenizer but absent from this stream are deliberately invisible here.
+    pub fn untrain(
+        tx: &Transaction<'_>,
+        words: &[String],
+        is_spam: bool,
+    ) -> SqlResult<Untrained> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let sql = if is_spam {
+            "UPDATE tokens SET spam = spam - 1, last_seen = ?2
+             WHERE word = ?1 AND spam > 0"
+        } else {
+            "UPDATE tokens SET good = good - 1, last_seen = ?2
+             WHERE word = ?1 AND good > 0"
+        };
+        let mut stmt = tx.prepare_cached(sql)?;
+        let mut decremented = 0u64;
+        for word in words {
+            decremented += stmt.execute(params![word, now])? as u64;
+        }
+        drop(stmt);
+
+        let key = if is_spam { "total_spam" } else { "total_good" };
+        tx.execute(
+            "UPDATE meta SET value = CAST(MAX(CAST(value AS INTEGER) - 1, 0) AS TEXT)
+             WHERE key = ?1",
+            params![key],
+        )?;
+
+        Ok(Untrained {
+            decremented,
+            stranded: words.len() as u64 - decremented,
+        })
+    }
+
+    /// Correct one message by removing the old class and training the new one
+    /// inside the caller-owned transaction.
+    pub fn relabel(
+        tx: &Transaction<'_>,
+        words: &[String],
+        from_spam: bool,
+        to_spam: bool,
+    ) -> SqlResult<Untrained> {
+        require_distinct_classes(from_spam, to_spam)?;
+        let result = untrain(tx, words, from_spam)?;
+        train(tx, words, to_spam)?;
+        Ok(result)
+    }
+
+    /// Untrain a batch inside the caller's transaction, summing outcomes.
+    pub fn untrain_batch(
+        tx: &Transaction<'_>,
+        messages: &[Vec<String>],
+        is_spam: bool,
+    ) -> SqlResult<Untrained> {
+        let mut total = Untrained::default();
+        for words in messages {
+            let result = untrain(tx, words, is_spam)?;
+            total.decremented += result.decremented;
+            total.stranded += result.stranded;
+        }
+        Ok(total)
+    }
+
+    /// Relabel a batch inside the caller's transaction, summing outcomes.
+    pub fn relabel_batch(
+        tx: &Transaction<'_>,
+        messages: &[Vec<String>],
+        from_spam: bool,
+        to_spam: bool,
+    ) -> SqlResult<Untrained> {
+        require_distinct_classes(from_spam, to_spam)?;
+        let mut total = Untrained::default();
+        for words in messages {
+            let result = relabel(tx, words, from_spam, to_spam)?;
+            total.decremented += result.decremented;
+            total.stranded += result.stranded;
+        }
+        Ok(total)
     }
 
     pub fn stats(conn: &Connection, recent_secs: u64) -> SqlResult<Stats> {
@@ -426,6 +539,50 @@ impl Database {
         tx.commit()
     }
 
+    /// Remove one message from a corpus class in one IMMEDIATE transaction.
+    pub fn untrain(&self, words: &[String], is_spam: bool) -> SqlResult<Untrained> {
+        let tx = ops::begin_immediate(&self.conn)?;
+        let result = ops::untrain(&tx, words, is_spam)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Correct one message from one class to the other atomically.
+    pub fn relabel(
+        &self,
+        words: &[String],
+        from_spam: bool,
+        to_spam: bool,
+    ) -> SqlResult<Untrained> {
+        require_distinct_classes(from_spam, to_spam)?;
+        let tx = ops::begin_immediate(&self.conn)?;
+        let result = ops::relabel(&tx, words, from_spam, to_spam)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Correct a batch durably in one IMMEDIATE transaction. The per-message
+    /// results are returned in input order for honest `train-dir` reporting.
+    pub fn relabel_messages(
+        &self,
+        messages: &[Vec<String>],
+        from_spam: bool,
+        to_spam: bool,
+    ) -> SqlResult<Vec<Untrained>> {
+        require_distinct_classes(from_spam, to_spam)?;
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        let tx = ops::begin_immediate(&self.conn)?;
+        let mut results = Vec::with_capacity(messages.len());
+        for words in messages {
+            results.push(ops::relabel(&tx, words, from_spam, to_spam)?);
+        }
+        tx.commit()?;
+        Ok(results)
+    }
+
     /// Extended statistics. `recent_secs` is the window for `seen_recent`
     /// (tokens with last_seen inside the last `recent_secs` seconds). One SQL
     /// statement, so the token aggregates and the meta totals are a single
@@ -633,6 +790,282 @@ mod tests {
         // Empty batch is a no-op, not an error.
         db.train_messages(&[], false).unwrap();
         assert_eq!(db.total_good().unwrap(), 0);
+    }
+
+    #[test]
+    fn relabel_reverses_counts_and_totals() {
+        let db = test_db();
+        let words = vec!["b:alpha".to_string(), "b:beta".to_string()];
+        db.train_message(&words, true).unwrap();
+
+        let result = db.relabel(&words, true, false).unwrap();
+
+        assert_eq!(result, Untrained { decremented: 2, stranded: 0 });
+        assert_eq!((db.total_good().unwrap(), db.total_spam().unwrap()), (1, 0));
+        let found = db.lookup_tokens(&words).unwrap();
+        assert_eq!(found["b:alpha"], (1, 0));
+        assert_eq!(found["b:beta"], (1, 0));
+    }
+
+    #[test]
+    fn relabel_floors_missing_from_counts_and_still_lands() {
+        let db = test_db();
+        let words = vec!["b:alpha".to_string(), "b:beta".to_string()];
+
+        let result = db.relabel(&words, true, false).unwrap();
+
+        assert_eq!(result, Untrained { decremented: 0, stranded: 2 });
+        assert_eq!((db.total_good().unwrap(), db.total_spam().unwrap()), (1, 0));
+        let found = db.lookup_tokens(&words).unwrap();
+        assert_eq!(found["b:alpha"], (1, 0));
+        assert_eq!(found["b:beta"], (1, 0));
+    }
+
+    #[test]
+    fn relabel_rejects_equal_classes_without_panicking() {
+        let db = test_db();
+        let error = db.relabel(&[], true, true).unwrap_err();
+        match error {
+            rusqlite::Error::InvalidParameterName(message) => assert_eq!(
+                message,
+                "relabel: from and to classes must differ"
+            ),
+            other => panic!("unexpected relabel error: {other}"),
+        }
+    }
+
+    #[test]
+    fn untrain_reports_partial_stranding() {
+        let db = test_db();
+        let trained = vec!["b:alpha".to_string(), "b:beta".to_string()];
+        let message = vec![
+            "b:alpha".to_string(),
+            "b:beta".to_string(),
+            "b:gamma".to_string(),
+            "b:delta".to_string(),
+        ];
+        db.train_message(&trained, true).unwrap();
+
+        let result = db.untrain(&message, true).unwrap();
+
+        assert_eq!(result, Untrained { decremented: 2, stranded: 2 });
+        assert_eq!(db.total_spam().unwrap(), 0);
+    }
+
+    #[test]
+    fn relabel_only_reverses_tokens_in_current_stream() {
+        let db = test_db();
+        let frozen = vec![
+            "b:style".to_string(),
+            "b:nbsp".to_string(),
+            "b:helvetica".to_string(),
+            "b:meeting".to_string(),
+            "b:agenda".to_string(),
+        ];
+        let current = vec!["b:meeting".to_string(), "b:agenda".to_string()];
+        db.train_message(&frozen, true).unwrap();
+
+        let result = db.relabel(&current, true, false).unwrap();
+
+        assert_eq!(result, Untrained { decremented: 2, stranded: 0 });
+        let found = db.lookup_tokens(&frozen).unwrap();
+        for markup in ["b:style", "b:nbsp", "b:helvetica"] {
+            assert_eq!(found[markup], (0, 1), "{markup} must remain spam-side");
+        }
+        for content in ["b:meeting", "b:agenda"] {
+            assert_eq!(found[content], (1, 0), "{content} must move classes");
+        }
+    }
+
+    #[test]
+    fn relabel_messages_returns_real_per_message_outcomes() {
+        let db = test_db();
+        let first = vec!["b:alpha".to_string()];
+        let second_trained = vec!["b:beta".to_string()];
+        let second_corrected = vec!["b:beta".to_string(), "b:missing".to_string()];
+        db.train_message(&first, true).unwrap();
+        db.train_message(&second_trained, true).unwrap();
+
+        let results = db
+            .relabel_messages(&[first.clone(), second_corrected.clone()], true, false)
+            .unwrap();
+
+        assert_eq!(
+            results,
+            vec![
+                Untrained { decremented: 1, stranded: 0 },
+                Untrained { decremented: 1, stranded: 1 },
+            ]
+        );
+        assert_eq!((db.total_good().unwrap(), db.total_spam().unwrap()), (2, 0));
+        let found = db.lookup_tokens(&[first, second_corrected].concat()).unwrap();
+        assert_eq!(found["b:alpha"], (1, 0));
+        assert_eq!(found["b:beta"], (1, 0));
+        assert_eq!(found["b:missing"], (1, 0));
+    }
+
+    #[test]
+    fn immediate_transactions_serialize_two_connections_without_busy_snapshot() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        struct TempDirGuard(std::path::PathBuf);
+
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "spamlite-immediate-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        let _guard = TempDirGuard(root.clone());
+        let path = root.join("db.sqlite");
+        let db_a = Database::open(&path).unwrap();
+        let db_b = Database::open(&path).unwrap();
+        let tx_a = ops::begin_immediate(&db_a.conn).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let attempt_at = Instant::now();
+            let result = ops::begin_immediate(&db_b.conn).and_then(|tx| tx.commit());
+            done_tx.send((attempt_at, attempt_at.elapsed(), result)).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "connection B silently proceeded while A held the reserved lock"
+        );
+        let release_at = Instant::now();
+        tx_a.commit().unwrap();
+
+        let (attempt_at, elapsed, result) = done_rx.recv().unwrap();
+        assert!(
+            attempt_at < release_at,
+            "connection B did not attempt BEGIN IMMEDIATE before A released"
+        );
+        if let Err(rusqlite::Error::SqliteFailure(error, _)) = &result {
+            assert_ne!(
+                error.extended_code,
+                rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+                "IMMEDIATE transaction must never fail with SQLITE_BUSY_SNAPSHOT"
+            );
+            assert_eq!(error.code, rusqlite::ErrorCode::DatabaseBusy);
+            assert!(
+                elapsed >= Duration::from_millis(4900),
+                "SQLITE_BUSY returned before busy_timeout elapsed: {elapsed:?}"
+            );
+        } else {
+            result.unwrap();
+            assert!(
+                elapsed >= Duration::from_millis(275),
+                "connection B did not wait for A: {elapsed:?}"
+            );
+        }
+        handle.join().unwrap();
+        drop(db_a);
+    }
+
+    #[test]
+    fn frozen_v090_ddl_interoperates_both_directions() {
+        use crate::scoring::{classify, Params, Verdict};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const V090_DDL: &str = "CREATE TABLE IF NOT EXISTS tokens (
+                word      TEXT PRIMARY KEY,
+                good      INTEGER NOT NULL DEFAULT 0,
+                spam      INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) WITHOUT ROWID;";
+        const V090_META: [&str; 3] = [
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('total_good', '0')",
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('total_spam', '0')",
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('version', '1')",
+        ];
+        const V090_GET_META: &str = "SELECT value FROM meta WHERE key = ?1";
+        const V090_LOOKUP_ONE: &str =
+            "SELECT word, good, spam FROM tokens WHERE word IN (?)";
+        const V090_UPSERT_GOOD: &str =
+            "INSERT INTO tokens (word, good, spam, last_seen) VALUES (?1, 1, 0, ?2)
+             ON CONFLICT(word) DO UPDATE SET good = good + 1, last_seen = ?2";
+        const V090_INC_META: &str =
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ?1";
+
+        let root = std::env::temp_dir().join(format!(
+            "spamlite-v090-interop-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let old_path = root.join("old.db");
+        let old = Connection::open(&old_path).unwrap();
+        old.execute_batch(V090_DDL).unwrap();
+        for sql in V090_META {
+            old.execute(sql, []).unwrap();
+        }
+        drop(old);
+
+        let upgraded = Database::open(&old_path).unwrap();
+        let old_to_new_version: String = upgraded
+            .conn
+            .query_row(V090_GET_META, params!["version"], |row| row.get(0))
+            .unwrap();
+        assert_eq!(old_to_new_version, "1");
+        let word = vec!["b:legacy".to_string()];
+        upgraded.train_message(&word, true).unwrap();
+        let (verdict, score) = classify(&upgraded, &word, &Params::default()).unwrap();
+        assert_eq!(verdict, Verdict::Spam);
+        assert!(score > 0.5);
+        drop(upgraded);
+
+        let new_path = root.join("new.db");
+        let current = Database::open(&new_path).unwrap();
+        current.train_message(&word, true).unwrap();
+        drop(current);
+
+        let old_binary = Connection::open(&new_path).unwrap();
+        let counts: (String, i64, i64) = old_binary
+            .query_row(
+                V090_LOOKUP_ONE,
+                params!["b:legacy"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, ("b:legacy".to_string(), 0, 1));
+        let total_spam: String = old_binary
+            .query_row(V090_GET_META, params!["total_spam"], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total_spam, "1");
+        let new_to_old_version: String = old_binary
+            .query_row(V090_GET_META, params!["version"], |row| row.get(0))
+            .unwrap();
+        assert_eq!(new_to_old_version, "1");
+        old_binary
+            .execute(V090_UPSERT_GOOD, params!["b:legacy", 1_i64])
+            .unwrap();
+        old_binary
+            .execute(V090_INC_META, params!["total_good"])
+            .unwrap();
+        drop(old_binary);
+
+        let reopened = Database::open(&new_path).unwrap();
+        assert_eq!(reopened.lookup_tokens(&word).unwrap()["b:legacy"], (1, 1));
+        assert_eq!((reopened.total_good().unwrap(), reopened.total_spam().unwrap()), (1, 1));
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

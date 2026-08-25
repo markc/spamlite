@@ -11,7 +11,7 @@ and a default-on CLI feature.
 ```
 src/
   lib.rs          Engine layers and classifier compatibility alias
-  storage.rs      SQLite schema + free ops + Database convenience wrapper
+  storage.rs      SQLite schema + caller-transaction train/untrain/relabel ops + Database wrapper
   tokenizer.rs    MIME tokenizer; tokenize_for_training is the training entry
   scoring.rs      Robinson-Fisher scoring and DB-free classify_tokens seam
   main.rs         cli-feature binary wiring and policy
@@ -20,7 +20,8 @@ src/
 The modules have clean boundaries:
 - `tokenizer` produces `Vec<String>` from raw email bytes
 - `tokenize_for_training` strips label headers before every supervised training path
-- `storage::schema` initialises SQLite and `storage::ops` owns the SQL
+- `storage::schema` initialises SQLite; `storage::ops` owns the SQL and takes
+  caller-owned transactions for atomic training and correction units
 - `scoring` combines fetched counts, with `classify_tokens` as the pure seam
 - without `cli`, the engine has no environment or configuration-file reads;
   filesystem access is limited to SQLite and its parent directory
