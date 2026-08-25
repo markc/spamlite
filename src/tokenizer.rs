@@ -67,6 +67,7 @@ impl TokenizerConfig {
     /// the offline eval harness A/B individual anti-evasion features via the
     /// stock `good`/`spam`/`score` CLI without a rebuild or code change.
     /// Production sets none of these, so the default behaviour is unchanged.
+    #[cfg(feature = "cli")]
     pub fn from_env() -> Self {
         let mut c = Self::default();
         let on = |k: &str| {
@@ -109,8 +110,59 @@ pub fn tokenize(raw: &[u8]) -> Vec<String> {
 /// Extract tokens using a config resolved from `SPAMLITE_*` env vars. The CLI
 /// train/score/receive paths use this so anti-evasion features can be A/B'd in
 /// the offline harness; with no env vars set it is identical to `tokenize`.
+#[cfg(feature = "cli")]
 pub fn tokenize_env(raw: &[u8]) -> Vec<String> {
     tokenize_with_config(raw, &TokenizerConfig::from_env())
+}
+
+/// Remove the filter's own label headers and their folded continuation lines
+/// before training, so the fallback tokenizer cannot learn a previous verdict.
+pub fn strip_label_headers(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skipping = false;
+    let mut in_headers = true;
+    for line in raw.split_inclusive(|&b| b == b'\n') {
+        if in_headers {
+            let is_blank = line == b"\r\n" || line == b"\n";
+            if is_blank {
+                in_headers = false;
+                skipping = false;
+            } else if line[0] == b' ' || line[0] == b'\t' {
+                // Folded continuation belongs to the previous header.
+                if skipping {
+                    continue;
+                }
+            } else {
+                let lower: Vec<u8> = line
+                    .iter()
+                    .take(16)
+                    .map(|b| b.to_ascii_lowercase())
+                    .collect();
+                skipping = lower.starts_with(b"x-spam-status:")
+                    || lower.starts_with(b"x-spamprobe:");
+                if skipping {
+                    continue;
+                }
+            }
+        }
+        out.extend_from_slice(line);
+    }
+    out
+}
+
+/// The only training tokenizer entry point: strip prior label headers, then
+/// tokenize with the caller's explicit configuration.
+pub fn tokenize_for_training(raw: &[u8], config: &TokenizerConfig) -> Vec<String> {
+    tokenize_for_training_with(raw, config, tokenize_with_config)
+}
+
+fn tokenize_for_training_with(
+    raw: &[u8],
+    config: &TokenizerConfig,
+    tokenize: impl FnOnce(&[u8], &TokenizerConfig) -> Vec<String>,
+) -> Vec<String> {
+    let stripped = strip_label_headers(raw);
+    tokenize(&stripped, config)
 }
 
 /// Extract tokens from a raw email message with explicit configuration.
@@ -762,6 +814,69 @@ fn normalize_url(url: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fallback_label_stream_is_stripped_before_training() {
+        let email = b"From: sender@example.com\r\n\
+                       Subject: Ordinary message\r\n\
+                       X-Spam-Status: Yes, score=0.99\r\n\
+                       \tby previous filter spam-status 0.99\r\n\
+                       X-SpamProbe: SPAM 0.99\r\n\
+                       \tspamprobe folded 0.99\r\n\
+                       \r\n\
+                       ordinary body text\r\n";
+        let config = TokenizerConfig::default();
+        let raw_fallback = tokenize_fallback(email, &config);
+        assert!(raw_fallback.iter().any(|t| t == "b:x-spam-status"));
+        assert!(raw_fallback.iter().any(|t| t == "b:spam"));
+        assert!(raw_fallback.iter().any(|t| t == "b:0.99"));
+
+        let stripped = strip_label_headers(email);
+        let stripped_fallback = tokenize_fallback(&stripped, &config);
+        assert!(!stripped_fallback.iter().any(|t| {
+            t.contains("spam-status") || t.contains("spamprobe") || t.contains("0.99")
+        }), "label token leaked after stripping: {stripped_fallback:?}");
+
+        // Exercise the same strip-then-tokenize helper as the public training
+        // entry point, injecting the fallback path so deleting the strip call
+        // makes this regression test fail.
+        let trained_fallback =
+            tokenize_for_training_with(email, &config, tokenize_fallback);
+        assert_eq!(trained_fallback, stripped_fallback);
+
+        let trained = tokenize_for_training(email, &config);
+        assert!(!trained.iter().any(|t| {
+            t.contains("spam-status") || t.contains("spamprobe") || t.contains("0.99")
+        }), "label token leaked into public training path: {trained:?}");
+        // The other direction of the mail-parser contract this guard leans on:
+        // a label-carrying message is header-bearing and therefore parses to
+        // `Some` — it never reaches the fallback through the public path. If a
+        // future mail-parser returns `None` more eagerly, this is the canary.
+        assert!(
+            MessageParser::default().parse(email).is_some(),
+            "label-carrying message unexpectedly failed to parse"
+        );
+    }
+
+    /// mail-parser 0.11 returns `None` only when it finds no headers. A
+    /// strip-recognised `X-Spam-Status:`/`X-SpamProbe:` line is itself a valid
+    /// header, so no single input can both carry one as a header and reach the
+    /// fallback through the public parser. The direct fallback test above pins
+    /// the label leak; this test pins a real public fallback-triggering input.
+    #[test]
+    fn test_headerless_input_reaches_public_fallback() {
+        let raw = b"plain headerless body words\r\n";
+        let config = TokenizerConfig::default();
+        assert!(MessageParser::default().parse(raw).is_none());
+        assert_eq!(
+            tokenize_with_config(raw, &config),
+            tokenize_fallback(raw, &config)
+        );
+        assert_eq!(
+            tokenize_for_training(raw, &config),
+            tokenize_fallback(raw, &config)
+        );
+    }
 
     #[test]
     fn test_extract_words() {

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use spamlite::classifier::{self, Params, Verdict};
+use spamlite::scoring::{self, Params, Verdict};
 use spamlite::storage::Database;
 use spamlite::tokenizer::{tokenize_with_config, TokenizerConfig};
 
@@ -130,8 +130,8 @@ fn parse_args() -> Args {
             }
             "--combine-mode" => {
                 params.combine_mode = match need(i, a).to_ascii_lowercase().as_str() {
-                    "fisher" => classifier::CombineMode::Fisher,
-                    "geometric" | "geo" | "robinson" => classifier::CombineMode::Geometric,
+                    "fisher" => scoring::CombineMode::Fisher,
+                    "geometric" | "geo" | "robinson" => scoring::CombineMode::Geometric,
                     other => {
                         eprintln!("spamlite-eval: --combine-mode must be fisher|geometric, got {other:?}");
                         process::exit(2);
@@ -268,7 +268,7 @@ fn evaluate_folder(
     for f in files {
         let Ok(raw) = fs::read(&f) else { continue };
         let tokens = tokenize_with_config(&raw, tok);
-        let (verdict, score) = match classifier::classify(db, &tokens, params) {
+        let (verdict, score) = match scoring::classify(db, &tokens, params) {
             Ok(x) => x,
             Err(_) => continue,
         };

@@ -319,7 +319,7 @@ impl Stats {
         }
         if !self.by_user_delivery.is_empty() {
             let mut users: Vec<_> = self.by_user_delivery.iter().collect();
-            users.sort_by(|a, b| (b.1 .0 + b.1 .1).cmp(&(a.1 .0 + a.1 .1)));
+            users.sort_by_key(|b| std::cmp::Reverse(b.1 .0 + b.1 .1));
             writeln!(w, "# top delivery users (verdict counts):")?;
             for (user, (g, s)) in users.iter().take(15) {
                 writeln!(w, "#   {:<40} good={g:<6} spam={s}", user)?;

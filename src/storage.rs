@@ -1,7 +1,7 @@
 // Copyright 2026 Mark Constable <mc@netserva.org>
 // SPDX-License-Identifier: MIT
 
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{params, Connection, Result as SqlResult, Transaction, TransactionBehavior};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -35,6 +35,287 @@ pub struct Stats {
     pub seen_recent: u64,
 }
 
+pub mod schema {
+    use super::*;
+
+    /// Apply the connection pragmas and initialise the version-1 schema.
+    pub fn init(conn: &Connection) -> SqlResult<()> {
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = 500;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tokens (
+                word      TEXT PRIMARY KEY,
+                good      INTEGER NOT NULL DEFAULT 0,
+                spam      INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) WITHOUT ROWID;",
+        )?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('total_good', '0')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('total_spam', '0')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('version', '1')",
+            [],
+        )?;
+        Ok(())
+    }
+}
+
+/// SQL operations for connections initialised by [`schema::init`]. Consumers
+/// that open their own [`Connection`] must call `schema::init` first; the
+/// [`Database`] wrapper always does this.
+pub mod ops {
+    use super::*;
+
+    /// Start a write transaction that acquires SQLite's reserved lock up front.
+    /// The connection must first be initialised by [`schema::init`] so the
+    /// required pragmas, including `busy_timeout=5000`, are installed.
+    pub fn begin_immediate(conn: &Connection) -> SqlResult<Transaction<'_>> {
+        Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+    }
+
+    fn get_meta(conn: &Connection, key: &str) -> SqlResult<u64> {
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| {
+            let s: String = row.get(0)?;
+            Ok(s.parse::<u64>().unwrap_or(0))
+        })
+    }
+
+    pub fn total_good(conn: &Connection) -> SqlResult<u64> {
+        get_meta(conn, "total_good")
+    }
+
+    pub fn total_spam(conn: &Connection) -> SqlResult<u64> {
+        get_meta(conn, "total_spam")
+    }
+
+    pub fn totals(conn: &Connection) -> SqlResult<(u64, u64)> {
+        Ok((total_good(conn)?, total_spam(conn)?))
+    }
+
+    pub fn increment_total(conn: &Connection, is_spam: bool) -> SqlResult<()> {
+        let key = if is_spam { "total_spam" } else { "total_good" };
+        conn.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ?1",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    pub fn lookup_tokens(
+        conn: &Connection,
+        words: &[String],
+    ) -> SqlResult<HashMap<String, (u64, u64)>> {
+        let mut results = HashMap::with_capacity(words.len());
+        for chunk in words.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT word, good, spam FROM tokens WHERE word IN ({placeholders})");
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?;
+            for row in rows {
+                let (word, good, spam) = row?;
+                results.insert(word, (good, spam));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Increment token counts only, without changing either message total.
+    pub fn upsert_tokens(tx: &Transaction<'_>, words: &[String], is_spam: bool) -> SqlResult<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let sql = if is_spam {
+            "INSERT INTO tokens (word, good, spam, last_seen) VALUES (?1, 0, 1, ?2)
+             ON CONFLICT(word) DO UPDATE SET spam = spam + 1, last_seen = ?2"
+        } else {
+            "INSERT INTO tokens (word, good, spam, last_seen) VALUES (?1, 1, 0, ?2)
+             ON CONFLICT(word) DO UPDATE SET good = good + 1, last_seen = ?2"
+        };
+        let mut stmt = tx.prepare_cached(sql)?;
+        for word in words {
+            stmt.execute(params![word, now])?;
+        }
+        Ok(())
+    }
+
+    /// Train one message inside the caller's transaction; do not commit it.
+    pub fn train(tx: &Transaction<'_>, words: &[String], is_spam: bool) -> SqlResult<()> {
+        upsert_tokens(tx, words, is_spam)?;
+        let key = if is_spam { "total_spam" } else { "total_good" };
+        tx.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ?1",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    /// Train a batch inside the caller's transaction; do not commit it.
+    pub fn train_batch(
+        tx: &Transaction<'_>,
+        messages: &[Vec<String>],
+        is_spam: bool,
+    ) -> SqlResult<()> {
+        for words in messages {
+            upsert_tokens(tx, words, is_spam)?;
+        }
+        let key = if is_spam { "total_spam" } else { "total_good" };
+        tx.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + ?2 AS TEXT) WHERE key = ?1",
+            params![key, messages.len() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn stats(conn: &Connection, recent_secs: u64) -> SqlResult<Stats> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let cutoff = now - recent_secs as i64;
+        conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(MIN(last_seen), 0),
+                    COALESCE(MAX(last_seen), 0),
+                    COALESCE(SUM(last_seen >= ?1), 0),
+                    COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'total_good'), 0),
+                    COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'total_spam'), 0)
+             FROM tokens",
+            params![cutoff],
+            |row| {
+                Ok(Stats {
+                    unique_tokens: row.get::<_, i64>(0)? as u64,
+                    last_seen_min: row.get::<_, i64>(1)? as u64,
+                    last_seen_max: row.get::<_, i64>(2)? as u64,
+                    seen_recent: row.get::<_, i64>(3)? as u64,
+                    total_good: row.get::<_, i64>(4)? as u64,
+                    total_spam: row.get::<_, i64>(5)? as u64,
+                })
+            },
+        )
+    }
+
+    pub fn counts(conn: &Connection) -> SqlResult<Counts> {
+        let unique_tokens = conn.query_row("SELECT COUNT(*) FROM tokens", [], |row| {
+            row.get::<_, i64>(0).map(|v| v as u64)
+        })?;
+        let (total_good, total_spam) = totals(conn)?;
+        Ok(Counts {
+            total_good,
+            total_spam,
+            unique_tokens,
+        })
+    }
+
+    pub fn cleanup(conn: &Connection, min_count: u64, days: u64) -> SqlResult<u64> {
+        let cutoff = if days > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            now - (days as i64 * 86400)
+        } else {
+            0
+        };
+        let deleted = if days > 0 {
+            conn.execute(
+                "DELETE FROM tokens WHERE (good + spam) <= ?1 OR last_seen < ?2",
+                params![min_count as i64, cutoff],
+            )?
+        } else {
+            conn.execute(
+                "DELETE FROM tokens WHERE (good + spam) <= ?1",
+                params![min_count as i64],
+            )?
+        };
+        Ok(deleted as u64)
+    }
+
+    pub fn export<W: Write>(conn: &Connection, writer: &mut W) -> Result<(), ExportError> {
+        let (total_good, total_spam) = totals(conn)?;
+        writeln!(writer, "{total_good},{total_spam},0,\"__total__\"")?;
+        let mut stmt = conn.prepare("SELECT word, good, spam FROM tokens ORDER BY word")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        for row in rows {
+            let (word, good, spam) = row?;
+            if word.contains('"') || word.chars().any(|c| c.is_control()) {
+                continue;
+            }
+            writeln!(writer, "{good},{spam},0,\"{word}\"")?;
+        }
+        Ok(())
+    }
+
+    pub fn import<R: BufRead>(tx: &Transaction<'_>, reader: R) -> SqlResult<u64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut count = 0u64;
+        let mut stmt = tx.prepare(
+            "INSERT INTO tokens (word, good, spam, last_seen) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(word) DO UPDATE SET good = good + ?2, spam = spam + ?3, last_seen = ?4",
+        )?;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((good, spam, word)) = super::parse_csv_line(line) {
+                if word == "__total__" {
+                    tx.execute(
+                        "INSERT INTO meta (key, value) VALUES ('total_good', ?1)
+                         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?1",
+                        params![good as i64],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO meta (key, value) VALUES ('total_spam', ?1)
+                         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?1",
+                        params![spam as i64],
+                    )?;
+                } else {
+                    stmt.execute(params![word, good as i64, spam as i64, now])?;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -62,7 +343,8 @@ impl Database {
         let flags = rusqlite::OpenFlags::default().difference(rusqlite::OpenFlags::SQLITE_OPEN_CREATE);
         let conn = Connection::open_with_flags(path, flags)
             .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        Self::init(conn).map_err(|e| format!("failed to open {}: {e}", path.display()))
+        schema::init(&conn).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        Ok(Database { conn })
     }
 
     /// Open (or create) the database at the given path with WAL mode.
@@ -73,140 +355,34 @@ impl Database {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path)?;
-        Self::init(conn)
-    }
-
-    /// Shared pragmas + schema/meta initialisation for both open paths. The
-    /// CREATE IF NOT EXISTS statements are no-ops on an existing db.
-    fn init(conn: Connection) -> SqlResult<Self> {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = 500;
-             PRAGMA busy_timeout = 5000;",
-        )?;
-
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS tokens (
-                word      TEXT PRIMARY KEY,
-                good      INTEGER NOT NULL DEFAULT 0,
-                spam      INTEGER NOT NULL DEFAULT 0,
-                last_seen INTEGER NOT NULL DEFAULT 0
-            ) WITHOUT ROWID;
-
-            CREATE TABLE IF NOT EXISTS meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            ) WITHOUT ROWID;",
-        )?;
-
-        // Initialize meta if missing
-        conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('total_good', '0')",
-            [],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('total_spam', '0')",
-            [],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('version', '1')",
-            [],
-        )?;
-
+        schema::init(&conn)?;
         Ok(Database { conn })
-    }
-
-    /// Get a meta value
-    fn get_meta(&self, key: &str) -> SqlResult<u64> {
-        self.conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| {
-                let s: String = row.get(0)?;
-                Ok(s.parse::<u64>().unwrap_or(0))
-            })
     }
 
     /// Get total good message count
     pub fn total_good(&self) -> SqlResult<u64> {
-        self.get_meta("total_good")
+        ops::total_good(&self.conn)
     }
 
     /// Get total spam message count
     pub fn total_spam(&self) -> SqlResult<u64> {
-        self.get_meta("total_spam")
-    }
-
-    /// Atomically increment a meta counter. A single UPDATE avoids the
-    /// read-modify-write lost-update race when two deliveries for the same
-    /// user run concurrently (dovecot lmtp can and does parallelise).
-    fn inc_meta(&self, key: &str) -> SqlResult<()> {
-        self.conn.execute(
-            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ?1",
-            params![key],
-        )?;
-        Ok(())
+        ops::total_spam(&self.conn)
     }
 
     /// Increment total good count
     pub fn inc_total_good(&self) -> SqlResult<()> {
-        self.inc_meta("total_good")
+        ops::increment_total(&self.conn, false)
     }
 
     /// Increment total spam count
     pub fn inc_total_spam(&self) -> SqlResult<()> {
-        self.inc_meta("total_spam")
+        ops::increment_total(&self.conn, true)
     }
 
     /// Batch-lookup tokens by word. Returns a map of word -> (good, spam)
     /// containing only tokens that exist in the DB.
     pub fn lookup_tokens(&self, words: &[String]) -> SqlResult<HashMap<String, (u64, u64)>> {
-        let mut results = HashMap::with_capacity(words.len());
-
-        // Build parameterized IN clause in chunks to avoid SQLite variable limits.
-        // prepare_cached means the common 500-placeholder statement is compiled
-        // once per connection even for multi-chunk messages.
-        for chunk in words.chunks(500) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!("SELECT word, good, spam FROM tokens WHERE word IN ({placeholders})");
-            let mut stmt = self.conn.prepare_cached(&sql)?;
-
-            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                ))
-            })?;
-
-            for row in rows {
-                let (word, good, spam) = row?;
-                results.insert(word, (good, spam));
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Upsert the per-token counts for one training pass. Runs inside the
-    /// caller's transaction (`Transaction` derefs to `Connection`).
-    fn upsert_tokens(conn: &Connection, words: &[String], is_spam: bool) -> SqlResult<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let sql = if is_spam {
-            "INSERT INTO tokens (word, good, spam, last_seen) VALUES (?1, 0, 1, ?2)
-             ON CONFLICT(word) DO UPDATE SET spam = spam + 1, last_seen = ?2"
-        } else {
-            "INSERT INTO tokens (word, good, spam, last_seen) VALUES (?1, 1, 0, ?2)
-             ON CONFLICT(word) DO UPDATE SET good = good + 1, last_seen = ?2"
-        };
-        let mut stmt = conn.prepare_cached(sql)?;
-        for word in words {
-            stmt.execute(params![word, now])?;
-        }
-        Ok(())
+        ops::lookup_tokens(&self.conn, words)
     }
 
     /// Train token counts only: increment good or spam count for each word.
@@ -214,8 +390,8 @@ impl Database {
     /// `cmd_train` needs (token counts repeat, the corpus ratio stays honest).
     /// For a full one-message training pass use `train_message`.
     pub fn train(&self, words: &[String], is_spam: bool) -> SqlResult<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        Self::upsert_tokens(&tx, words, is_spam)?;
+        let tx = ops::begin_immediate(&self.conn)?;
+        ops::upsert_tokens(&tx, words, is_spam)?;
         tx.commit()
     }
 
@@ -224,13 +400,8 @@ impl Database {
     /// between the two would skew the corpus good/spam ratio that feeds every
     /// per-token probability.
     pub fn train_message(&self, words: &[String], is_spam: bool) -> SqlResult<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        Self::upsert_tokens(&tx, words, is_spam)?;
-        let key = if is_spam { "total_spam" } else { "total_good" };
-        tx.execute(
-            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = ?1",
-            params![key],
-        )?;
+        let tx = ops::begin_immediate(&self.conn)?;
+        ops::train(&tx, words, is_spam)?;
         tx.commit()
     }
 
@@ -250,15 +421,8 @@ impl Database {
             return Ok(());
         }
         self.conn.execute_batch("PRAGMA synchronous = FULL;")?;
-        let tx = self.conn.unchecked_transaction()?;
-        for words in messages {
-            Self::upsert_tokens(&tx, words, is_spam)?;
-        }
-        let key = if is_spam { "total_spam" } else { "total_good" };
-        tx.execute(
-            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + ?2 AS TEXT) WHERE key = ?1",
-            params![key, messages.len() as i64],
-        )?;
+        let tx = ops::begin_immediate(&self.conn)?;
+        ops::train_batch(&tx, messages, is_spam)?;
         tx.commit()
     }
 
@@ -267,165 +431,30 @@ impl Database {
     /// statement, so the token aggregates and the meta totals are a single
     /// consistent snapshot even with concurrent training on other connections.
     pub fn stats(&self, recent_secs: u64) -> SqlResult<Stats> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let cutoff = now - recent_secs as i64;
-        self.conn.query_row(
-            "SELECT COUNT(*),
-                    COALESCE(MIN(last_seen), 0),
-                    COALESCE(MAX(last_seen), 0),
-                    COALESCE(SUM(last_seen >= ?1), 0),
-                    COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'total_good'), 0),
-                    COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'total_spam'), 0)
-             FROM tokens",
-            params![cutoff],
-            |row| {
-                Ok(Stats {
-                    unique_tokens: row.get::<_, i64>(0)? as u64,
-                    last_seen_min: row.get::<_, i64>(1)? as u64,
-                    last_seen_max: row.get::<_, i64>(2)? as u64,
-                    seen_recent: row.get::<_, i64>(3)? as u64,
-                    total_good: row.get::<_, i64>(4)? as u64,
-                    total_spam: row.get::<_, i64>(5)? as u64,
-                })
-            },
-        )
+        ops::stats(&self.conn, recent_secs)
     }
 
     /// Get database statistics
     pub fn counts(&self) -> SqlResult<Counts> {
-        let unique_tokens: u64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tokens",
-            [],
-            |row| row.get::<_, i64>(0).map(|v| v as u64),
-        )?;
-
-        Ok(Counts {
-            total_good: self.total_good()?,
-            total_spam: self.total_spam()?,
-            unique_tokens,
-        })
+        ops::counts(&self.conn)
     }
 
     /// Cleanup: remove tokens with total count <= min_count or not seen in `days` days
     pub fn cleanup(&self, min_count: u64, days: u64) -> SqlResult<u64> {
-        let cutoff = if days > 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            now - (days as i64 * 86400)
-        } else {
-            0
-        };
-
-        let deleted = if days > 0 {
-            self.conn.execute(
-                "DELETE FROM tokens WHERE (good + spam) <= ?1 OR last_seen < ?2",
-                params![min_count as i64, cutoff],
-            )?
-        } else {
-            self.conn.execute(
-                "DELETE FROM tokens WHERE (good + spam) <= ?1",
-                params![min_count as i64],
-            )?
-        };
-
-        Ok(deleted as u64)
+        ops::cleanup(&self.conn, min_count, days)
     }
 
     /// Export all tokens in spamprobe-compatible CSV format:
     /// goodCount,spamCount,flags,"word"
     pub fn export<W: Write>(&self, writer: &mut W) -> Result<(), ExportError> {
-        // First line: meta counts as a special token
-        let total_good = self.total_good()?;
-        let total_spam = self.total_spam()?;
-        writeln!(writer, "{total_good},{total_spam},0,\"__total__\"")?;
-
-        let mut stmt = self
-            .conn
-            .prepare("SELECT word, good, spam FROM tokens ORDER BY word")?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as u64,
-                row.get::<_, i64>(2)? as u64,
-            ))
-        })?;
-
-        for row in rows {
-            let (word, good, spam) = row?;
-            // Skip tokens that would corrupt the CSV line format. A `"` can
-            // reach the db via a single-quoted href URL; control chars never
-            // should but cost nothing to guard. Such tokens are junk signal.
-            if word.contains('"') || word.chars().any(|c| c.is_control()) {
-                continue;
-            }
-            writeln!(writer, "{good},{spam},0,\"{word}\"")?;
-        }
-
-        Ok(())
+        ops::export(&self.conn, writer)
     }
 
     /// Import from spamprobe-compatible CSV format:
     /// goodCount,spamCount,flags,"word"
     pub fn import<R: BufRead>(&self, reader: R) -> SqlResult<u64> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let tx = self.conn.unchecked_transaction()?;
-        let mut count = 0u64;
-
-        let mut stmt = tx.prepare(
-            "INSERT INTO tokens (word, good, spam, last_seen) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(word) DO UPDATE SET good = good + ?2, spam = spam + ?3, last_seen = ?4",
-        )?;
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            // Parse: goodCount,spamCount,flags,"word"
-            if let Some((good, spam, word)) = parse_csv_line(line) {
-                if word == "__total__" {
-                    // Totals ADD, matching the token rows above (`good = good + ?2`).
-                    //
-                    // These used to be INSERT OR REPLACE, which is only correct when
-                    // importing into an empty database. Importing to MERGE a second corpus
-                    // — the obvious way to give a user extra ham coverage — kept every
-                    // merged token count but overwrote the totals with the incoming file's,
-                    // so a ham-only donor (spam=0) set the target's `total_spam` to 0 and
-                    // every message scored GOOD. Adding is correct in both cases: a restore
-                    // into an empty db is 0 + N = N.
-                    tx.execute(
-                        "INSERT INTO meta (key, value) VALUES ('total_good', ?1)
-                         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?1",
-                        params![good as i64],
-                    )?;
-                    tx.execute(
-                        "INSERT INTO meta (key, value) VALUES ('total_spam', ?1)
-                         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?1",
-                        params![spam as i64],
-                    )?;
-                } else {
-                    stmt.execute(params![word, good as i64, spam as i64, now])?;
-                    count += 1;
-                }
-            }
-        }
-
-        drop(stmt);
+        let tx = ops::begin_immediate(&self.conn)?;
+        let count = ops::import(&tx, reader)?;
         tx.commit()?;
         Ok(count)
     }

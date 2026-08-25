@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::OnceLock;
 
-use spamlite::classifier::{self, Params};
+use spamlite::scoring::{self, Params};
 use spamlite::storage::Database;
 use spamlite::tokenizer;
 
@@ -181,7 +181,7 @@ fn cmd_score() {
             e
         })?;
         let params = make_params();
-        classifier::classify(&db, &tokens, &params).map_err(|e| e.to_string())
+        scoring::classify(&db, &tokens, &params).map_err(|e| e.to_string())
     });
     match result {
         Ok(Ok((verdict, score))) => print!("{verdict} {score:.6}"),
@@ -205,32 +205,50 @@ fn cmd_score() {
 /// contract is preserved even if the training write fails. Training failures
 /// are logged to stderr but do not exit non-zero — mail delivery must not break
 /// because the classifier couldn't persist counts.
+fn receive_phase1<T, E, Tokenize, Classify>(
+    tokenize: Tokenize,
+    classify: Classify,
+) -> Result<T, &'static str>
+where
+    E: std::fmt::Display,
+    Tokenize: FnOnce() -> Vec<String> + std::panic::UnwindSafe,
+    Classify: FnOnce(Vec<String>) -> Result<T, E> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(move || classify(tokenize())) {
+        Ok(Ok(parts)) => Ok(parts),
+        Ok(Err(e)) => {
+            eprintln!("spamlite: classification error (fail-open): {e}");
+            Err(FAIL_OPEN_VERDICT)
+        }
+        Err(_) => {
+            eprintln!("spamlite: internal panic (fail-open, message scored neutral)");
+            Err(FAIL_OPEN_VERDICT)
+        }
+    }
+}
+
 fn cmd_receive() {
     let raw = read_stdin();
     let gate = TOE_GATE.get().copied().unwrap_or(TOE_GATE_DEFAULT);
 
     // Phase 1 — tokenize + classify, panic-isolated. Nothing is printed
     // inside the guarded region, so a fail-open can never double-print.
-    let classified = std::panic::catch_unwind(move || {
-        let tokens = tokenizer::tokenize_env(&raw);
-        let db = open_db();
-        let params = make_params();
-        classifier::classify(&db, &tokens, &params).map(|(verdict, score)| {
-            let is_spam = matches!(verdict, classifier::Verdict::Spam);
-            (format!("{verdict} {score:.6}"), score, is_spam, tokens, db)
-        })
-    });
+    let classified = receive_phase1(
+        move || tokenizer::tokenize_env(&raw),
+        |tokens| {
+            let db = open_db();
+            let params = make_params();
+            scoring::classify(&db, &tokens, &params).map(|(verdict, score)| {
+                let is_spam = matches!(verdict, scoring::Verdict::Spam);
+                (format!("{verdict} {score:.6}"), score, is_spam, tokens, db)
+            })
+        },
+    );
 
     let (output, score, is_spam, tokens, db) = match classified {
-        Ok(Ok(parts)) => parts,
-        Ok(Err(e)) => {
-            eprintln!("spamlite: classification error (fail-open): {e}");
-            print!("{FAIL_OPEN_VERDICT}");
-            return;
-        }
-        Err(_) => {
-            eprintln!("spamlite: internal panic (fail-open, message scored neutral)");
-            print!("{FAIL_OPEN_VERDICT}");
+        Ok(parts) => parts,
+        Err(output) => {
+            print!("{output}");
             return;
         }
     };
@@ -264,7 +282,8 @@ fn cmd_receive() {
 
 fn cmd_train(is_spam: bool) {
     let raw = read_stdin();
-    let tokens = tokenizer::tokenize_env(&raw);
+    let config = tokenizer::TokenizerConfig::from_env();
+    let tokens = tokenizer::tokenize_for_training(&raw, &config);
     let db = open_db();
     let params = make_params();
 
@@ -284,7 +303,7 @@ fn cmd_train(is_spam: bool) {
         let confident = |score: f64| if is_spam { score >= 0.9 } else { score <= 0.1 };
         let mut reps = 1;
         while reps < params.train_max_reps {
-            match classifier::classify(&db, &tokens, &params) {
+            match scoring::classify(&db, &tokens, &params) {
                 Ok((_, score)) if confident(score) => break,
                 Ok(_) => {}
                 Err(e) => {
@@ -312,7 +331,7 @@ fn cmd_explain() {
     let db = open_db_ro_or_exit();
     let params = make_params();
 
-    let expl = match classifier::classify_explain(&db, &tokens, &params) {
+    let expl = match scoring::classify_explain(&db, &tokens, &params) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("spamlite: classification error: {e}");
@@ -449,46 +468,6 @@ fn cmd_import() {
     }
 }
 
-/// Remove the filter's own label headers (X-Spam-Status, X-SpamProbe — plus
-/// their folded continuation lines) from a raw message before training. The
-/// structured tokenizer never reads these headers, but the fallback tokenizer
-/// for unparseable messages tokenizes ALL raw text — and a "SPAM"/"GOOD" label
-/// stamped by a previous classification is exactly the label leak a trainer
-/// must never learn from. Done in the binary so the safety rule cannot be
-/// forgotten by a caller (it replaces the reconciler's reconcile-strip.awk).
-fn strip_label_headers(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len());
-    let mut skipping = false;
-    let mut in_headers = true;
-    for line in raw.split_inclusive(|&b| b == b'\n') {
-        if in_headers {
-            let is_blank = line == b"\r\n" || line == b"\n";
-            if is_blank {
-                in_headers = false;
-                skipping = false;
-            } else if line[0] == b' ' || line[0] == b'\t' {
-                // Folded continuation belongs to the previous header.
-                if skipping {
-                    continue;
-                }
-            } else {
-                let lower: Vec<u8> = line
-                    .iter()
-                    .take(16)
-                    .map(|b| b.to_ascii_lowercase())
-                    .collect();
-                skipping = lower.starts_with(b"x-spam-status:")
-                    || lower.starts_with(b"x-spamprobe:");
-                if skipping {
-                    continue;
-                }
-            }
-        }
-        out.extend_from_slice(line);
-    }
-    out
-}
-
 /// Read one message file, bounded by the same cap as stdin. A file above the
 /// cap is truncated with a warning (matching the stdin path) — the prefix
 /// still carries the discriminating tokens of any real message.
@@ -622,6 +601,7 @@ fn cmd_train_dir(args: &[String]) {
     };
     let is_spam = class == "spam";
     let db = open_db_ro_or_exit();
+    let tokenizer_config = tokenizer::TokenizerConfig::from_env();
 
     let scan = list_message_files(dir);
     let mut ok = 0u64;
@@ -672,11 +652,13 @@ fn cmd_train_dir(args: &[String]) {
                 continue;
             }
         };
-        let stripped = strip_label_headers(&raw);
+        let stripped = tokenizer::strip_label_headers(&raw);
         let msgid = extract_msgid(&stripped).unwrap_or_else(|| "-".to_string());
         // Panic-isolated per message: one pathological file must not sink
         // the batch (the v0.2.0 tokenizer panic shipped that failure mode).
-        let toks = std::panic::catch_unwind(|| tokenizer::tokenize_env(&stripped));
+        let toks = std::panic::catch_unwind(|| {
+            tokenizer::tokenize_for_training(&raw, &tokenizer_config)
+        });
         match toks {
             Ok(tokens) if !tokens.is_empty() => {
                 batch_tokens += tokens.len();
@@ -925,5 +907,64 @@ fn main() {
             usage();
             process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receive_tokenizer_panic_uses_neutral_fail_open_verdict() {
+        let guarded = receive_phase1(
+            || -> Vec<String> { panic!("synthetic tokenizer panic") },
+            |_tokens| -> Result<(), &'static str> { Ok(()) },
+        );
+        assert_eq!(guarded, Err(FAIL_OPEN_VERDICT));
+    }
+
+    #[test]
+    fn release_profile_explicitly_unwinds_for_fail_open() {
+        let manifest = include_str!("../Cargo.toml");
+        let header = "[profile.release]";
+        assert_eq!(
+            manifest.lines().filter(|line| line.trim() == header).count(),
+            1,
+            "Cargo.toml must contain exactly one [profile.release] section"
+        );
+
+        let mut in_release = false;
+        let mut panic_values = Vec::new();
+        for raw in manifest.lines() {
+            let trimmed = raw.trim();
+            if trimmed == header {
+                in_release = true;
+                continue;
+            }
+            if in_release && trimmed.starts_with('[') {
+                break;
+            }
+            if !in_release {
+                continue;
+            }
+
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else { continue };
+            if key.trim() != "panic" {
+                continue;
+            }
+            if let Some(value) = value
+                .trim()
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+            {
+                panic_values.push(value);
+            }
+        }
+
+        assert_eq!(panic_values, vec!["unwind"]);
     }
 }
