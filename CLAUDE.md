@@ -3,30 +3,34 @@
 ## What This Is
 
 Per-user Bayesian spam filter in Rust. Drop-in replacement for spamprobe/bogofilter,
-integrates with Dovecot via sieve `execute`. SQLite storage, single static binary,
-cross-compiles to OpenWrt (aarch64-musl).
+integrates with Dovecot via sieve `execute`. SQLite storage with a reusable engine
+and a default-on CLI feature.
 
 ## Architecture
 
 ```
 src/
-  lib.rs          Module declarations
-  storage.rs      SQLite layer — schema, WAL mode, CRUD, export/import
-  tokenizer.rs    MIME-aware tokenizer via mail-parser, location-prefixed tokens
-  classifier.rs   Robinson-Fisher chi-squared Bayesian classifier
-  main.rs         CLI — receive, spam, good, counts, cleanup, export, import
+  lib.rs          Engine layers and classifier compatibility alias
+  storage.rs      SQLite schema + free ops + Database convenience wrapper
+  tokenizer.rs    MIME tokenizer; tokenize_for_training is the training entry
+  scoring.rs      Robinson-Fisher scoring and DB-free classify_tokens seam
+  main.rs         cli-feature binary wiring and policy
 ```
 
-All four modules are independent with clean boundaries:
+The modules have clean boundaries:
 - `tokenizer` produces `Vec<String>` from raw email bytes
-- `storage` persists token counts in SQLite
-- `classifier` combines token probabilities using Robinson-Fisher
-- `main` wires them together with CLI arg parsing
+- `tokenize_for_training` strips label headers before every supervised training path
+- `storage::schema` initialises SQLite and `storage::ops` owns the SQL
+- `scoring` combines fetched counts, with `classify_tokens` as the pure seam
+- without `cli`, the engine has no environment or configuration-file reads;
+  filesystem access is limited to SQLite and its parent directory
+- the default `cli` feature adds env/`params.toml` readers and the binaries
 
 ## Key Design Decisions
 
 - **No async, no daemon** — single-threaded CLI, one invocation per message
-- **No config file** — all tuning via `Params::default()` for now, CLI flags later
+- **Per-user tuning** — compiled `Params::default()` values sit underneath
+  `<db_dir>/params.toml` overrides provided by the `cli` feature
 - **`print!` not `println!`** for `receive` output — sieve captures stdout including newlines,
   trailing `\n` corrupts sieve variable parsing
 - **`-d DIR`** flag for per-user database path — sieve passes `/srv/{domain}/msg/{user}/.spamlite`
@@ -44,8 +48,6 @@ cargo test
 # Release (x86_64)
 cargo build --release
 
-# OpenWrt aarch64 (requires: rustup target add aarch64-unknown-linux-musl, cargo-zigbuild, zig)
-cargo zigbuild --release --target aarch64-unknown-linux-musl
 ```
 
 ## Deployment
@@ -70,7 +72,7 @@ improvement plan.
 ## Testing
 
 ```bash
-cargo test                    # 16 unit tests
+cargo test
 echo "Subject: test" | cargo run -- receive   # Quick classification test
 ```
 
@@ -79,7 +81,7 @@ echo "Subject: test" | cargo run -- receive   # Quick classification test
 - Token length bounds: 3-40 BYTES (not chars — CJK words max out at ~13 chars). Tokens outside this range are silently dropped. Bodies are additionally capped at 50k raw tokens per message.
 - SQLite WAL mode requires the `-wal` and `-shm` files to be writable by the mail user.
 - The `receive` command outputs to stdout without a trailing newline (intentional — sieve compat).
-- `mail-parser` v0.10's `received()` returns `Option<&Received>` (single), not an iterator.
+- `mail-parser` 0.11's `received()` returns `Option<&Received>` (single), not an iterator.
   Only the most recent Received header is tokenized.
 
 ## Future Work

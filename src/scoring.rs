@@ -171,6 +171,7 @@ impl Params {
     /// rail_floor = 0.95        # score a tripped message is floored to
     /// rail_require_coflag = true  # weak-tier needs a co-flag (false = pure relax)
     /// ```
+    #[cfg(feature = "cli")]
     pub fn load_overrides(&mut self, db_dir: &std::path::Path) {
         let path = db_dir.join("params.toml");
         let body = match std::fs::read_to_string(&path) {
@@ -370,7 +371,7 @@ impl Params {
 /// This is the single authoritative per-token formula — `classify`,
 /// `classify_from_counts` and `classify_explain` all route through it so they
 /// can never drift.
-fn score_token(good: u64, spam: u64, total_good: f64, total_spam: f64, p: &Params) -> f64 {
+pub fn score_token(good: u64, spam: u64, total_good: f64, total_spam: f64, p: &Params) -> f64 {
     let n = good + spam;
     if n < p.min_word_count {
         return p.new_word_score;
@@ -403,7 +404,7 @@ fn min_distance_keep(sorted: &[f64], p: &Params) -> usize {
 /// floor. Returning INDICES (not values) is what lets `classify` and
 /// `classify_explain` share this selection verbatim — explain maps the same
 /// indices back to per-token detail, so the two can never drift.
-fn select_interesting_indices(fws: &[f64], params: &Params) -> Vec<usize> {
+pub fn select_interesting_indices(fws: &[f64], params: &Params) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..fws.len()).collect();
     idx.sort_by(|&a, &b| {
         let da = (fws[a] - 0.5).abs();
@@ -420,12 +421,12 @@ fn select_interesting_indices(fws: &[f64], params: &Params) -> Vec<usize> {
 /// Result of combining per-token probabilities into a message score. The Fisher
 /// intermediates (`h_*`, `p_*`) are populated only in Fisher mode; in Geometric
 /// mode `h_spam`/`h_ham` carry the spamness/goodness nth-roots and `p_*` are 0.
-struct Combined {
-    score: f64,
-    h_spam: f64,
-    h_ham: f64,
-    p_spam: f64,
-    p_ham: f64,
+pub struct Combined {
+    pub score: f64,
+    pub h_spam: f64,
+    pub h_ham: f64,
+    pub p_spam: f64,
+    pub p_ham: f64,
 }
 
 /// Combine selected per-token probabilities into a final spam score per
@@ -471,10 +472,10 @@ fn combine(fws: &[f64], params: &Params) -> Combined {
 /// Outcome of the shared classification core: the selected interesting
 /// indices into the caller's `fws` slice, the combined result, and the
 /// thresholded verdict.
-struct Scored {
-    selected: Vec<usize>,
-    combined: Combined,
-    verdict: Verdict,
+pub struct Scored {
+    pub selected: Vec<usize>,
+    pub combined: Combined,
+    pub verdict: Verdict,
 }
 
 /// The single classification tail shared by `classify`, `classify_from_counts`
@@ -483,7 +484,7 @@ struct Scored {
 /// neutral GOOD 0.5. Sharing this (and `score_token` for the per-token step)
 /// makes agreement between the three entry points structural rather than a
 /// convention enforced by comments.
-fn score_fws(fws: &[f64], params: &Params) -> Option<Scored> {
+pub fn score_fws(fws: &[f64], params: &Params) -> Option<Scored> {
     let selected = select_interesting_indices(fws, params);
     if selected.is_empty() {
         return None;
@@ -542,7 +543,7 @@ pub struct RailHit {
 /// `known` is the same `lookup_tokens` map `classify` builds; unknown TLD tokens
 /// (absent from the map) never qualify. Presence-only for co-flags — a co-flag's
 /// own DB counts are irrelevant, only that the current message emitted one.
-fn rail_hit(
+pub fn rail_hit(
     token_words: &[String],
     known: &HashMap<String, (u64, u64)>,
     params: &Params,
@@ -589,7 +590,7 @@ fn rail_hit(
 /// `params.rail_floor` (never lowers a score already above the floor). Returns
 /// the possibly-floored score; the caller re-derives the verdict from it so the
 /// threshold comparison stays the single source of the SPAM/GOOD decision.
-fn apply_rail(base: f64, hit: &Option<RailHit>, params: &Params) -> f64 {
+pub fn apply_rail(base: f64, hit: &Option<RailHit>, params: &Params) -> f64 {
     if hit.is_some() {
         base.max(params.rail_floor)
     } else {
@@ -601,7 +602,7 @@ fn apply_rail(base: f64, hit: &Option<RailHit>, params: &Params) -> f64 {
 /// taken purely from the (possibly floored) score vs threshold; otherwise the
 /// combiner's own `base` verdict is kept. Shared by `classify` and both
 /// `classify_explain` paths so the rail can never make the two disagree.
-fn rail_verdict(base: Verdict, score: f64, hit: &Option<RailHit>, params: &Params) -> Verdict {
+pub fn rail_verdict(base: Verdict, score: f64, hit: &Option<RailHit>, params: &Params) -> Verdict {
     if hit.is_some() {
         if score >= params.threshold {
             Verdict::Spam
@@ -613,29 +614,44 @@ fn rail_verdict(base: Verdict, score: f64, hit: &Option<RailHit>, params: &Param
     }
 }
 
-/// Classify a set of tokens against the database.
-/// Returns (verdict, score) where score is 0.0 (definitely good) to 1.0 (definitely spam).
-pub fn classify(
-    db: &Database,
-    token_words: &[String],
-    params: &Params,
-) -> rusqlite::Result<(Verdict, f64)> {
-    let total_good = db.total_good()? as f64;
-    let total_spam = db.total_spam()? as f64;
+/// Full result from the pure scoring layer.
+pub struct Classified {
+    pub score: f64,
+    /// One probability per input token, in token order. This is empty when
+    /// both corpus totals are zero, matching the historical early return.
+    pub fws: Vec<f64>,
+    /// `None` when nothing survived selection, producing the neutral 0.5 base.
+    pub scored: Option<Scored>,
+    pub rail: Option<RailHit>,
+    /// ADVISORY: f64 score vs params.threshold, before any consumer adjustment.
+    /// Consumers that apply post-hoc adjustments (cold-start thresholds, bias terms,
+    /// f32 decisions) must derive their own label from `score`.
+    pub verdict: Verdict,
+}
 
-    // Need at least some training data
-    if total_good < 1.0 && total_spam < 1.0 {
-        return Ok((Verdict::Good, 0.5));
+/// Layer 2: tokens + already-fetched counts → the full decision including the
+/// rail. Pure. When both corpus totals are zero, this preserves the historical
+/// early return: GOOD 0.5 with empty `fws`, no selected score, and no rail hit.
+pub fn classify_tokens(
+    tokens: &[String],
+    known: &HashMap<String, (u64, u64)>,
+    total_good: u64,
+    total_spam: u64,
+    params: &Params,
+) -> Classified {
+    if total_good < 1 && total_spam < 1 {
+        return Classified {
+            score: 0.5,
+            fws: Vec::new(),
+            scored: None,
+            rail: None,
+            verdict: Verdict::Good,
+        };
     }
 
-    // Use 1.0 as minimum to avoid division by zero
-    let total_good = total_good.max(1.0);
-    let total_spam = total_spam.max(1.0);
-
-    // Per-token probability for every message token (known → formula, unknown →
-    // new_word_score), then the shared select/combine/threshold tail.
-    let known = db.lookup_tokens(token_words)?;
-    let fws: Vec<f64> = token_words
+    let total_good = (total_good as f64).max(1.0);
+    let total_spam = (total_spam as f64).max(1.0);
+    let fws: Vec<f64> = tokens
         .iter()
         .map(|word| match known.get(word.as_str()) {
             Some(&(good, spam)) => score_token(good, spam, total_good, total_spam, params),
@@ -643,19 +659,40 @@ pub fn classify(
         })
         .collect();
 
-    let (base_verdict, base) = match score_fws(&fws, params) {
+    let scored = score_fws(&fws, params);
+    let (base_verdict, base) = match &scored {
         Some(s) => (s.verdict, s.combined.score),
         None => (Verdict::Good, 0.5),
     };
+    let rail = rail_hit(tokens, known, params);
+    let score = apply_rail(base, &rail, params);
+    let verdict = rail_verdict(base_verdict, score, &rail, params);
 
-    // Hard-rail post-combine: a structural override for abuse-TLD mail the soft
-    // Bayesian combiner dilutes. Floors the score, then the verdict is re-derived
-    // from it. No-op (keeps the combiner's own verdict) when the rail is off or
-    // does not trip — so default behaviour is unchanged.
-    let hit = rail_hit(token_words, &known, params);
-    let score = apply_rail(base, &hit, params);
-    let verdict = rail_verdict(base_verdict, score, &hit, params);
-    Ok((verdict, score))
+    Classified {
+        score,
+        fws,
+        scored,
+        rail,
+        verdict,
+    }
+}
+
+/// Classify a set of tokens against the database.
+/// Returns (verdict, score) where score is 0.0 (definitely good) to 1.0 (definitely spam).
+pub fn classify(
+    db: &Database,
+    token_words: &[String],
+    params: &Params,
+) -> rusqlite::Result<(Verdict, f64)> {
+    let total_good = db.total_good()?;
+    let total_spam = db.total_spam()?;
+    if total_good < 1 && total_spam < 1 {
+        let classified = classify_tokens(token_words, &HashMap::new(), 0, 0, params);
+        return Ok((classified.verdict, classified.score));
+    }
+    let known = db.lookup_tokens(token_words)?;
+    let classified = classify_tokens(token_words, &known, total_good, total_spam, params);
+    Ok((classified.verdict, classified.score))
 }
 
 /// One message represented as the per-token (good_count, spam_count) pairs
@@ -666,10 +703,10 @@ pub fn classify(
 pub type CountedTokens = Vec<Option<(u64, u64)>>;
 
 /// Compute spam probability from already-fetched per-token (good, spam) counts.
-/// Math is identical to `classify`'s inner loop — the only difference is that
-/// the SQL lookup has been hoisted out so this function runs in pure CPU time.
-/// If `classify_from_counts` and `classify` ever drift, `classify` is the
-/// authoritative implementation.
+/// This counts-only entry point is deliberately rail-free: the abuse-TLD rail
+/// needs token strings to recognise `x:tld:*` and co-flag tokens, while this
+/// compact tuning representation carries counts only. With the rail disabled,
+/// its math is identical to `classify_tokens`.
 pub fn classify_from_counts(
     counts: &CountedTokens,
     total_good: u64,
@@ -760,55 +797,48 @@ pub fn classify_explain(
         rail: None,
     };
 
+    let known = if total_good_raw < 1 && total_spam_raw < 1 {
+        HashMap::new()
+    } else {
+        db.lookup_tokens(token_words)?
+    };
+    let known_count = known.len();
+    let classified = classify_tokens(
+        token_words,
+        &known,
+        total_good_raw,
+        total_spam_raw,
+        params,
+    );
+
     if total_good_raw < 1 && total_spam_raw < 1 {
         return Ok(neutral(0, 0, 0));
     }
-    let total_good = (total_good_raw as f64).max(1.0);
-    let total_spam = (total_spam_raw as f64).max(1.0);
-
-    let known = db.lookup_tokens(token_words)?;
-    let known_count = known.len();
 
     // One fw per input token — identical to `classify` — plus a parallel
     // detail slot for display. Unknown tokens and known tokens below the
     // `min_word_count` gate contribute `new_word_score` with no detail
     // (there is nothing useful to show for a fallback probability).
-    let mut fws: Vec<f64> = Vec::with_capacity(token_words.len());
     let mut details: Vec<Option<TokenDetail>> = Vec::with_capacity(token_words.len());
-    for word in token_words {
+    for (i, word) in token_words.iter().enumerate() {
         match known.get(word.as_str()) {
             Some(&(good, spam)) if good + spam >= params.min_word_count => {
-                let fw = score_token(good, spam, total_good, total_spam, params);
-                fws.push(fw);
                 details.push(Some(TokenDetail {
                     word: word.clone(),
                     good,
                     spam,
-                    fw,
+                    fw: classified.fws[i],
                 }));
             }
-            _ => {
-                fws.push(params.new_word_score);
-                details.push(None);
-            }
+            _ => details.push(None),
         }
     }
 
-    // The rail is evaluated ONCE and applied on BOTH the normal and the
-    // no-interesting-tokens paths, so `classify_explain` can never disagree with
-    // `classify` — which also rails the empty-selection base of 0.5. (Missing this
-    // on the `None` path was a real divergence: a message with an abuse-only TLD
-    // but no interesting tokens rails to SPAM in `classify` yet showed GOOD here.)
-    let hit = rail_hit(token_words, &known, params);
-
-    let Some(s) = score_fws(&fws, params) else {
-        // No interesting tokens → neutral base 0.5, then the rail applies.
-        let score = apply_rail(0.5, &hit, params);
-        let verdict = rail_verdict(Verdict::Good, score, &hit, params);
+    let Some(s) = classified.scored else {
         let mut e = neutral(total_good_raw, total_spam_raw, known_count);
-        e.verdict = verdict;
-        e.score = score;
-        e.rail = hit;
+        e.verdict = classified.verdict;
+        e.score = classified.score;
+        e.rail = classified.rail;
         return Ok(e);
     };
 
@@ -821,13 +851,9 @@ pub fn classify_explain(
         .filter_map(|&i| details[i].take())
         .collect();
 
-    // Same rail as `classify`: floor the score and re-derive the verdict.
-    let score = apply_rail(s.combined.score, &hit, params);
-    let verdict = rail_verdict(s.verdict, score, &hit, params);
-
     Ok(Explanation {
-        verdict,
-        score,
+        verdict: classified.verdict,
+        score: classified.score,
         total_good: total_good_raw,
         total_spam: total_spam_raw,
         msg_tokens: token_words.len(),
@@ -837,14 +863,14 @@ pub fn classify_explain(
         h_ham: s.combined.h_ham,
         p_spam: s.combined.p_spam,
         p_ham: s.combined.p_ham,
-        rail: hit,
+        rail: classified.rail,
     })
 }
 
 /// Chi-squared survival function (upper tail, `P(X > x)`) — NOT the CDF,
 /// despite the old name. For even `df` this is the closed-form series
 /// `exp(-x/2) * Σ (x/2)^i / i!` — exact, no approximation needed.
-fn chi2_survival(x: f64, df: usize) -> f64 {
+pub fn chi2_survival(x: f64, df: usize) -> f64 {
     if df < 2 || x <= 0.0 {
         return if x <= 0.0 { 1.0 } else { 0.0 };
     }
@@ -988,6 +1014,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cli")]
     fn test_load_overrides_rejects_out_of_range() {
         let dir = std::env::temp_dir().join(format!("spamlite-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1296,6 +1323,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cli")]
     fn test_load_overrides_rail_keys() {
         let dir = std::env::temp_dir().join(format!("spamlite-rail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use spamlite::classifier::{
+use spamlite::scoring::{
     self, classify_from_counts, CountedTokens, Params, Verdict,
 };
 use spamlite::storage::Database;
@@ -485,7 +485,7 @@ fn stratified_split(samples: Vec<Sample>, holdout: f64) -> (Vec<Sample>, Vec<Sam
         }
         let test_n = ((n as f64) * holdout).round() as usize;
         let test_n = test_n.max(1).min(n - 1).min(n);
-        let step = if test_n == 0 { usize::MAX } else { n / test_n };
+        let step = n.checked_div(test_n).unwrap_or(usize::MAX);
         let mut train = Vec::new();
         let mut test = Vec::new();
         for (i, s) in class.into_iter().enumerate() {
@@ -756,7 +756,7 @@ fn main() {
         }
         eprintln!("spamlite-tune: wrote {}/params.toml", args.db_dir.display());
     }
-    let _ = classifier::Verdict::Good; // keep `classifier` use anchored
+    let _ = scoring::Verdict::Good; // keep `scoring` use anchored
 }
 
 #[cfg(test)]

@@ -5,11 +5,9 @@ Per-user Bayesian spam filter in Rust. Drop-in replacement for
 [bogofilter](https://bogofilter.sourceforge.io/), designed to integrate
 with Dovecot via sieve `execute`.
 
-- **1.8 MB** statically-linked binary (with SQLite embedded)
 - **5-8 MB RSS** regardless of database size
 - **SQLite WAL** storage — crash-safe, no BerkeleyDB corruption
 - **Robinson-Fisher** chi-squared classifier — same proven algorithm as bogofilter and SpamAssassin
-- Cross-compiles to **OpenWrt** (aarch64-musl)
 
 ## Why
 
@@ -22,12 +20,11 @@ with hundreds of mailboxes, BDB's memory-mapped databases cause serious problems
 | 1.5 GB token database | 1.5 GB mmap per invocation | ~5 MB RSS (indexed lookups) |
 | Process crash during training | `__db.*` corruption, manual recovery | Auto-rollback on next open |
 | Concurrent classify + train | Lock contention, deadlocks | WAL mode — readers never block |
-| OpenWrt (256 MB RAM) | Fails for non-trivial databases | Works fine |
 
 bogofilter can use SQLite but lacks location-prefixed tokenization and is effectively
 unmaintained. spamlite takes the best ideas from both (Robinson-Fisher from bogofilter,
 location-prefixed tokens from [gonzofilter](https://github.com/jmhodges/gonzofilter))
-and packages them in a small, modern Rust binary.
+and packages them in a modern Rust program.
 
 ## Install
 
@@ -35,14 +32,18 @@ and packages them in a small, modern Rust binary.
 cargo install --path .
 ```
 
-### Cross-compile for OpenWrt (aarch64)
+## Library use
 
-```bash
-rustup target add aarch64-unknown-linux-musl
-cargo install cargo-zigbuild   # requires zig
-cargo zigbuild --release --target aarch64-unknown-linux-musl
-# Binary: target/aarch64-unknown-linux-musl/release/spamlite
+```toml
+spamlite = { git = "https://github.com/markc/spamlite", default-features = false }
 ```
+
+Disabling default features gives the engine — tokenizer, scoring, and storage
+operations — with no environment reads and no configuration-file reads; its
+only filesystem access is the SQLite database itself and its parent directory.
+The default `cli` feature adds the environment and `params.toml` readers plus
+all binaries. `scoring::classify_tokens` is the DB-free entry point for
+consumers that fetch token counts through their own storage layer.
 
 ## Usage
 
@@ -188,9 +189,9 @@ Bayesian filtering via sieve. spamprobe depends on BerkeleyDB, which:
   all subsequent mail delivery until manual recovery
 - Is itself orphaned — Oracle stopped maintaining BerkeleyDB
 
-On an OpenWrt-based mail gateway (GL-MT6000, aarch64, 1 GB RAM), spamprobe wasn't
-even available. bogofilter was used as a stopgap, but with equal ham/spam cutoffs
-(0.60/0.60) effectively disabling the Unsure band, and no location-prefixed tokenization.
+On one mail gateway, spamprobe was not available. bogofilter was used as a
+stopgap, but with equal ham/spam cutoffs (0.60/0.60) effectively disabling the
+Unsure band, and no location-prefixed tokenization.
 
 ### The build
 
@@ -207,20 +208,10 @@ order:
 First build: all 16 tests passed. Classification on synthetic messages:
 SPAM 0.999976, GOOD 0.000232, UNSURE 0.500000.
 
-### Cross-compilation
-
-The native x86_64 binary couldn't run on the aarch64 OpenWrt gateway. Cross-compilation
-required:
-
-- `rustup target add aarch64-unknown-linux-musl` for the Rust target
-- `zig` + `cargo-zigbuild` as the C cross-compiler (the GNU cross-compiler failed
-  with glibc/musl symbol mismatches — `open64`, `stat64`, etc. don't exist in musl)
-- Result: 1.8 MB statically-linked aarch64 binary
-
 ### Deployment
 
-On the gateway, bogofilter was gently moved aside (scripts renamed to `.bogofilter.bak`,
-not deleted) and spamlite took over:
+During the first deployment, bogofilter was gently moved aside (scripts renamed
+to `.bogofilter.bak`, not deleted) and spamlite took over:
 
 - Binary installed to `/usr/bin/spamlite`
 - New sieve scripts written for spamlite's output format
