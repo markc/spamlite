@@ -320,6 +320,28 @@ fn cmd_train(is_spam: bool) {
     }
 }
 
+fn cmd_untrain(args: &[String]) {
+    let class = match args {
+        [class] if class == "spam" || class == "good" => class.as_str(),
+        _ => {
+            eprintln!("spamlite: usage: untrain spam|good");
+            process::exit(1);
+        }
+    };
+    let raw = read_stdin();
+    let config = tokenizer::TokenizerConfig::from_env();
+    let tokens = tokenizer::tokenize_for_training(&raw, &config);
+    let db = open_db_ro_or_exit();
+    let result = db.untrain(&tokens, class == "spam").unwrap_or_else(|e| {
+        eprintln!("spamlite: untrain error: {e}");
+        process::exit(1);
+    });
+    println!(
+        "UNTRAINED {class} decremented={} stranded={}",
+        result.decremented, result.stranded
+    );
+}
+
 /// explain = classify + verbose breakdown of top interesting tokens. Read-only.
 /// Intended for debugging individual messages — e.g. "why is this ham scoring
 /// as spam?" The output shows the Robinson-corrected probability f(w) for
@@ -560,7 +582,8 @@ fn extract_msgid(raw: &[u8]) -> Option<String> {
     }
 }
 
-/// train-dir = bulk-train every message file in a directory as ONE class.
+/// train-dir = bulk-train every message file in a directory as ONE class, or
+/// correct it atomically from the class named by `--from` to the target class.
 /// Replaces the per-message exec loop (fork + db open + commit per message)
 /// with a single process and one durable transaction per chunk of
 /// `TRAIN_CHUNK` messages — chunking bounds memory (tokens are held only for
@@ -569,7 +592,8 @@ fn extract_msgid(raw: &[u8]) -> Option<String> {
 ///
 /// stdout: one TSV line per file — `ok\t<msgid|->\t<path>` for messages in a
 /// committed chunk, `err\t<reason>\t<path>` for files that could not be read
-/// or tokenized (excluded from the batch, never fatal). The msgid column is
+/// or tokenized (excluded from the batch, never fatal). Correction ok rows add
+/// `corr=<decremented>/<stranded>` as a fourth column. The msgid column is
 /// the message's identity for dedupe purposes; the path column is
 /// informational only (tab/newline sanitised, lossy for non-UTF-8 names).
 /// Each chunk's report is printed AFTER its commit, so every `ok` line ever
@@ -591,15 +615,33 @@ const TRAIN_CHUNK: usize = 500;
 /// Real mail runs well under 10k raw tokens; this only bites synthetic input.
 const TRAIN_CHUNK_TOKEN_BUDGET: usize = 1_000_000;
 
+fn match_train_dir_args(args: &[String]) -> Option<(&str, &str, Option<&str>)> {
+    match args {
+        [dir, class] if class == "spam" || class == "good" => {
+            Some((dir.as_str(), class.as_str(), None))
+        }
+        [dir, class, flag, from]
+            if (class == "spam" || class == "good")
+                && flag == "--from"
+                && (from == "spam" || from == "good")
+                && from != class =>
+        {
+            Some((dir.as_str(), class.as_str(), Some(from.as_str())))
+        }
+        _ => None,
+    }
+}
+
 fn cmd_train_dir(args: &[String]) {
-    let (dir, class) = match (args.first(), args.get(1)) {
-        (Some(d), Some(c)) if c == "spam" || c == "good" => (d.as_str(), c.as_str()),
-        _ => {
-            eprintln!("spamlite: usage: train-dir <dir> spam|good");
+    let (dir, class, from_class) = match match_train_dir_args(args) {
+        Some(parsed) => parsed,
+        None => {
+            eprintln!("spamlite: usage: train-dir <dir> spam|good [--from spam|good]");
             process::exit(1);
         }
     };
     let is_spam = class == "spam";
+    let from_spam = from_class.map(|from| from == "spam");
     let db = open_db_ro_or_exit();
     let tokenizer_config = tokenizer::TokenizerConfig::from_env();
 
@@ -622,18 +664,33 @@ fn cmd_train_dir(args: &[String]) {
                      report: &mut Vec<(bool, String, String)>,
                      ok: &mut u64,
                      failed: &mut u64| {
-        if let Err(e) = db.train_messages(batch, is_spam) {
+        let correction_results = if let Some(from_spam) = from_spam {
+            db.relabel_messages(batch, from_spam, is_spam)
+        } else {
+            db.train_messages(batch, is_spam).map(|()| Vec::new())
+        };
+        let correction_results = correction_results.unwrap_or_else(|e| {
             // Prior chunks are committed and reported — those ok lines stand.
             eprintln!(
                 "spamlite: train-dir transaction failed, this chunk NOT trained \
                  (earlier ok lines remain valid): {e}"
             );
             process::exit(1);
-        }
+        });
+        let mut correction_index = 0usize;
         for (trained, info, path) in report.iter() {
             if *trained {
                 *ok += 1;
-                println!("ok\t{info}\t{path}");
+                if from_spam.is_some() {
+                    let result = correction_results[correction_index];
+                    println!(
+                        "ok\t{info}\t{path}\tcorr={}/{}",
+                        result.decremented, result.stranded
+                    );
+                    correction_index += 1;
+                } else {
+                    println!("ok\t{info}\t{path}");
+                }
             } else {
                 *failed += 1;
                 println!("err\t{info}\t{path}");
@@ -740,8 +797,10 @@ fn cmd_msgids(args: &[String]) {
 /// stats = machine-readable database statistics, one `key value` per line.
 /// The `counts` verb stays as the human-facing view; this one is for scripts
 /// (replaces ad-hoc `sqlite3` queries against the db). `seen_30d` counts
-/// tokens trained in the last 30 days — score/receive never write last_seen,
-/// so it is an exact "own vocabulary is growing" marker.
+/// tokens touched by supervised training in the last 30 days — train,
+/// untrain and relabel all refresh last_seen; score/receive never do — so it
+/// marks recent corpus *modification*, not necessarily growth (an untrained
+/// token at count 0 still counts as recently seen until `cleanup` reaps it).
 fn cmd_stats() {
     let db = open_db_ro_or_exit();
     let s = match db.stats(30 * 86400) {
@@ -775,10 +834,15 @@ Usage:
   spamlite [-d DIR] [-t THRESHOLD] explain             Verbose token-level breakdown (debug)
   spamlite [-d DIR] spam                               Train message from stdin as spam
   spamlite [-d DIR] good                               Train message from stdin as good/ham
-  spamlite [-d DIR] train-dir <MSGDIR> spam|good       Bulk-train every file in MSGDIR (durable
+  spamlite [-d DIR] untrain spam|good                  Remove stdin message from one class
+                                                       (db must already exist)
+  spamlite [-d DIR] train-dir <MSGDIR> spam|good
+                              [--from spam|good]       Bulk-train every file in MSGDIR (durable
                                                        transaction per 500-message chunk; label
                                                        headers stripped; TSV report on stdout,
-                                                       printed post-commit; db must exist)
+                                                       printed post-commit; db must exist). With
+                                                       --from, atomically correct each message
+                                                       from the named class to the target class
   spamlite msgids <MSGDIR>                             Print msgid/from/path TSV per file
   spamlite [-d DIR] stats                              Machine-readable stats (key value lines)
   spamlite [-d DIR] counts                             Show database statistics
@@ -893,6 +957,7 @@ fn main() {
         "explain" => cmd_explain(),
         "spam" => cmd_train(true),
         "good" => cmd_train(false),
+        "untrain" => cmd_untrain(&args[1..]),
         "train-dir" => cmd_train_dir(&args[1..]),
         "msgids" => cmd_msgids(&args[1..]),
         "stats" => cmd_stats(),
@@ -921,6 +986,26 @@ mod tests {
             |_tokens| -> Result<(), &'static str> { Ok(()) },
         );
         assert_eq!(guarded, Err(FAIL_OPEN_VERDICT));
+    }
+
+    #[test]
+    fn train_dir_arg_matcher_rejects_surplus_and_equal_from_shapes() {
+        let strings = |items: &[&str]| {
+            items.iter().map(|item| (*item).to_string()).collect::<Vec<_>>()
+        };
+
+        assert!(match_train_dir_args(&strings(&["dir", "spam", "extra"])).is_none());
+        assert!(
+            match_train_dir_args(&strings(&["dir", "spam", "--from", "good", "extra"]))
+                .is_none()
+        );
+        assert!(
+            match_train_dir_args(&strings(&["dir", "spam", "--from", "spam"])).is_none()
+        );
+        assert!(match_train_dir_args(&strings(&["dir", "spam"])).is_some());
+        assert!(
+            match_train_dir_args(&strings(&["dir", "spam", "--from", "good"])).is_some()
+        );
     }
 
     #[test]
