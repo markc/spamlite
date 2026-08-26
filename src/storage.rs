@@ -61,12 +61,20 @@ pub mod schema {
     /// The engine never reads `labels` in this phase; it exists so consumers
     /// such as maild can keep per-message label bookkeeping in one shared schema.
     pub fn init(conn: &Connection) -> SqlResult<()> {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+        init_with_busy_timeout(conn, 5_000)
+    }
+
+    /// Apply the connection pragmas and initialise the version-1 schema using
+    /// `busy_timeout_ms` for every statement, including schema creation and the
+    /// initial meta rows. The timeout pragma must be first because WAL setup and
+    /// the idempotent schema statements can themselves contend with a writer.
+    pub fn init_with_busy_timeout(conn: &Connection, busy_timeout_ms: u64) -> SqlResult<()> {
+        conn.execute_batch(&format!(
+            "PRAGMA busy_timeout = {busy_timeout_ms};
+             PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = 500;
-             PRAGMA busy_timeout = 5000;",
-        )?;
+             PRAGMA cache_size = 500;"
+        ))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tokens (
@@ -104,24 +112,29 @@ pub mod schema {
     }
 }
 
-/// SQL operations for connections initialised by [`schema::init`]. Consumers
-/// that open their own [`Connection`] must call `schema::init` first; the
-/// [`Database`] wrapper always does this.
+/// SQL operations for connections initialised by [`schema::init`] or
+/// [`schema::init_with_busy_timeout`]. Consumers that open their own
+/// [`Connection`] must initialise it first; the [`Database`] wrapper always
+/// does this.
 pub mod ops {
     use super::*;
 
     /// Start a write transaction that acquires SQLite's reserved lock up front.
-    /// The connection must first be initialised by [`schema::init`] so the
-    /// required pragmas, including `busy_timeout=5000`, are installed.
+    /// The connection must first be initialised by [`schema::init`] or
+    /// [`schema::init_with_busy_timeout`] so the required pragmas are installed.
     pub fn begin_immediate(conn: &Connection) -> SqlResult<Transaction<'_>> {
         Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
     }
 
     fn get_meta(conn: &Connection, key: &str) -> SqlResult<u64> {
-        conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |row| {
-            let s: String = row.get(0)?;
-            Ok(s.parse::<u64>().unwrap_or(0))
-        })
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![key],
+            |row| {
+                let s: String = row.get(0)?;
+                Ok(s.parse::<u64>().unwrap_or(0))
+            },
+        )
     }
 
     pub fn total_good(conn: &Connection) -> SqlResult<u64> {
@@ -221,11 +234,7 @@ pub mod ops {
     /// once, floored at zero, even if every token strands. Tokens absent from
     /// the DB or already at zero are stranded; tokens emitted by an older
     /// tokenizer but absent from this stream are deliberately invisible here.
-    pub fn untrain(
-        tx: &Transaction<'_>,
-        words: &[String],
-        is_spam: bool,
-    ) -> SqlResult<Untrained> {
+    pub fn untrain(tx: &Transaction<'_>, words: &[String], is_spam: bool) -> SqlResult<Untrained> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -446,6 +455,15 @@ impl Database {
     /// newly provisioned user. A read-only command must never bring a database into
     /// existence.
     pub fn open_existing(path: &Path) -> Result<Self, String> {
+        Self::open_existing_with_busy_timeout(path, 5_000)
+    }
+
+    /// Open an existing database with `busy_timeout_ms` governing schema
+    /// initialisation as well as later operations on this connection.
+    pub fn open_existing_with_busy_timeout(
+        path: &Path,
+        busy_timeout_ms: u64,
+    ) -> Result<Self, String> {
         // The friendly error first; the OPEN flags below are the actual
         // guarantee — without SQLITE_OPEN_CREATE the open cannot conjure a
         // database even if the file vanishes between this check and the open
@@ -453,10 +471,12 @@ impl Database {
         if !path.is_file() {
             return Err(format!("no database at {}", path.display()));
         }
-        let flags = rusqlite::OpenFlags::default().difference(rusqlite::OpenFlags::SQLITE_OPEN_CREATE);
+        let flags =
+            rusqlite::OpenFlags::default().difference(rusqlite::OpenFlags::SQLITE_OPEN_CREATE);
         let conn = Connection::open_with_flags(path, flags)
             .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        schema::init(&conn).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        schema::init_with_busy_timeout(&conn, busy_timeout_ms)
+            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
         Ok(Database { conn })
     }
 
@@ -464,11 +484,17 @@ impl Database {
     /// Creates the file and its parent directories — use `open_existing` for
     /// anything that only reads.
     pub fn open(path: &Path) -> SqlResult<Self> {
+        Self::open_with_busy_timeout(path, 5_000)
+    }
+
+    /// Open (or create) a database with `busy_timeout_ms` governing schema
+    /// initialisation as well as later operations on this connection.
+    pub fn open_with_busy_timeout(path: &Path, busy_timeout_ms: u64) -> SqlResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path)?;
-        schema::init(&conn)?;
+        schema::init_with_busy_timeout(&conn, busy_timeout_ms)?;
         Ok(Database { conn })
     }
 
@@ -673,8 +699,8 @@ mod tests {
     #[test]
     fn import_merges_totals_additively() {
         let db = test_db();
-        db.train_message(&["alpha".to_string()], false).unwrap();   // 1 good
-        db.train_message(&["beta".to_string()], true).unwrap();     // 1 spam
+        db.train_message(&["alpha".to_string()], false).unwrap(); // 1 good
+        db.train_message(&["beta".to_string()], true).unwrap(); // 1 spam
         assert_eq!(db.total_good().unwrap(), 1);
         assert_eq!(db.total_spam().unwrap(), 1);
 
@@ -683,7 +709,11 @@ mod tests {
         db.import(Cursor::new(donor)).unwrap();
 
         assert_eq!(db.total_good().unwrap(), 51, "totals must add, not replace");
-        assert_eq!(db.total_spam().unwrap(), 1, "a ham-only import must NOT zero total_spam");
+        assert_eq!(
+            db.total_spam().unwrap(),
+            1,
+            "a ham-only import must NOT zero total_spam"
+        );
 
         let counts = db.lookup_tokens(&["gamma".to_string()]).unwrap();
         assert_eq!(counts.get("gamma"), Some(&(3, 0)));
@@ -775,10 +805,8 @@ mod tests {
     #[test]
     fn test_train_messages_bulk() {
         let db = test_db();
-        let msgs: Vec<Vec<String>> = vec![
-            vec!["b:one".into(), "b:two".into()],
-            vec!["b:two".into()],
-        ];
+        let msgs: Vec<Vec<String>> =
+            vec![vec!["b:one".into(), "b:two".into()], vec!["b:two".into()]];
         db.train_messages(&msgs, true).unwrap();
         assert_eq!(db.total_spam().unwrap(), 2);
         assert_eq!(db.total_good().unwrap(), 0);
@@ -800,7 +828,13 @@ mod tests {
 
         let result = db.relabel(&words, true, false).unwrap();
 
-        assert_eq!(result, Untrained { decremented: 2, stranded: 0 });
+        assert_eq!(
+            result,
+            Untrained {
+                decremented: 2,
+                stranded: 0
+            }
+        );
         assert_eq!((db.total_good().unwrap(), db.total_spam().unwrap()), (1, 0));
         let found = db.lookup_tokens(&words).unwrap();
         assert_eq!(found["b:alpha"], (1, 0));
@@ -814,7 +848,13 @@ mod tests {
 
         let result = db.relabel(&words, true, false).unwrap();
 
-        assert_eq!(result, Untrained { decremented: 0, stranded: 2 });
+        assert_eq!(
+            result,
+            Untrained {
+                decremented: 0,
+                stranded: 2
+            }
+        );
         assert_eq!((db.total_good().unwrap(), db.total_spam().unwrap()), (1, 0));
         let found = db.lookup_tokens(&words).unwrap();
         assert_eq!(found["b:alpha"], (1, 0));
@@ -826,10 +866,9 @@ mod tests {
         let db = test_db();
         let error = db.relabel(&[], true, true).unwrap_err();
         match error {
-            rusqlite::Error::InvalidParameterName(message) => assert_eq!(
-                message,
-                "relabel: from and to classes must differ"
-            ),
+            rusqlite::Error::InvalidParameterName(message) => {
+                assert_eq!(message, "relabel: from and to classes must differ")
+            }
             other => panic!("unexpected relabel error: {other}"),
         }
     }
@@ -848,7 +887,13 @@ mod tests {
 
         let result = db.untrain(&message, true).unwrap();
 
-        assert_eq!(result, Untrained { decremented: 2, stranded: 2 });
+        assert_eq!(
+            result,
+            Untrained {
+                decremented: 2,
+                stranded: 2
+            }
+        );
         assert_eq!(db.total_spam().unwrap(), 0);
     }
 
@@ -867,7 +912,13 @@ mod tests {
 
         let result = db.relabel(&current, true, false).unwrap();
 
-        assert_eq!(result, Untrained { decremented: 2, stranded: 0 });
+        assert_eq!(
+            result,
+            Untrained {
+                decremented: 2,
+                stranded: 0
+            }
+        );
         let found = db.lookup_tokens(&frozen).unwrap();
         for markup in ["b:style", "b:nbsp", "b:helvetica"] {
             assert_eq!(found[markup], (0, 1), "{markup} must remain spam-side");
@@ -893,12 +944,20 @@ mod tests {
         assert_eq!(
             results,
             vec![
-                Untrained { decremented: 1, stranded: 0 },
-                Untrained { decremented: 1, stranded: 1 },
+                Untrained {
+                    decremented: 1,
+                    stranded: 0
+                },
+                Untrained {
+                    decremented: 1,
+                    stranded: 1
+                },
             ]
         );
         assert_eq!((db.total_good().unwrap(), db.total_spam().unwrap()), (2, 0));
-        let found = db.lookup_tokens(&[first, second_corrected].concat()).unwrap();
+        let found = db
+            .lookup_tokens(&[first, second_corrected].concat())
+            .unwrap();
         assert_eq!(found["b:alpha"], (1, 0));
         assert_eq!(found["b:beta"], (1, 0));
         assert_eq!(found["b:missing"], (1, 0));
@@ -920,7 +979,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "spamlite-immediate-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         let _guard = TempDirGuard(root.clone());
         let path = root.join("db.sqlite");
@@ -934,7 +996,9 @@ mod tests {
             started_tx.send(()).unwrap();
             let attempt_at = Instant::now();
             let result = ops::begin_immediate(&db_b.conn).and_then(|tx| tx.commit());
-            done_tx.send((attempt_at, attempt_at.elapsed(), result)).unwrap();
+            done_tx
+                .send((attempt_at, attempt_at.elapsed(), result))
+                .unwrap();
         });
 
         started_rx.recv().unwrap();
@@ -974,6 +1038,159 @@ mod tests {
     }
 
     #[test]
+    fn configured_busy_timeout_is_honoured() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        struct TempDirGuard(std::path::PathBuf);
+
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "spamlite-busy-timeout-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _guard = TempDirGuard(root.clone());
+        let path = root.join("db.sqlite");
+        let holder = Database::open(&path).unwrap();
+        let short = Database::open_with_busy_timeout(&path, 500).unwrap();
+        let long = Database::open_with_busy_timeout(&path, 3_000).unwrap();
+        let holder_tx = ops::begin_immediate(&holder.conn).unwrap();
+
+        let short_started = Instant::now();
+        let short_result = ops::begin_immediate(&short.conn);
+        let short_elapsed = short_started.elapsed();
+        assert!(
+            matches!(
+                short_result,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "500 ms connection did not time out with SQLITE_BUSY"
+        );
+        assert!(
+            short_elapsed >= Duration::from_millis(450),
+            "500 ms timeout returned too early: {short_elapsed:?}"
+        );
+        assert!(
+            short_elapsed < Duration::from_millis(2_000),
+            "500 ms timeout was ignored in favour of a longer default: {short_elapsed:?}"
+        );
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let started = Instant::now();
+            let result = ops::begin_immediate(&long.conn).and_then(|tx| tx.commit());
+            done_tx.send((started.elapsed(), result)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(1_000));
+        holder_tx.commit().unwrap();
+
+        let (long_elapsed, long_result) = done_rx.recv().unwrap();
+        long_result.expect("3 second connection should outwait the held write lock");
+        assert!(
+            long_elapsed >= Duration::from_millis(900),
+            "3 second connection did not wait for the lock: {long_elapsed:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn configured_busy_timeout_applies_during_schema_init() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        struct TempDirGuard(std::path::PathBuf);
+
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "spamlite-init-busy-timeout-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _guard = TempDirGuard(root.clone());
+        let path = root.join("db.sqlite");
+        let holder = Database::open(&path).unwrap();
+
+        // A short configured timeout must apply before init's idempotent
+        // schema/meta writes, rather than inheriting schema::init's 5 seconds.
+        let short_holder_tx = ops::begin_immediate(&holder.conn).unwrap();
+        let short_started = Instant::now();
+        let short_result = Database::open_with_busy_timeout(&path, 500);
+        let short_elapsed = short_started.elapsed();
+        assert!(
+            matches!(
+                short_result,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "schema init did not time out with SQLITE_BUSY"
+        );
+        assert!(
+            short_elapsed >= Duration::from_millis(450),
+            "schema init's 500 ms timeout returned too early: {short_elapsed:?}"
+        );
+        assert!(
+            short_elapsed < Duration::from_millis(2_000),
+            "schema init ignored the configured 500 ms timeout: {short_elapsed:?}"
+        );
+        drop(short_holder_tx);
+
+        // Conversely, a 3-second constructor must keep waiting through init
+        // until a 1.5-second holder releases the reserved lock.
+        let long_holder_tx = ops::begin_immediate(&holder.conn).unwrap();
+        let path_for_thread = path.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let started = Instant::now();
+            let result = Database::open_with_busy_timeout(&path_for_thread, 3_000)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            done_tx.send((started.elapsed(), result)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert!(
+            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "schema init stopped waiting before the 1.5 second holder released"
+        );
+        long_holder_tx.commit().unwrap();
+
+        let (long_elapsed, long_result) = done_rx.recv().unwrap();
+        long_result.expect("3 second schema init should outwait the held write lock");
+        assert!(
+            long_elapsed >= Duration::from_millis(1_400),
+            "schema init did not wait for the held lock: {long_elapsed:?}"
+        );
+        assert!(
+            long_elapsed < Duration::from_millis(3_000),
+            "schema init exceeded its configured timeout: {long_elapsed:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn frozen_v090_ddl_interoperates_both_directions() {
         use crate::scoring::{classify, Params, Verdict};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -995,8 +1212,7 @@ mod tests {
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('version', '1')",
         ];
         const V090_GET_META: &str = "SELECT value FROM meta WHERE key = ?1";
-        const V090_LOOKUP_ONE: &str =
-            "SELECT word, good, spam FROM tokens WHERE word IN (?)";
+        const V090_LOOKUP_ONE: &str = "SELECT word, good, spam FROM tokens WHERE word IN (?)";
         const V090_UPSERT_GOOD: &str =
             "INSERT INTO tokens (word, good, spam, last_seen) VALUES (?1, 1, 0, ?2)
              ON CONFLICT(word) DO UPDATE SET good = good + 1, last_seen = ?2";
@@ -1006,7 +1222,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "spamlite-v090-interop-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         std::fs::create_dir_all(&root).unwrap();
 
@@ -1038,11 +1257,9 @@ mod tests {
 
         let old_binary = Connection::open(&new_path).unwrap();
         let counts: (String, i64, i64) = old_binary
-            .query_row(
-                V090_LOOKUP_ONE,
-                params!["b:legacy"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+            .query_row(V090_LOOKUP_ONE, params!["b:legacy"], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .unwrap();
         assert_eq!(counts, ("b:legacy".to_string(), 0, 1));
         let total_spam: String = old_binary
@@ -1063,7 +1280,13 @@ mod tests {
 
         let reopened = Database::open(&new_path).unwrap();
         assert_eq!(reopened.lookup_tokens(&word).unwrap()["b:legacy"], (1, 1));
-        assert_eq!((reopened.total_good().unwrap(), reopened.total_spam().unwrap()), (1, 1));
+        assert_eq!(
+            (
+                reopened.total_good().unwrap(),
+                reopened.total_spam().unwrap()
+            ),
+            (1, 1)
+        );
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1081,7 +1304,10 @@ mod tests {
         let s = db.stats(86400).unwrap();
         assert_eq!(s.total_good, 1);
         assert_eq!(s.unique_tokens, 1);
-        assert_eq!(s.seen_recent, 1, "a just-trained token is inside any sane window");
+        assert_eq!(
+            s.seen_recent, 1,
+            "a just-trained token is inside any sane window"
+        );
         assert!(s.last_seen_min > 0 && s.last_seen_max >= s.last_seen_min);
     }
 

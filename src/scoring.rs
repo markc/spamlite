@@ -446,7 +446,10 @@ fn min_distance_keep(sorted: &[f64], p: &Params) -> usize {
     if p.min_distance <= 0.0 {
         return sorted.len();
     }
-    match sorted.iter().position(|&f| (f - 0.5).abs() < p.min_distance) {
+    match sorted
+        .iter()
+        .position(|&f| (f - 0.5).abs() < p.min_distance)
+    {
         Some(pos) => pos.max(p.min_array_size).min(sorted.len()),
         None => sorted.len(),
     }
@@ -488,13 +491,18 @@ fn combine(fws: &[f64], params: &Params) -> Combined {
     let n = fws.len();
     match params.combine_mode {
         CombineMode::Fisher => {
-            let h_spam: f64 =
-                -2.0 * fws.iter().map(|&f| (1.0 - f).max(1e-200).ln()).sum::<f64>();
+            let h_spam: f64 = -2.0 * fws.iter().map(|&f| (1.0 - f).max(1e-200).ln()).sum::<f64>();
             let h_ham: f64 = -2.0 * fws.iter().map(|&f| f.max(1e-200).ln()).sum::<f64>();
             let p_spam = 1.0 - chi2_survival(h_spam, 2 * n);
             let p_ham = 1.0 - chi2_survival(h_ham, 2 * n);
             let score = ((1.0 + p_spam - p_ham) / 2.0).clamp(0.0, 1.0);
-            Combined { score, h_spam, h_ham, p_spam, p_ham }
+            Combined {
+                score,
+                h_spam,
+                h_ham,
+                p_spam,
+                p_ham,
+            }
         }
         CombineMode::Geometric => {
             // nth-root geometric mean via exp(mean(ln f)) for numerical stability
@@ -517,7 +525,13 @@ fn combine(fws: &[f64], params: &Params) -> Combined {
             } else {
                 0.5
             };
-            Combined { score, h_spam: spamness, h_ham: goodness, p_spam: 0.0, p_ham: 0.0 }
+            Combined {
+                score,
+                h_spam: spamness,
+                h_ham: goodness,
+                p_spam: 0.0,
+                p_ham: 0.0,
+            }
         }
     }
 }
@@ -618,7 +632,9 @@ pub fn rail_hit(
         if !t.starts_with("x:tld:") {
             continue;
         }
-        let Some(&(good, spam)) = known.get(t) else { continue };
+        let Some(&(good, spam)) = known.get(t) else {
+            continue;
+        };
         if good != 0 || spam < params.rail_min_spam {
             continue;
         }
@@ -856,13 +872,7 @@ pub fn classify_explain(
         db.lookup_tokens(token_words)?
     };
     let known_count = known.len();
-    let classified = classify_tokens(
-        token_words,
-        &known,
-        total_good_raw,
-        total_spam_raw,
-        params,
-    );
+    let classified = classify_tokens(token_words, &known, total_good_raw, total_spam_raw, params);
 
     if total_good_raw < 1 && total_spam_raw < 1 {
         return Ok(neutral(0, 0, 0));
@@ -1111,7 +1121,10 @@ mod tests {
 
         p.combine_mode = CombineMode::Geometric;
         let geo = combine(&fws, &p).score;
-        assert!((geo - 0.7).abs() < 1e-6, "geometric should stay ~0.7, got {geo}");
+        assert!(
+            (geo - 0.7).abs() < 1e-6,
+            "geometric should stay ~0.7, got {geo}"
+        );
 
         // Scale-invariance: same score at 20 and 200 tokens.
         let geo_20 = combine(&[0.7_f64; 20], &p).score;
@@ -1130,7 +1143,10 @@ mod tests {
         let mut fws = vec![0.3_f64; 50];
         fws.push(1.0);
         let geo = combine(&fws, &p).score;
-        assert!(geo < 0.6, "one extreme token must not saturate geometric, got {geo}");
+        assert!(
+            geo < 0.6,
+            "one extreme token must not saturate geometric, got {geo}"
+        );
     }
 
     #[test]
@@ -1184,8 +1200,12 @@ mod tests {
             db.train(&ham, false).unwrap();
         }
         // 20 spam from an abuse-only `.life` TLD (strong tier).
-        let spam_life: Vec<String> =
-            vec!["b:hello".into(), "b:agenda".into(), "b:project".into(), "x:tld:life".into()];
+        let spam_life: Vec<String> = vec![
+            "b:hello".into(),
+            "b:agenda".into(),
+            "b:project".into(),
+            "x:tld:life".into(),
+        ];
         for _ in 0..20 {
             db.inc_total_spam().unwrap();
             db.train(&spam_life, true).unwrap();
@@ -1229,7 +1249,10 @@ mod tests {
     }
 
     fn rail_on() -> Params {
-        Params { rail: true, ..Default::default() } // min_spam=2, strong_spam=15
+        Params {
+            rail: true,
+            ..Default::default()
+        } // min_spam=2, strong_spam=15
     }
 
     #[test]
@@ -1255,8 +1278,14 @@ mod tests {
         let base = classify(&db, &msg, &Params::default()).unwrap().1;
         let (v, s) = classify(&db, &msg, &rail_on()).unwrap();
         assert_eq!(s, base.max(0.95));
-        assert!(s >= 0.95 && v == Verdict::Spam, "strong tier floors without co-flag");
-        let hit = classify_explain(&db, &msg, &rail_on()).unwrap().rail.unwrap();
+        assert!(
+            s >= 0.95 && v == Verdict::Spam,
+            "strong tier floors without co-flag"
+        );
+        let hit = classify_explain(&db, &msg, &rail_on())
+            .unwrap()
+            .rail
+            .unwrap();
         assert!(hit.strong, "should be flagged strong tier");
         assert_eq!(hit.co_flag, "(none)");
     }
@@ -1274,7 +1303,10 @@ mod tests {
         // WITH a co-flag → fires, flagged weak tier.
         let (v, s) = classify(&db, &rail_msg_weak(true), &rail_on()).unwrap();
         assert!(s >= 0.95 && v == Verdict::Spam, "weak tier + co-flag fires");
-        let hit = classify_explain(&db, &rail_msg_weak(true), &rail_on()).unwrap().rail.unwrap();
+        let hit = classify_explain(&db, &rail_msg_weak(true), &rail_on())
+            .unwrap()
+            .rail
+            .unwrap();
         assert!(!hit.strong, "should be flagged weak tier");
         assert_eq!(hit.tld_token, "x:tld:work");
         assert_eq!(hit.co_flag, "x:brandmiss:apple");
@@ -1292,16 +1324,29 @@ mod tests {
             "b:project".into(),
         ];
         let base = classify(&db, &msg, &Params::default()).unwrap();
-        assert_eq!(classify(&db, &msg, &rail_on()).unwrap(), base, "ham-bearing TLD → inert");
+        assert_eq!(
+            classify(&db, &msg, &rail_on()).unwrap(),
+            base,
+            "ham-bearing TLD → inert"
+        );
     }
 
     #[test]
     fn test_rail_min_spam_floor() {
         let db = setup_rail_db(); // .life spam=20
-        // rail_min_spam above the TLD's spam count → below the floor → no fire.
-        let strict = Params { rail: true, rail_min_spam: 25, rail_strong_spam: 25, ..Default::default() };
+                                  // rail_min_spam above the TLD's spam count → below the floor → no fire.
+        let strict = Params {
+            rail: true,
+            rail_min_spam: 25,
+            rail_strong_spam: 25,
+            ..Default::default()
+        };
         let base = classify(&db, &rail_msg(), &Params::default()).unwrap();
-        assert_eq!(classify(&db, &rail_msg(), &strict).unwrap(), base, "spam below min → inert");
+        assert_eq!(
+            classify(&db, &rail_msg(), &strict).unwrap(),
+            base,
+            "spam below min → inert"
+        );
         // default (min=2) → the strong .life fires.
         assert!(classify(&db, &rail_msg(), &rail_on()).unwrap().1 >= 0.95);
     }
@@ -1319,9 +1364,17 @@ mod tests {
             "b:meeting".into(),
             "b:report".into(),
         ];
-        let demote = Params { rail: true, rail_strong_spam: 100, ..Default::default() };
+        let demote = Params {
+            rail: true,
+            rail_strong_spam: 100,
+            ..Default::default()
+        };
         let base = classify(&db, &msg, &Params::default()).unwrap();
-        assert_eq!(classify(&db, &msg, &demote).unwrap(), base, "demoted to weak, no co-flag → inert");
+        assert_eq!(
+            classify(&db, &msg, &demote).unwrap(),
+            base,
+            "demoted to weak, no co-flag → inert"
+        );
         // Same TLD WITH a co-flag fires under the raised threshold (weak path).
         assert!(classify(&db, &rail_msg(), &demote).unwrap().1 >= 0.95);
     }
@@ -1330,12 +1383,19 @@ mod tests {
     fn test_rail_pure_relax_fires_weak_tld_alone() {
         let db = setup_rail_db();
         // rail_require_coflag=false collapses tiers → weak .work fires with no co-flag.
-        let relaxed = Params { rail: true, rail_require_coflag: false, ..Default::default() };
+        let relaxed = Params {
+            rail: true,
+            rail_require_coflag: false,
+            ..Default::default()
+        };
         assert!(
             classify(&db, &rail_msg_weak(false), &relaxed).unwrap().1 >= 0.95,
             "pure relax fires on a thin TLD alone (trades away the guard)"
         );
-        let hit = classify_explain(&db, &rail_msg_weak(false), &relaxed).unwrap().rail.unwrap();
+        let hit = classify_explain(&db, &rail_msg_weak(false), &relaxed)
+            .unwrap()
+            .rail
+            .unwrap();
         assert_eq!(hit.co_flag, "(none)");
     }
 
@@ -1368,11 +1428,22 @@ mod tests {
         };
         let (cv, cs) = classify(&db, &rail_msg(), &params).unwrap();
         let expl = classify_explain(&db, &rail_msg(), &params).unwrap();
-        assert_eq!(cv, Verdict::Spam, "classify rails the empty-selection message");
+        assert_eq!(
+            cv,
+            Verdict::Spam,
+            "classify rails the empty-selection message"
+        );
         assert!(cs >= 0.95);
         assert_eq!(cv, expl.verdict, "explain must agree with classify");
-        assert!((cs - expl.score).abs() < 1e-9, "explain score {} != classify {cs}", expl.score);
-        assert!(expl.rail.is_some(), "explain must surface the rail hit on the None path");
+        assert!(
+            (cs - expl.score).abs() < 1e-9,
+            "explain score {} != classify {cs}",
+            expl.score
+        );
+        assert!(
+            expl.rail.is_some(),
+            "explain must surface the rail hit on the None path"
+        );
     }
 
     #[test]
@@ -1432,7 +1503,10 @@ mod tests {
         fn thin_corpus_is_shrunk_hard_toward_neutral() {
             let centre = centre_from_base_rate(0, 2, 0.5, &prior(true));
             assert!(centre < 0.60, "thin corpus escaped shrinkage: {centre}");
-            assert!(centre > 0.5, "spam evidence did not move the centre: {centre}");
+            assert!(
+                centre > 0.5,
+                "spam evidence did not move the centre: {centre}"
+            );
         }
 
         #[test]
@@ -1495,7 +1569,12 @@ mod tests {
             let off = classify_tokens(&tokens, &known, 50, 450, &off_params);
             let on = classify_tokens(&tokens, &known, 50, 450, &on_params);
 
-            assert!(on.score > off.score, "enabled {} <= disabled {}", on.score, off.score);
+            assert!(
+                on.score > off.score,
+                "enabled {} <= disabled {}",
+                on.score,
+                off.score
+            );
         }
 
         #[test]

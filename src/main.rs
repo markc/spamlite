@@ -77,12 +77,40 @@ fn read_stdin() -> Vec<u8> {
 /// presented in production for six weeks).
 const FAIL_OPEN_VERDICT: &str = "GOOD 0.500000";
 
+/// User-correction verbs (`good`, `spam`, `untrain`, and `train-dir`) wait up
+/// to 15 seconds for SQLite's write lock. Imapsieve permits an `execute` hook
+/// 20 seconds, leaving roughly five seconds for opening, tokenization, the
+/// transaction itself, and process teardown after a reconciler releases its
+/// chunk commit. Delivery-path `receive` and `score` retain the 5-second
+/// library default; other CLI opens do not inherit this correction budget.
+const CLI_WRITE_BUSY_TIMEOUT_MS: u64 = 15_000;
+
 fn open_db() -> Database {
     let path = db_path();
     Database::open(&path).unwrap_or_else(|e| {
         eprintln!("spamlite: failed to open database {}: {e}", path.display());
         process::exit(1);
     })
+}
+
+fn open_db_for_correction() -> Database {
+    let path = db_path();
+    Database::open_with_busy_timeout(&path, CLI_WRITE_BUSY_TIMEOUT_MS).unwrap_or_else(|e| {
+        eprintln!("spamlite: failed to open database {}: {e}", path.display());
+        process::exit(1);
+    })
+}
+
+/// Correction-write counterpart to `open_db_ro_or_exit` for verbs which must
+/// not create a missing corpus.
+fn open_db_existing_for_correction() -> Database {
+    let path = db_path();
+    Database::open_existing_with_busy_timeout(&path, CLI_WRITE_BUSY_TIMEOUT_MS).unwrap_or_else(
+        |e| {
+            eprintln!("spamlite: {e}");
+            process::exit(1);
+        },
+    )
 }
 
 /// Open for the read-only commands. Never creates the database — a mistyped `-d`
@@ -284,7 +312,7 @@ fn cmd_train(is_spam: bool) {
     let raw = read_stdin();
     let config = tokenizer::TokenizerConfig::from_env();
     let tokens = tokenizer::tokenize_for_training(&raw, &config);
-    let db = open_db();
+    let db = open_db_for_correction();
     let params = make_params();
 
     // First pass: token counts +1 AND the message total +1, atomically.
@@ -331,7 +359,7 @@ fn cmd_untrain(args: &[String]) {
     let raw = read_stdin();
     let config = tokenizer::TokenizerConfig::from_env();
     let tokens = tokenizer::tokenize_for_training(&raw, &config);
-    let db = open_db_ro_or_exit();
+    let db = open_db_existing_for_correction();
     let result = db.untrain(&tokens, class == "spam").unwrap_or_else(|e| {
         eprintln!("spamlite: untrain error: {e}");
         process::exit(1);
@@ -408,7 +436,10 @@ fn cmd_explain() {
         "  {:<44}  {:>6}  {:>6}  {:>7}  direction",
         "word", "good", "spam", "f(w)"
     );
-    println!("  {:-<44}  {:-<6}  {:-<6}  {:-<7}  ---------", "", "", "", "");
+    println!(
+        "  {:-<44}  {:-<6}  {:-<6}  {:-<7}  ---------",
+        "", "", "", ""
+    );
 
     for tok in expl.top_tokens.iter().take(display_limit) {
         // Bar: 11 cells, centre is 0.5. Left half = ham, right half = spam.
@@ -561,7 +592,13 @@ fn list_message_files(dir: &str) -> DirScan {
 fn tsv_safe(s: String) -> String {
     if s.contains(['\t', '\n', '\r']) {
         s.chars()
-            .map(|c| if matches!(c, '\t' | '\n' | '\r') { '?' } else { c })
+            .map(|c| {
+                if matches!(c, '\t' | '\n' | '\r') {
+                    '?'
+                } else {
+                    c
+                }
+            })
             .collect()
     } else {
         s
@@ -573,7 +610,11 @@ fn tsv_safe(s: String) -> String {
 fn extract_msgid(raw: &[u8]) -> Option<String> {
     let parser = mail_parser::MessageParser::default();
     let message = parser.parse(raw)?;
-    let id = message.message_id()?.trim().trim_matches(['<', '>']).to_string();
+    let id = message
+        .message_id()?
+        .trim()
+        .trim_matches(['<', '>'])
+        .to_string();
     let id: String = id.chars().filter(|c| !c.is_whitespace()).collect();
     if id.is_empty() {
         None
@@ -642,7 +683,7 @@ fn cmd_train_dir(args: &[String]) {
     };
     let is_spam = class == "spam";
     let from_spam = from_class.map(|from| from == "spam");
-    let db = open_db_ro_or_exit();
+    let db = open_db_existing_for_correction();
     let tokenizer_config = tokenizer::TokenizerConfig::from_env();
 
     let scan = list_message_files(dir);
@@ -661,9 +702,9 @@ fn cmd_train_dir(args: &[String]) {
     let mut batch_tokens = 0usize;
 
     let flush = |batch: &mut Vec<Vec<String>>,
-                     report: &mut Vec<(bool, String, String)>,
-                     ok: &mut u64,
-                     failed: &mut u64| {
+                 report: &mut Vec<(bool, String, String)>,
+                 ok: &mut u64,
+                 failed: &mut u64| {
         let correction_results = if let Some(from_spam) = from_spam {
             db.relabel_messages(batch, from_spam, is_spam)
         } else {
@@ -713,9 +754,8 @@ fn cmd_train_dir(args: &[String]) {
         let msgid = extract_msgid(&stripped).unwrap_or_else(|| "-".to_string());
         // Panic-isolated per message: one pathological file must not sink
         // the batch (the v0.2.0 tokenizer panic shipped that failure mode).
-        let toks = std::panic::catch_unwind(|| {
-            tokenizer::tokenize_for_training(&raw, &tokenizer_config)
-        });
+        let toks =
+            std::panic::catch_unwind(|| tokenizer::tokenize_for_training(&raw, &tokenizer_config));
         match toks {
             Ok(tokens) if !tokens.is_empty() => {
                 batch_tokens += tokens.len();
@@ -991,21 +1031,19 @@ mod tests {
     #[test]
     fn train_dir_arg_matcher_rejects_surplus_and_equal_from_shapes() {
         let strings = |items: &[&str]| {
-            items.iter().map(|item| (*item).to_string()).collect::<Vec<_>>()
+            items
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect::<Vec<_>>()
         };
 
         assert!(match_train_dir_args(&strings(&["dir", "spam", "extra"])).is_none());
         assert!(
-            match_train_dir_args(&strings(&["dir", "spam", "--from", "good", "extra"]))
-                .is_none()
+            match_train_dir_args(&strings(&["dir", "spam", "--from", "good", "extra"])).is_none()
         );
-        assert!(
-            match_train_dir_args(&strings(&["dir", "spam", "--from", "spam"])).is_none()
-        );
+        assert!(match_train_dir_args(&strings(&["dir", "spam", "--from", "spam"])).is_none());
         assert!(match_train_dir_args(&strings(&["dir", "spam"])).is_some());
-        assert!(
-            match_train_dir_args(&strings(&["dir", "spam", "--from", "good"])).is_some()
-        );
+        assert!(match_train_dir_args(&strings(&["dir", "spam", "--from", "good"])).is_some());
     }
 
     #[test]
@@ -1013,7 +1051,10 @@ mod tests {
         let manifest = include_str!("../Cargo.toml");
         let header = "[profile.release]";
         assert_eq!(
-            manifest.lines().filter(|line| line.trim() == header).count(),
+            manifest
+                .lines()
+                .filter(|line| line.trim() == header)
+                .count(),
             1,
             "Cargo.toml must contain exactly one [profile.release] section"
         );
@@ -1037,7 +1078,9 @@ mod tests {
             if line.is_empty() {
                 continue;
             }
-            let Some((key, value)) = line.split_once('=') else { continue };
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
             if key.trim() != "panic" {
                 continue;
             }

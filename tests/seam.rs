@@ -85,34 +85,16 @@ fn duplicated_and_zero_count_tokens_match_counts_seam() {
         new_word_score: 0.71,
         ..Default::default()
     };
-    let classified = classify_tokens(
-        &message,
-        &known,
-        total_good,
-        total_spam,
-        &params,
-    );
+    let classified = classify_tokens(&message, &known, total_good, total_spam, &params);
     let counts = message.iter().map(|t| known.get(t).copied()).collect();
     let counted = classify_from_counts(&counts, total_good, total_spam, &params);
 
     assert_eq!(classified.score.to_bits(), counted.1.to_bits());
     assert_eq!(classified.fws.len(), message.len());
-    let zero_count_fw = score_token(
-        0,
-        0,
-        total_good as f64,
-        total_spam as f64,
-        &params,
-    );
-    assert_eq!(
-        classified.fws[2].to_bits(),
-        zero_count_fw.to_bits()
-    );
+    let zero_count_fw = score_token(0, 0, total_good as f64, total_spam as f64, &params);
+    assert_eq!(classified.fws[2].to_bits(), zero_count_fw.to_bits());
     assert_eq!(zero_count_fw.to_bits(), params.unknown_prob.to_bits());
-    assert_eq!(
-        classified.fws[3].to_bits(),
-        params.new_word_score.to_bits()
-    );
+    assert_eq!(classified.fws[3].to_bits(), params.new_word_score.to_bits());
 }
 
 #[test]
@@ -145,26 +127,15 @@ fn classify_database_and_pure_seam_are_bit_identical() -> rusqlite::Result<()> {
         let total_spam = db.total_spam()?;
         for params in params_variants() {
             let via_db = classify(&db, &message, &params)?;
-            let pure = classify_tokens(
-                &message,
-                &known,
-                total_good,
-                total_spam,
-                &params,
-            );
+            let pure = classify_tokens(&message, &known, total_good, total_spam, &params);
             assert_eq!(via_db.0, pure.verdict, "pair {pair}");
             assert_eq!(via_db.1.to_bits(), pure.score.to_bits(), "pair {pair}");
 
             if !params.rail {
                 let counts = message.iter().map(|t| known.get(t).copied()).collect();
-                let count_score =
-                    classify_from_counts(&counts, total_good, total_spam, &params);
+                let count_score = classify_from_counts(&counts, total_good, total_spam, &params);
                 assert_eq!(count_score.0, pure.verdict, "pair {pair}");
-                assert_eq!(
-                    count_score.1.to_bits(),
-                    pure.score.to_bits(),
-                    "pair {pair}"
-                );
+                assert_eq!(count_score.1.to_bits(), pure.score.to_bits(), "pair {pair}");
             }
         }
     }

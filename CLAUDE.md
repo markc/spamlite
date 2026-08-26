@@ -70,6 +70,15 @@ Per-user databases live at `/srv/{domain}/msg/{user}/.spamlite/db.sqlite`. See
 the private ops docs for the full wiring and active
 improvement plan.
 
+User-correction commands (`good`, `spam`, `untrain`, and `train-dir`) use a
+15-second SQLite busy timeout so imapsieve corrections can outwait a reconciler
+chunk commit within Dovecot's 20-second execute limit. Delivery-path `receive`
+and `score`, other CLI opens, and the library default remain at 5 seconds.
+The nightly reconciler trains spam from Junk and its child mailboxes, excluding
+similar-looking siblings such as `Junkyard`; its ham source remains only the
+ripened INBOX window. mdbox candidates use the saved-time Unix epoch for the
+shared cap, and an enumeration failure skips both classes for that user.
+
 ## Testing
 
 ```bash
@@ -79,7 +88,7 @@ echo "Subject: test" | cargo run -- receive   # Quick classification test
 
 ## Things to Watch
 
-- Token length bounds: 3-40 BYTES (not chars — CJK words max out at ~13 chars). Tokens outside this range are silently dropped. Bodies are additionally capped at 50k raw tokens per message.
+- Token length bounds: 3-40 BYTES (not chars — CJK words max out at ~13 chars). Tokens outside this range are silently dropped. Bodies, including URL extraction, share a 50k raw-token cap per message.
 - SQLite WAL mode requires the `-wal` and `-shm` files to be writable by the mail user.
 - The `receive` command outputs to stdout without a trailing newline (intentional — sieve compat).
 - `mail-parser` 0.11's `received()` returns `Option<&Received>` (single), not an iterator.

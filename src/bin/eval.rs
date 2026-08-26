@@ -133,7 +133,9 @@ fn parse_args() -> Args {
                     "fisher" => scoring::CombineMode::Fisher,
                     "geometric" | "geo" | "robinson" => scoring::CombineMode::Geometric,
                     other => {
-                        eprintln!("spamlite-eval: --combine-mode must be fisher|geometric, got {other:?}");
+                        eprintln!(
+                            "spamlite-eval: --combine-mode must be fisher|geometric, got {other:?}"
+                        );
                         process::exit(2);
                     }
                 };
@@ -388,22 +390,38 @@ fn main() {
         fields.insert("min_len", tok.min_len.to_string());
         fields.insert("max_len", tok.max_len.to_string());
         fields.insert("expanded_headers", tok.expanded_headers.to_string());
-        fields.insert("ham_p50", format!("{:.6}", percentile(&all_ham_scores, 0.5)));
-        fields.insert("ham_p95", format!("{:.6}", percentile(&all_ham_scores, 0.95)));
-        fields.insert("ham_p99", format!("{:.6}", percentile(&all_ham_scores, 0.99)));
+        fields.insert(
+            "ham_p50",
+            format!("{:.6}", percentile(&all_ham_scores, 0.5)),
+        );
+        fields.insert(
+            "ham_p95",
+            format!("{:.6}", percentile(&all_ham_scores, 0.95)),
+        );
+        fields.insert(
+            "ham_p99",
+            format!("{:.6}", percentile(&all_ham_scores, 0.99)),
+        );
         fields.insert(
             "spam_p01",
             format!("{:.6}", percentile(&all_spam_scores, 0.01)),
         );
-        fields.insert("spam_p05", format!("{:.6}", percentile(&all_spam_scores, 0.05)));
-        fields.insert("spam_p50", format!("{:.6}", percentile(&all_spam_scores, 0.5)));
+        fields.insert(
+            "spam_p05",
+            format!("{:.6}", percentile(&all_spam_scores, 0.05)),
+        );
+        fields.insert(
+            "spam_p50",
+            format!("{:.6}", percentile(&all_spam_scores, 0.5)),
+        );
         fields.insert("elapsed_s", format!("{elapsed:.3}"));
         let pairs: Vec<String> = fields
             .iter()
             .map(|(k, v)| {
                 // Bare (unquoted) JSON value: a number or a boolean literal.
                 let is_number = !v.is_empty()
-                    && v.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-');
+                    && v.chars()
+                        .all(|c| c.is_ascii_digit() || c == '.' || c == '-');
                 if is_number || v == "true" || v == "false" {
                     format!("\"{k}\":{v}")
                 } else {
