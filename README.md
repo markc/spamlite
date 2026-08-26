@@ -62,7 +62,7 @@ would require persisting the trained token set per message.
 ## Usage
 
 ```
-spamlite 0.1.0 — per-user Bayesian spam filter
+spamlite 0.9.3 — per-user Bayesian spam filter
 Copyright 2026 Mark Constable <mc@netserva.org>
 MIT License — https://github.com/markc/spamlite
 
@@ -159,6 +159,13 @@ if string :is "${verdict}" "UNSURE" { fileinto "Unsure"; stop; }
 
 ### Retrain on IMAP move
 
+User-correction commands (`good`, `spam`, `untrain`, and `train-dir`) wait up
+to 15 seconds for SQLite contention. This fits inside Dovecot's 20-second sieve
+execute timeout while allowing an imapsieve correction to outwait a reconciler
+chunk commit. Delivery-path `receive` and `score`, other CLI opens, and library
+connections retain the 5-second default unless the caller requests another
+value.
+
 ```sieve
 # retrain-as-spam.sieve (triggered on COPY into Junk)
 require ["vnd.dovecot.execute", "environment", "variables", "imapsieve"];
@@ -175,13 +182,21 @@ if environment :matches "imap.user" "*@*" {
 }
 ```
 
+The nightly reconciler treats Junk and its child mailboxes as spam, in both
+Maildir and mdbox layouts. Similar-looking sibling mailboxes such as `Junkyard`
+are excluded. Its ham policy is unchanged: only messages in the ripened INBOX
+window are candidates, with the per-night class cap shared across all Junk
+sources. mdbox candidates are ordered by Dovecot's saved-time Unix epoch; if
+Junk enumeration fails, the user is skipped for both classes that night.
+
 ## Algorithm
 
 spamlite uses the Robinson-Fisher method — the same statistically-proven approach
 used by bogofilter and SpamAssassin:
 
 1. **Tokenize** — MIME-aware parsing via `mail-parser`, location-prefixed tokens
-   (`h:subject:`, `h:from:`, `b:`, `u:` for URLs), subject bigrams
+   (`h:subject:`, `h:from:`, `b:`, `u:` for URLs), subject bigrams; body words
+   and URL extraction share a 50,000 raw-token cap
 2. **Lookup** — batch `SELECT` from SQLite for message tokens
 3. **Robinson's correction** — `f(w) = (s*x + n*p(w)) / (s+n)` prevents rare tokens
    from dominating (s=1.0, x=0.5)

@@ -25,9 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use spamlite::scoring::{
-    self, classify_from_counts, CountedTokens, Params, Verdict,
-};
+use spamlite::scoring::{self, classify_from_counts, CountedTokens, Params, Verdict};
 use spamlite::storage::Database;
 use spamlite::tokenizer::{tokenize_with_config, TokenizerConfig};
 
@@ -338,12 +336,7 @@ impl EvalResult {
     }
 }
 
-fn evaluate(
-    samples: &[Sample],
-    total_good: u64,
-    total_spam: u64,
-    params: &Params,
-) -> EvalResult {
+fn evaluate(samples: &[Sample], total_good: u64, total_spam: u64, params: &Params) -> EvalResult {
     let mut r = EvalResult {
         fp: 0,
         fn_: 0,
@@ -632,7 +625,10 @@ fn main() {
             eprintln!("spamlite-tune: {e}");
             process::exit(1);
         });
-    eprintln!("spamlite-tune: cache built in {:.2}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "spamlite-tune: cache built in {:.2}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     let (train, test) = stratified_split(samples, args.holdout);
     let train_ham = train.iter().filter(|s| !s.is_spam_truth).count();
@@ -669,7 +665,8 @@ fn main() {
     //    a user's legitimate mail to catch more spam is not an improvement we accept
     //    silently, whatever the arithmetic says.
     // 3. The holdout carries enough spam to estimate a false-negative rate at all.
-    let improved = best_test.weighted_err(args.fp_weight) < baseline_test.weighted_err(args.fp_weight);
+    let improved =
+        best_test.weighted_err(args.fp_weight) < baseline_test.weighted_err(args.fp_weight);
     let no_fp_regression = best_test.fp <= baseline_test.fp;
     let enough_spam = test_spam >= args.min_test_spam;
     let generalised = improved && no_fp_regression && enough_spam;
@@ -678,7 +675,10 @@ fn main() {
     let refused = if generalised {
         String::new()
     } else if !enough_spam {
-        format!("test_spam {test_spam} < min_test_spam {}", args.min_test_spam)
+        format!(
+            "test_spam {test_spam} < min_test_spam {}",
+            args.min_test_spam
+        )
     } else if !no_fp_regression {
         format!(
             "fp regression {} -> {} (+{})",
@@ -794,7 +794,10 @@ mod tests {
         let always_ham = ev(0, 38, 0, 31_000);
         let sensible = ev(100, 10, 28, 30_900);
         for w in [1.0, 10.0] {
-            assert!(sensible.weighted_err(w) < always_ham.weighted_err(w), "w={w}");
+            assert!(
+                sensible.weighted_err(w) < always_ham.weighted_err(w),
+                "w={w}"
+            );
         }
     }
 
@@ -809,7 +812,10 @@ mod tests {
         )
         .unwrap();
 
-        let p = Params { threshold: 0.65, ..Default::default() };
+        let p = Params {
+            threshold: 0.65,
+            ..Default::default()
+        };
         write_params_toml(&dir, &p).unwrap();
         let got = fs::read_to_string(&path).unwrap();
 

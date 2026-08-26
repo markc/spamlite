@@ -200,7 +200,10 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Load a harvest JSONL file and return the msgid → Delivery map for a
 /// single user.
-fn load_deliveries<R: BufRead>(reader: R, want_user: &str) -> io::Result<HashMap<String, Delivery>> {
+fn load_deliveries<R: BufRead>(
+    reader: R,
+    want_user: &str,
+) -> io::Result<HashMap<String, Delivery>> {
     let mut map = HashMap::new();
     for line in reader.lines() {
         let line = line?;
@@ -466,7 +469,8 @@ fn main() {
             .and_then(|_| write_json_string(&mut out, conf))
             .ok();
         out.write_all(b",\"algo_error\":").ok();
-        out.write_all(if algo_err { b"true" } else { b"false" }).ok();
+        out.write_all(if algo_err { b"true" } else { b"false" })
+            .ok();
         out.write_all(b",\"msgid\":")
             .and_then(|_| write_json_string(&mut out, &msgid))
             .ok();
@@ -512,9 +516,18 @@ fn main() {
     eprintln!("# algorithm-level: raw-score confidence vs user action");
     eprintln!("# confidence bands: high_ham <= 0.2, uncertain (0.2, 0.8), high_spam >= 0.8");
     for (band, count) in [
-        ("high_ham", conf_counts.get("high_ham").copied().unwrap_or(0)),
-        ("uncertain", conf_counts.get("uncertain").copied().unwrap_or(0)),
-        ("high_spam", conf_counts.get("high_spam").copied().unwrap_or(0)),
+        (
+            "high_ham",
+            conf_counts.get("high_ham").copied().unwrap_or(0),
+        ),
+        (
+            "uncertain",
+            conf_counts.get("uncertain").copied().unwrap_or(0),
+        ),
+        (
+            "high_spam",
+            conf_counts.get("high_spam").copied().unwrap_or(0),
+        ),
     ] {
         eprintln!("#   {band}: {count}");
     }
@@ -536,7 +549,10 @@ mod tests {
     #[test]
     fn test_extract_string_handles_escaped_quote() {
         let line = r#"{"msgid":"<has\"quote>"}"#;
-        assert_eq!(extract_string(line, "msgid"), Some("<has\"quote>".to_string()));
+        assert_eq!(
+            extract_string(line, "msgid"),
+            Some("<has\"quote>".to_string())
+        );
     }
 
     #[test]

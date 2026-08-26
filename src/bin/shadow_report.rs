@@ -50,10 +50,7 @@ fn parse_args() -> Args {
     while i < argv.len() {
         match argv[i].as_str() {
             "--threshold" | "-t" => {
-                threshold = argv
-                    .get(i + 1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.6);
+                threshold = argv.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0.6);
                 i += 2;
             }
             "--json" => {
@@ -211,7 +208,10 @@ fn main() {
         return;
     }
 
-    println!("spamlite-shadow-report  ({} lines read, {} parse fails)", total_lines, parse_fails);
+    println!(
+        "spamlite-shadow-report  ({} lines read, {} parse fails)",
+        total_lines, parse_fails
+    );
     println!();
     println!("Aggregate:");
     println!("  total:          {total_n}");
@@ -242,7 +242,10 @@ fn main() {
         "  {:<32}  {:>6}  {:>6}  {:>6}  {:>7}  {:>7}  {:>9}  {:>9}",
         "user", "n", "agree", "disag", "p_spam", "c_spam", "delta_p50", "delta_p99"
     );
-    println!("  {:-<32}  {:->6}  {:->6}  {:->6}  {:->7}  {:->7}  {:->9}  {:->9}", "", "", "", "", "", "", "", "");
+    println!(
+        "  {:-<32}  {:->6}  {:->6}  {:->6}  {:->7}  {:->7}  {:->9}  {:->9}",
+        "", "", "", "", "", "", "", ""
+    );
 
     for (u, s) in &users {
         let mut deltas = s.deltas.clone();

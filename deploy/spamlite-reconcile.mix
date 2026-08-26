@@ -2,26 +2,39 @@
 -- spamlite-reconcile.mix — nightly STATE-based trainer.
 --
 -- Folder state is the label source, not imapsieve events (events lose ~97% of
--- corrections; state cannot lie — ~/.ns mbc _journal/2026-08-21 session 3):
---   spam: everything in Junk
+-- corrections; state cannot lie — operator journal 2026-08-21, session 3):
+--   spam: everything in Junk and its child mailboxes
 --   ham:  everything in INBOX older than RIPEN (survived triage) and younger
 --         than WINDOW (older mail either trained already or missed)
 --   never: Trash (deletion is not a class signal), unseen new/ mail
+-- Ham policy is deliberately unchanged: only the ripened INBOX window trains.
 --
 -- Mailbox access per user dir (auto-detected):
---   Maildir/  — direct file globs (Junk = .Junk/{cur,new}, ham = cur/ by
---               basename epoch), staged as symlinks.
+--   Maildir/  — direct file globs (Junk = .Junk/{cur,new} plus
+--               .Junk.*/{cur,new}, ham = cur/ by basename epoch), staged as
+--               symlinks.
 --   mdbox/    — via doveadm (login derived from the path:
 --               <root>/<domain>/msg/<user> -> user@domain): enumeration with
---               `doveadm fetch "uid hdr.message-id hdr.from" <query>`, ham
---               window with `savedsince/savedbefore`, selected messages
---               fetched into staging files named by uid.
+--               `doveadm mailbox list 'Junk*'`, filtered to Junk plus Junk/
+--               and Junk. children; fetch includes date.saved.unixtime so the
+--               shared cap remains oldest-first across mailboxes. Missing
+--               unixtime is warned once per user and falls back to UID order
+--               within that mailbox. Ham uses the unchanged
+--               `savedsince/savedbefore` INBOX window. Selected messages are
+--               staged under a per-mailbox UID ref.
+--               Both child markers are accepted deliberately even when the
+--               host's configured separator makes the other form look
+--               sibling-like.
 --
 -- Sidecar .spamlite/reconciled.log ("class epoch key" per line, last entry
 -- wins) makes each message train once per class. One corrective retrain is
 -- allowed on a class flip; after 2 entries a key is frozen (flip-flop guard).
--- Keys: lowercased Message-ID without <>, else f:<maildir-basename> /
--- f:<uid> (fallback keys don't survive folder moves — accepted).
+-- Keys: lowercased Message-ID without <>. Message-ID-less top-level .Junk and
+-- Maildir cur use f:<basename>; Maildir Junk children use
+-- f:<maildir-subdir>/<basename>. mdbox Junk and INBOX retain f:<uid>; mdbox
+-- Junk children use f:<mailbox>/<uid>. Existing top-level sidecar keys remain
+-- valid and are never retrained merely because child scanning is enabled.
+-- Fallback keys don't survive folder moves — accepted.
 --
 -- Rails: per-night per-class cap (default 200, oldest first, remainder next
 -- night); both classes trained each night when both have candidates (batch
@@ -32,6 +45,8 @@
 -- users whose Junk cannot be trusted as spam (the junk-as-ham sick cohort:
 -- their Junk holds their ham; ham-only reconciliation grows retention ham
 -- until their FP situation clears, then the marker comes off);
+-- enumeration fails closed per user: a Junk glob/msgids or doveadm list/fetch
+-- failure skips both classes for that night, preventing one-sided drift;
 -- WAL/shm/log chowned back to the mail user after a root run.
 --
 -- Engine: spamlite >= 0.9.2 (stats / msgids / train-dir corrections). train-dir's ok
@@ -40,8 +55,9 @@
 -- Corrective batches pass `--from <old-class>` so old counts are decremented.
 --
 -- Usage: spamlite-reconcile.mix [--dry-run] [--cap N] [--root DIR] [path-substring-filter]
+--        SPAMLITE_BIN=<path> overrides the engine binary (default /usr/local/bin/spamlite).
 
-$SL = "/usr/local/bin/spamlite"
+$SL = env("SPAMLITE_BIN", "/usr/local/bin/spamlite")
 $RIPEN = 259200
 $WINDOW = 2592000
 $CAP = 200
@@ -71,6 +87,14 @@ fn first_line($s)
   $clean = strip($s)
   if $clean == "" then return "-" end
   return split($clean, "\n")[0]
+end
+
+fn checked_glob($pattern)
+  try
+    return {ok: 1, files: glob($pattern), error: ""}
+  catch $e
+    return {ok: 0, files: [], error: $e}
+  end
 end
 
 $a = args()
@@ -179,74 +203,190 @@ while $u < len($users)
       $lines = read_lines($log)
       $li = 0
       while $li < len($lines)
-        $p = split($lines[$li], " ")
-        if len($p) >= 3 then
-          $seen[$p[2]] = $p[0]
-          $n = $cnt[$p[2]]
-          if $n == nil then
-            $n = 0
+        -- The key is the untouched remainder after class and epoch. Child
+        -- mailbox names may contain spaces, so splitting the whole line would
+        -- truncate an otherwise stable f:<mailbox>/<uid> identity.
+        $line = $lines[$li]
+        $first = pos(" ", $line)
+        if $first > 0 then
+          $tail = substr($line, $first, len($line) - $first)
+          $second = pos(" ", $tail)
+          if $second > 0 then
+            $cls = substr($line, 0, $first - 1)
+            $key = substr($tail, $second, len($tail) - $second)
+            if $key != "" then
+              $seen[$key] = $cls
+              $n = $cnt[$key]
+              if $n == nil then
+                $n = 0
+              end
+              $cnt[$key] = $n + 1
+            end
           end
-          $cnt[$p[2]] = $n + 1
         end
         $li = $li + 1
       end
     end
 
     -- ============ enumeration: candidates as "SORT|CLS|ID|BN" ============
-    -- ID: maildir = source path; mdbox = "<box> <uid>". BN: staging basename
-    -- (maildir basename sans :2,flags / uid) — the join key for key/from maps.
+    -- ID: maildir = source path; mdbox = uid. BN is an internal staging ref,
+    -- unique across contributing mailboxes and directories, and is the join
+    -- key for key/from maps. Sidecar identities are stored separately.
     $cand = []
     $key_bn = {}
     $from_bn = {}
+    $box_bn = {}
+    $key_path = {}
+    $from_path = {}
+    $fallback_path = {}
+    $skipped_junk_summary = ""
+    $missing_saved_warning = ""
+    $enumeration_failed = 0
+    $enumeration_error = ""
     $njunk = 0
     $nham = 0
+    $user_parts = split($d, "/")
+    $user_id = $user_parts[len($user_parts) - 1] .. "@" .. $user_parts[len($user_parts) - 3]
 
     if $mode == "maildir" then
       $junk = []
+      $junk_dirs = []
+      $junk_files_by_dir = {}
       if $hamonly == 0 then
-        $junk = concat(glob($d .. "/Maildir/.Junk/cur/*"), glob($d .. "/Maildir/.Junk/new/*"))
-      end
-      $inbox = []
-      $all = glob($d .. "/Maildir/cur/*")
-      $ai = 0
-      while $ai < len($all)
-        $ps = split($all[$ai], "/")
-        $b = $ps[len($ps) - 1]
-        $e = to_number(substr($b, 0, 10))
-        if $e >= $HAM_LO then
-          if $e <= $HAM_HI then
-            push($inbox, $all[$ai])
+        push($junk_dirs, $d .. "/Maildir/.Junk/cur")
+        push($junk_dirs, $d .. "/Maildir/.Junk/new")
+        $child_cur = checked_glob($d .. "/Maildir/.Junk.*/cur")
+        $child_new = checked_glob($d .. "/Maildir/.Junk.*/new")
+        if $child_cur.ok == 0 then
+          $enumeration_failed = 1
+          $enumeration_error = $child_cur.error
+        else
+          if $child_new.ok == 0 then
+            $enumeration_failed = 1
+            $enumeration_error = $child_new.error
+          else
+            $junk_dirs = concat($junk_dirs, $child_cur.files, $child_new.files)
           end
         end
-        $ai = $ai + 1
+        $jdi = 0
+        while $jdi < len($junk_dirs) and $enumeration_failed == 0
+          -- glob() answers [] for an unreadable directory exactly as it does for an
+          -- empty one; ask the kernel first so a permission problem on a Junk dir
+          -- fails the user closed instead of letting the night go ham-only.
+          if is_dir($junk_dirs[$jdi]) and not access($junk_dirs[$jdi], "rx") then
+            $enumeration_failed = 1
+            $enumeration_error = "unreadable " .. $junk_dirs[$jdi]
+            break
+          end
+          $junk_glob = checked_glob($junk_dirs[$jdi] .. "/*")
+          if $junk_glob.ok == 0 then
+            $enumeration_failed = 1
+            $enumeration_error = $junk_glob.error
+            break
+          end
+          $jfiles = $junk_glob.files
+          $junk_files_by_dir[$junk_dirs[$jdi]] = $jfiles
+          $junk = concat($junk, $jfiles)
+          $jdparts = split($junk_dirs[$jdi], "/")
+          $junk_subdir = $jdparts[len($jdparts) - 2]
+          $jfi = 0
+          while $jfi < len($jfiles)
+            $jparts = split($jfiles[$jfi], "/")
+            $jbn = $jparts[len($jparts) - 1]
+            $jfl = pos(":2,", $jbn)
+            if $jfl > 0 then
+              $jbn = substr($jbn, 0, $jfl - 1)
+            end
+            if $junk_subdir == ".Junk" then
+              $fallback_path[$jfiles[$jfi]] = "f:" .. $jbn
+            else
+              $fallback_path[$jfiles[$jfi]] = "f:" .. $junk_subdir .. "/" .. $jbn
+            end
+            $jfi = $jfi + 1
+          end
+          $jdi = $jdi + 1
+        end
+      end
+      $inbox = []
+      if $enumeration_failed == 0 then
+        $inbox_glob = checked_glob($d .. "/Maildir/cur/*")
+        if $inbox_glob.ok == 0 then
+          $enumeration_failed = 1
+          $enumeration_error = $inbox_glob.error
+        else
+          $all = $inbox_glob.files
+          $ai = 0
+          while $ai < len($all)
+            $ps = split($all[$ai], "/")
+            $b = $ps[len($ps) - 1]
+            $e = to_number(substr($b, 0, 10))
+            if $e >= $HAM_LO then
+              if $e <= $HAM_HI then
+                push($inbox, $all[$ai])
+              end
+            end
+            $ai = $ai + 1
+          end
+        end
       end
       $njunk = len($junk)
       $nham = len($inbox)
 
       -- keys via `spamlite msgids`: Junk dirs scanned whole; the inbox window
       -- is a subset of cur/, so it is staged as symlinks for its scan. A file
-      -- expunged mid-run makes msgids exit non-zero; the remaining output is
-      -- still valid, so rc is deliberately ignored.
+      -- expunged mid-run makes msgids exit non-zero; that closes this user for
+      -- the night so a partial spam scan cannot permit ham-only training.
       $scan = $STAGE .. ".scan"
       remove_dir($scan)
       mkdir($scan)
-      if len($inbox) > 0 then
-        run_argv(concat(["ln", "-s", "-t", $scan], $inbox))
+      if len($inbox) > 0 and $enumeration_failed == 0 then
+        $link_r = run_argv(concat(["ln", "-s", "-t", $scan], $inbox))
+        if $link_r.exit_code != 0 then
+          $enumeration_failed = 1
+          $enumeration_error = first_line($link_r.stderr)
+        else
+          $ifi = 0
+          while $ifi < len($inbox)
+            $iparts = split($inbox[$ifi], "/")
+            $ib = $iparts[len($iparts) - 1]
+            $ibn = $ib
+            $ifl = pos(":2,", $ibn)
+            if $ifl > 0 then
+              $ibn = substr($ibn, 0, $ifl - 1)
+            end
+            $fallback_path[$scan .. "/" .. $ib] = "f:" .. $ibn
+            $ifi = $ifi + 1
+          end
+        end
       end
       $kl = []
-      if $hamonly == 0 then
-        if len(glob($d .. "/Maildir/.Junk/cur/*")) > 0 then
-          $r = run_argv([$SL, "msgids", $d .. "/Maildir/.Junk/cur"], {timeout: 300})
-          $kl = concat($kl, split(strip($r.stdout), "\n"))
-        end
-        if len(glob($d .. "/Maildir/.Junk/new/*")) > 0 then
-          $r = run_argv([$SL, "msgids", $d .. "/Maildir/.Junk/new"], {timeout: 300})
-          $kl = concat($kl, split(strip($r.stdout), "\n"))
+      if $hamonly == 0 and $enumeration_failed == 0 then
+        $jdi = 0
+        while $jdi < len($junk_dirs) and $enumeration_failed == 0
+          if len($junk_files_by_dir[$junk_dirs[$jdi]]) > 0 then
+            $r = run_argv([$SL, "msgids", $junk_dirs[$jdi]], {timeout: 300})
+            if $r.exit_code != 0 then
+              $enumeration_failed = 1
+              $enumeration_error = first_line($r.stderr)
+            else
+              if strip($r.stdout) != "" then
+                $kl = concat($kl, split(strip($r.stdout), "\n"))
+              end
+            end
+          end
+          $jdi = $jdi + 1
         end
       end
-      if len($inbox) > 0 then
+      if len($inbox) > 0 and $enumeration_failed == 0 then
         $r = run_argv([$SL, "msgids", $scan], {timeout: 300})
-        $kl = concat($kl, split(strip($r.stdout), "\n"))
+        if $r.exit_code != 0 then
+          $enumeration_failed = 1
+          $enumeration_error = first_line($r.stderr)
+        else
+          if strip($r.stdout) != "" then
+            $kl = concat($kl, split(strip($r.stdout), "\n"))
+          end
+        end
       end
       remove_dir($scan)
       $ki = 0
@@ -264,16 +404,19 @@ while $u < len($users)
             $key = lower($p[0])
           end
           if $key == "" then
-            $key = "f:" .. $bn
+            $key = $fallback_path[$p[2]]
           end
-          $key_bn[$bn] = $key
-          $from_bn[$bn] = $p[1]
+          if $key != nil then
+            $key_path[$p[2]] = $key
+            $from_path[$p[2]] = $p[1]
+          end
         end
         $ki = $ki + 1
       end
 
       $sets = [["S", $junk], ["G", $inbox]]
       $si = 0
+      $ref_num = 0
       while $si < len($sets)
         $cls = $sets[$si][0]
         $files = $sets[$si][1]
@@ -287,7 +430,15 @@ while $u < len($users)
           if $fl > 0 then
             $bn = substr($bn, 0, $fl - 1)
           end
-          push($cand, substr($b, 0, 10) .. "|" .. $cls .. "|" .. $f .. "|" .. $bn)
+          $key_source = $f
+          if $cls == "G" then
+            $key_source = $scan .. "/" .. $b
+          end
+          $ref = "m." .. $ref_num
+          $key_bn[$ref] = $key_path[$key_source]
+          $from_bn[$ref] = $from_path[$key_source]
+          push($cand, substr($b, 0, 10) .. "|" .. $cls .. "|" .. $f .. "|" .. $ref)
+          $ref_num = $ref_num + 1
           $fi = $fi + 1
         end
         $si = $si + 1
@@ -300,16 +451,53 @@ while $u < len($users)
       $login = $ps[len($ps) - 1] .. "@" .. $ps[len($ps) - 3]
       $plans = []
       if $hamonly == 0 then
-        push($plans, ["S", "Junk", ["mailbox", "Junk"]])
+        $ml = run_argv(["doveadm", "mailbox", "list", "-u", $login, "Junk*"], {timeout: 300})
+        $boxes = []
+        if $ml.exit_code != 0 then
+          $enumeration_failed = 1
+          $enumeration_error = first_line($ml.stderr)
+        else
+          if strip($ml.stdout) != "" then
+            $boxes = split($ml.stdout, "\n")
+          end
+        end
+        $bi = 0
+        while $bi < len($boxes)
+          $junk_box = strip($boxes[$bi])
+          $is_junk_child = 0
+          if $junk_box == "Junk" then
+            $is_junk_child = 1
+          else
+            if pos("Junk/", $junk_box) == 1 or pos("Junk.", $junk_box) == 1 then
+              $is_junk_child = 1
+            end
+          end
+          if $is_junk_child == 1 then
+            push($plans, ["S", $junk_box, ["mailbox", $junk_box]])
+          else
+            if $junk_box != "" then
+              $skipped_junk_summary = $skipped_junk_summary .. " skipped-junk-sibling=" .. $junk_box
+            end
+          end
+          $bi = $bi + 1
+        end
       end
-      push($plans, ["G", "INBOX", ["mailbox", "INBOX", "savedsince", "" .. $HAM_LO, "savedbefore", "" .. $HAM_HI]])
+      if $enumeration_failed == 0 then
+        push($plans, ["G", "INBOX", ["mailbox", "INBOX", "savedsince", "" .. $HAM_LO, "savedbefore", "" .. $HAM_HI]])
+      end
       $pi = 0
-      while $pi < len($plans)
+      while $pi < len($plans) and $enumeration_failed == 0
         $cls = $plans[$pi][0]
         $box = $plans[$pi][1]
         $q = $plans[$pi][2]
-        $r = run_argv(concat(["doveadm", "fetch", "-u", $login, "uid hdr.message-id hdr.from"], $q), {timeout: 600})
+        $r = run_argv(concat(["doveadm", "fetch", "-u", $login, "uid date.saved.unixtime hdr.message-id hdr.from"], $q), {timeout: 600})
+        if $r.exit_code != 0 then
+          $enumeration_failed = 1
+          $enumeration_error = first_line($r.stderr)
+          break
+        end
         $uid = ""
+        $saved = ""
         $mid = ""
         $frm = ""
         $last = ""
@@ -325,12 +513,29 @@ while $u < len($users)
             if $uid != "" then
               $key = lower(replace(replace(replace($mid, "<", ""), ">", ""), " ", ""))
               if $key == "" then
-                $key = "f:" .. $uid
+                if $box == "Junk" or $box == "INBOX" then
+                  $key = "f:" .. $uid
+                else
+                  $key = "f:" .. $box .. "/" .. $uid
+                end
               end
-              $key_bn[$uid] = $key
-              $from_bn[$uid] = $frm
-              $z = "0000000000" .. $uid
-              push($cand, substr($z, len($z) - 10, 10) .. "|" .. $cls .. "|" .. $box .. " " .. $uid .. "|" .. $uid)
+              $ref = "" .. $pi .. "." .. $uid
+              $key_bn[$ref] = $key
+              $from_bn[$ref] = $frm
+              $box_bn[$ref] = $box
+              $saved_epoch = to_number($saved)
+              $uz = "0000000000" .. $uid
+              if $saved_epoch == nil then
+                $pz = "0000000000" .. $pi
+                $sort_key = "1." .. substr($pz, len($pz) - 10, 10) .. "." .. substr($uz, len($uz) - 10, 10)
+                if $missing_saved_warning == "" then
+                  $missing_saved_warning = "warn: no date.saved.unixtime for " .. $box .. "/" .. $uid
+                end
+              else
+                $z = "0000000000" .. $saved_epoch
+                $sort_key = "0." .. substr($z, len($z) - 10, 10) .. "." .. substr($uz, len($uz) - 10, 10)
+              end
+              push($cand, $sort_key .. "|" .. $cls .. "|" .. $uid .. "|" .. $ref)
               if $cls == "S" then
                 $njunk = $njunk + 1
               else
@@ -338,27 +543,32 @@ while $u < len($users)
               end
             end
             $uid = strip(substr($line, 5, len($line) - 5))
+            $saved = ""
             $mid = ""
             $frm = ""
             $last = ""
           else
-            if pos("hdr.message-id:", $line) == 1 then
-              $mid = strip(substr($line, 15, len($line) - 15))
-              $last = "mid"
+            if pos("date.saved.unixtime:", $line) == 1 then
+              $saved = strip(substr($line, 21, len($line) - 21))
             else
-              if pos("hdr.from:", $line) == 1 then
-                $frm = strip(substr($line, 9, len($line) - 9))
-                $last = "frm"
+              if pos("hdr.message-id:", $line) == 1 then
+                $mid = strip(substr($line, 15, len($line) - 15))
+                $last = "mid"
               else
-                if pos(" ", $line) == 1 then
-                  -- folded header continuation
-                  if $last == "mid" then
-                    $mid = $mid .. strip($line)
+                if pos("hdr.from:", $line) == 1 then
+                  $frm = strip(substr($line, 9, len($line) - 9))
+                  $last = "frm"
+                else
+                  if pos(" ", $line) == 1 then
+                    -- folded header continuation
+                    if $last == "mid" then
+                      $mid = $mid .. strip($line)
+                    end
                   end
-                end
-                if pos("\t", $line) == 1 then
-                  if $last == "mid" then
-                    $mid = $mid .. strip($line)
+                  if pos("\t", $line) == 1 then
+                    if $last == "mid" then
+                      $mid = $mid .. strip($line)
+                    end
                   end
                 end
               end
@@ -370,8 +580,16 @@ while $u < len($users)
       end
     end
 
+    if $enumeration_failed == 1 then
+      print("skip " .. $user_id .. ": enumeration failed (" .. $enumeration_error .. ") | failed=1")
+      $u = $u + 1
+      continue
+    end
+    if $missing_saved_warning != "" then
+      print($missing_saved_warning)
+    end
     if len($cand) == 0 then
-      print($d .. ": nothing in scope")
+      print($d .. ": nothing in scope" .. $skipped_junk_summary)
     else
       -- ============ policy: dedupe, flips, caps (mode-independent) ============
       $cand = sort($cand)
@@ -502,26 +720,33 @@ while $u < len($users)
             mkdir($sd)
             $stage_fail = 0
             if $mode == "maildir" then
-              $paths = []
               $xi = 0
               while $xi < len($sel)
-                push($paths, $sel[$xi][0])
+                $source = $sel[$xi][0]
+                $bn = $sel[$xi][1]
+                $link_r = run_argv(["ln", "-s", $source, $sd .. "/" .. $bn])
+                if $link_r.exit_code != 0 then
+                  $fail = $fail + 1
+                  $stage_fail = $stage_fail + 1
+                  print("stage failed " .. $bn .. ": " .. first_line($link_r.stderr))
+                end
                 $xi = $xi + 1
               end
-              run_argv(concat(["ln", "-s", "-t", $sd], $paths))
             else
               $ps = split($d, "/")
               $login = $ps[len($ps) - 1] .. "@" .. $ps[len($ps) - 3]
               $xi = 0
               while $xi < len($sel)
-                $bp = split($sel[$xi][0], " ")
-                $out = $sd .. "/" .. $sel[$xi][1]
-                $fetch_r = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $bp[0], "uid", $bp[1]], {stdout: {file: $sd .. "/raw"}})
+                $uid = $sel[$xi][0]
+                $bn = $sel[$xi][1]
+                $box = $box_bn[$bn]
+                $out = $sd .. "/" .. $bn
+                $fetch_r = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $box, "uid", $uid], {stdout: {file: $sd .. "/raw"}})
                 if $fetch_r.exit_code != 0 then
                   $cleanup_r = run_argv(["rm", "-f", $sd .. "/raw", $out])
                   $fail = $fail + 1
                   $stage_fail = $stage_fail + 1
-                  print("stage failed " .. $bp[1] .. ": " .. first_line($fetch_r.stderr))
+                  print("stage failed " .. $uid .. ": " .. first_line($fetch_r.stderr))
                   $xi = $xi + 1
                   continue
                 end
@@ -530,7 +755,7 @@ while $u < len($users)
                   $cleanup_r = run_argv(["rm", "-f", $sd .. "/raw", $out])
                   $fail = $fail + 1
                   $stage_fail = $stage_fail + 1
-                  print("stage failed " .. $bp[1] .. ": " .. first_line($strip_r.stderr))
+                  print("stage failed " .. $uid .. ": " .. first_line($strip_r.stderr))
                   $xi = $xi + 1
                   continue
                 end
@@ -619,7 +844,7 @@ while $u < len($users)
       if $DRY == 1 then
         $verb = "would-train"
       end
-      print($d .. " [" .. $modetag .. "]: junk=" .. $njunk .. " inbox-window=" .. $nham .. " | " .. $verb .. " spam=" .. $ns .. " good=" .. $ng .. " (corrective=" .. $ncorr .. " decremented=" .. $ndec .. " stranded=" .. $nstrand .. ") | already=" .. $skip_done .. " frozen=" .. $skip_frozen .. " deferred=" .. $defer .. " failed=" .. $fail)
+      print($d .. " [" .. $modetag .. "]: junk=" .. $njunk .. " inbox-window=" .. $nham .. " | " .. $verb .. " spam=" .. $ns .. " good=" .. $ng .. " (corrective=" .. $ncorr .. " decremented=" .. $ndec .. " stranded=" .. $nstrand .. ") | already=" .. $skip_done .. " frozen=" .. $skip_frozen .. " deferred=" .. $defer .. " failed=" .. $fail .. $skipped_junk_summary)
 
       -- root-run hygiene: give WAL/shm/log back to the mail user
       if $DRY == 0 then

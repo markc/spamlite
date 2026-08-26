@@ -268,7 +268,10 @@ struct Stats {
 impl Stats {
     fn record_train(&mut self, ev: &TrainEvent<'_>) {
         self.train_emitted += 1;
-        let entry = self.by_user_train.entry(ev.user.to_string()).or_insert((0, 0));
+        let entry = self
+            .by_user_train
+            .entry(ev.user.to_string())
+            .or_insert((0, 0));
         if ev.verdict == "good" {
             entry.0 += 1;
         } else {

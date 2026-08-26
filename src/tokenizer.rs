@@ -138,8 +138,8 @@ pub fn strip_label_headers(raw: &[u8]) -> Vec<u8> {
                     .take(16)
                     .map(|b| b.to_ascii_lowercase())
                     .collect();
-                skipping = lower.starts_with(b"x-spam-status:")
-                    || lower.starts_with(b"x-spamprobe:");
+                skipping =
+                    lower.starts_with(b"x-spam-status:") || lower.starts_with(b"x-spamprobe:");
                 if skipping {
                     continue;
                 }
@@ -228,12 +228,18 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
     // Received headers — split first hop from subsequent when expanded
     if config.expanded_headers {
         let mut first = true;
-        let root_headers = message.parts.first().map(|p| p.headers.as_slice()).unwrap_or(&[]);
+        let root_headers = message
+            .parts
+            .first()
+            .map(|p| p.headers.as_slice())
+            .unwrap_or(&[]);
         for header in root_headers {
             if header.name != HeaderName::Received {
                 continue;
             }
-            let HeaderValue::Received(received) = &header.value else { continue };
+            let HeaderValue::Received(received) = &header.value else {
+                continue;
+            };
             let prefix = if first { "h:hrecv:" } else { "h:hrecvx:" };
             first = false;
             if let Some(from_host) = received.from() {
@@ -328,7 +334,9 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
 
         // URLs in plain-text bodies carry the same signal as HTML hrefs —
         // text-only spam was previously losing its `u:` tokens entirely.
-        for url in extract_urls_from_text(text, config.max_len) {
+        let mut urls = extract_urls_from_text(text, config.max_len);
+        while tokens.len() < MAX_RAW_TOKENS {
+            let Some(url) = urls.next() else { break };
             if valid(&url) {
                 tokens.push(format!("u:{url}"));
             }
@@ -351,7 +359,9 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         let html = part.text_contents().unwrap_or_default();
 
         // Extract URLs from HTML before stripping
-        for url in extract_urls(html, config.max_len) {
+        let mut urls = extract_urls(html, config.max_len);
+        while tokens.len() < MAX_RAW_TOKENS {
+            let Some(url) = urls.next() else { break };
             if valid(&url) {
                 tokens.push(format!("u:{url}"));
             }
@@ -380,8 +390,8 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
 /// just the common business SLDs this cluster's senders use. Used to find the
 /// registrable domain so the bare brand label can be extracted.
 const TWO_LEVEL_SLDS: &[&str] = &[
-    "com", "net", "org", "edu", "gov", "co", "ac", "asn", "id", "or", "ne", "go",
-    "gen", "mil", "biz", "info",
+    "com", "net", "org", "edu", "gov", "co", "ac", "asn", "id", "or", "ne", "go", "gen", "mil",
+    "biz", "info",
 ];
 
 /// Decompose a DNS host into (registrable_domain, bare_brand_label).
@@ -402,8 +412,7 @@ fn decompose_host(host: &str) -> Option<(String, String)> {
     if n < 2 {
         return None;
     }
-    let two_level =
-        n >= 3 && labels[n - 1].len() == 2 && TWO_LEVEL_SLDS.contains(&labels[n - 2]);
+    let two_level = n >= 3 && labels[n - 1].len() == 2 && TWO_LEVEL_SLDS.contains(&labels[n - 2]);
     let start = if two_level { n - 3 } else { n - 2 };
     let registrable = labels[start..].join(".");
     let brand = labels[start].to_string();
@@ -417,7 +426,9 @@ fn push_addr<F: Fn(&str) -> bool>(
     valid: &F,
     config: &TokenizerConfig,
 ) {
-    let Some(email) = addr.address.as_deref() else { return };
+    let Some(email) = addr.address.as_deref() else {
+        return;
+    };
     let email_lower = email.to_lowercase();
     if valid(&email_lower) {
         tokens.push(format!("{prefix}{email_lower}"));
@@ -482,8 +493,7 @@ fn effective_tld(host: &str) -> Option<String> {
     if n < 2 {
         return None;
     }
-    let two_level =
-        n >= 3 && labels[n - 1].len() == 2 && TWO_LEVEL_SLDS.contains(&labels[n - 2]);
+    let two_level = n >= 3 && labels[n - 1].len() == 2 && TWO_LEVEL_SLDS.contains(&labels[n - 2]);
     if two_level {
         Some(format!("{}.{}", labels[n - 2], labels[n - 1]))
     } else {
@@ -584,7 +594,11 @@ fn map_math_alnum(cp: u32) -> Option<char> {
     for &s in &ALPHA_STARTS {
         if cp >= s && cp <= s + 51 {
             let off = (cp - s) as u8;
-            let base = if off < 26 { b'a' + off } else { b'a' + (off - 26) };
+            let base = if off < 26 {
+                b'a' + off
+            } else {
+                b'a' + (off - 26)
+            };
             return Some(base as char);
         }
     }
@@ -691,7 +705,10 @@ fn emit_auth_tokens(tokens: &mut Vec<String>, ar: &str) {
         let needle = format!("{method}=");
         if let Some(idx) = ar.find(&needle) {
             let after = &ar[idx + needle.len()..];
-            let val: String = after.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+            let val: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect();
             if !val.is_empty() {
                 tokens.push(format!("x:auth:{method}_{val}"));
             }
@@ -727,44 +744,52 @@ fn extract_words(text: &str) -> impl Iterator<Item = String> + '_ {
 
 /// Extract URLs from HTML content (href and src attributes) in a single
 /// left-to-right scan, accepting either quote style.
-fn extract_urls(html: &str, max_len: usize) -> Vec<String> {
-    let mut urls = Vec::new();
+fn find_url_attribute(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    for pos in 0..bytes.len() {
+        if bytes[pos..].starts_with(b"href=") {
+            return Some((pos, 5));
+        }
+        if bytes[pos..].starts_with(b"src=") {
+            return Some((pos, 4));
+        }
+    }
+    None
+}
+
+fn extract_urls(html: &str, max_len: usize) -> impl Iterator<Item = String> + '_ {
     let mut rest = html;
-    loop {
-        let (pos, attr_len) = match (rest.find("href="), rest.find("src=")) {
-            (Some(h), Some(s)) if h < s => (h, 5),
-            (Some(h), None) => (h, 5),
-            (_, Some(s)) => (s, 4),
-            (None, None) => break,
-        };
+    std::iter::from_fn(move || loop {
+        let (pos, attr_len) = find_url_attribute(rest)?;
         rest = &rest[pos + attr_len..];
         let quote = match rest.chars().next() {
             Some(q @ ('"' | '\'')) => q,
             _ => continue, // unquoted or truncated attribute — keep scanning
         };
         rest = &rest[1..];
-        let Some(end) = rest.find(quote) else { continue };
+        let Some(end) = rest.find(quote) else {
+            continue;
+        };
         let url = &rest[..end];
+        rest = &rest[end..];
         if url.starts_with("http://") || url.starts_with("https://") {
             // Normalize: lowercase, strip tracking params, keep domain+path
             let normalized = normalize_url(url, max_len);
             if !normalized.is_empty() {
-                urls.push(normalized);
+                return Some(normalized);
             }
         }
-        rest = &rest[end..];
-    }
-    urls
+    })
 }
 
 /// Extract URLs from plain text — scan for http(s):// runs terminated by
 /// whitespace or characters that can't appear in a sane URL. Same
 /// normalization as the HTML path so text and HTML mail produce identical
 /// `u:` tokens for the same link.
-fn extract_urls_from_text(text: &str, max_len: usize) -> Vec<String> {
-    let mut urls = Vec::new();
+fn extract_urls_from_text(text: &str, max_len: usize) -> impl Iterator<Item = String> + '_ {
     let mut search = text;
-    while let Some(pos) = search.find("http") {
+    std::iter::from_fn(move || loop {
+        let pos = search.find("http")?;
         search = &search[pos..];
         let rest = if let Some(r) = search.strip_prefix("https://") {
             r
@@ -784,21 +809,30 @@ fn extract_urls_from_text(text: &str, max_len: usize) -> Vec<String> {
         if end > 0 {
             let url = &search[..scheme_len + end];
             let normalized = normalize_url(url, max_len);
+            search = &rest[end..];
             if !normalized.is_empty() {
-                urls.push(normalized);
+                return Some(normalized);
             }
+        } else {
+            search = &rest[end..];
         }
-        search = &rest[end..];
-    }
-    urls
+    })
 }
 
 /// Normalize a URL for tokenization — keep scheme+host+path, drop query
 fn normalize_url(url: &str, max_len: usize) -> String {
-    let url = url.to_lowercase();
-    // Strip query string and fragment
+    // Bound allocation before lowercasing. The final token cannot use bytes
+    // beyond max_len, and a 4x prefix leaves room for Unicode case-fold
+    // expansion without materialising an attacker-controlled multi-MiB URL.
+    let mut bounded_end = url.len().min(max_len.saturating_mul(4));
+    while bounded_end > 0 && !url.is_char_boundary(bounded_end) {
+        bounded_end -= 1;
+    }
+    let url = &url[..bounded_end];
+    // Strip query string and fragment before allocating the lowercase copy.
     let cut = url.find(['?', '#']).unwrap_or(url.len());
     let url = &url[..cut];
+    let url = url.to_lowercase();
     // Truncate to max token length, respecting char boundaries for multi-byte UTF-8
     if url.len() > max_len {
         let mut end = max_len;
@@ -833,21 +867,26 @@ mod tests {
 
         let stripped = strip_label_headers(email);
         let stripped_fallback = tokenize_fallback(&stripped, &config);
-        assert!(!stripped_fallback.iter().any(|t| {
-            t.contains("spam-status") || t.contains("spamprobe") || t.contains("0.99")
-        }), "label token leaked after stripping: {stripped_fallback:?}");
+        assert!(
+            !stripped_fallback.iter().any(|t| {
+                t.contains("spam-status") || t.contains("spamprobe") || t.contains("0.99")
+            }),
+            "label token leaked after stripping: {stripped_fallback:?}"
+        );
 
         // Exercise the same strip-then-tokenize helper as the public training
         // entry point, injecting the fallback path so deleting the strip call
         // makes this regression test fail.
-        let trained_fallback =
-            tokenize_for_training_with(email, &config, tokenize_fallback);
+        let trained_fallback = tokenize_for_training_with(email, &config, tokenize_fallback);
         assert_eq!(trained_fallback, stripped_fallback);
 
         let trained = tokenize_for_training(email, &config);
-        assert!(!trained.iter().any(|t| {
-            t.contains("spam-status") || t.contains("spamprobe") || t.contains("0.99")
-        }), "label token leaked into public training path: {trained:?}");
+        assert!(
+            !trained.iter().any(|t| {
+                t.contains("spam-status") || t.contains("spamprobe") || t.contains("0.99")
+            }),
+            "label token leaked into public training path: {trained:?}"
+        );
         // The other direction of the mail-parser contract this guard leans on:
         // a label-carrying message is header-bearing and therefore parses to
         // `Some` — it never reaches the fallback through the public path. If a
@@ -880,7 +919,8 @@ mod tests {
 
     #[test]
     fn test_extract_words() {
-        let words: Vec<String> = extract_words("Hello World! This is a TEST-email_token.").collect();
+        let words: Vec<String> =
+            extract_words("Hello World! This is a TEST-email_token.").collect();
         assert!(words.contains(&"hello".to_string()));
         assert!(words.contains(&"world".to_string()));
         assert!(words.contains(&"test-email_token".to_string()));
@@ -889,14 +929,14 @@ mod tests {
     #[test]
     fn test_extract_urls() {
         let html = r#"<a href="https://example.com/page">click</a>"#;
-        let urls = extract_urls(html, MAX_TOKEN_LEN);
+        let urls: Vec<String> = extract_urls(html, MAX_TOKEN_LEN).collect();
         assert_eq!(urls, vec!["https://example.com/page"]);
     }
 
     #[test]
     fn test_extract_urls_mixed_quotes_document_order() {
         let html = r#"<img src='https://cdn.spam.biz/pix.gif'><a href="https://example.com/go">x</a> <a href=unquoted>y</a>"#;
-        let urls = extract_urls(html, MAX_TOKEN_LEN);
+        let urls: Vec<String> = extract_urls(html, MAX_TOKEN_LEN).collect();
         assert_eq!(
             urls,
             vec!["https://cdn.spam.biz/pix.gif", "https://example.com/go"]
@@ -917,6 +957,85 @@ mod tests {
             tokens.len() <= MAX_RAW_TOKENS + 100,
             "cap not enforced: {} tokens",
             tokens.len()
+        );
+    }
+
+    #[test]
+    fn test_token_cap_bounds_pathological_html_urls() {
+        let mut body = String::with_capacity(4 << 20);
+        // One element keeps this focused on 60k href attributes rather than
+        // benchmarking the downstream HTML renderer on 60k DOM nodes.
+        body.push_str("<a ");
+        for i in 0..(MAX_RAW_TOKENS + 10_000) {
+            body.push_str(&format!("href=\"https://host.invalid/{i:06}\" "));
+        }
+        body.push_str(">link</a>");
+        let email =
+            format!("From: x@y.test\r\nSubject: s\r\nContent-Type: text/html\r\n\r\n{body}");
+        let tokens = tokenize(email.as_bytes());
+        assert!(
+            tokens.len() <= MAX_RAW_TOKENS + 100,
+            "HTML URL cap not enforced: {} tokens",
+            tokens.len()
+        );
+    }
+
+    #[test]
+    fn test_token_cap_bounds_pathological_text_urls() {
+        let mut body = String::with_capacity(2 << 20);
+        for i in 0..(MAX_RAW_TOKENS + 10_000) {
+            body.push_str(&format!("https://host.invalid/{i:06} "));
+        }
+        let email =
+            format!("From: x@y.test\r\nSubject: s\r\nContent-Type: text/plain\r\n\r\n{body}");
+        let tokens = tokenize(email.as_bytes());
+        assert!(
+            tokens.len() <= MAX_RAW_TOKENS + 100,
+            "plain-text URL cap not enforced: {} tokens",
+            tokens.len()
+        );
+    }
+
+    #[test]
+    fn test_invalid_html_urls_do_not_spend_token_budget() {
+        let mut body = String::with_capacity(2 << 20);
+        body.push_str("<a ");
+        for _ in 0..(MAX_RAW_TOKENS + 1_000) {
+            body.push_str("href=\"http://x\" ");
+        }
+        body.push_str("href=\"https://host.invalid/long-valid-path\">link</a>");
+        let email = format!("Subject: s\r\nContent-Type: text/html\r\n\r\n{body}");
+        let config = TokenizerConfig {
+            min_len: 20,
+            ..Default::default()
+        };
+        let tokens = tokenize_with_config(email.as_bytes(), &config);
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t == "u:https://host.invalid/long-valid-path"),
+            "later valid HTML URL was dropped: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_text_urls_do_not_spend_token_budget() {
+        let mut body = String::with_capacity(1 << 20);
+        for _ in 0..(MAX_RAW_TOKENS + 1_000) {
+            body.push_str("http://x ");
+        }
+        body.push_str("https://host.invalid/long-valid-path");
+        let email = format!("Subject: s\r\nContent-Type: text/plain\r\n\r\n{body}");
+        let config = TokenizerConfig {
+            min_len: 20,
+            ..Default::default()
+        };
+        let tokens = tokenize_with_config(email.as_bytes(), &config);
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t == "u:https://host.invalid/long-valid-path"),
+            "later valid plain-text URL was dropped: {tokens:?}"
         );
     }
 
@@ -947,9 +1066,13 @@ mod tests {
 
     #[test]
     fn test_extract_urls_from_text() {
-        let text = "Visit https://example.com/page?x=1 or http://spam.biz/buy now.\nNot a url: httpfoo";
-        let urls = extract_urls_from_text(text, MAX_TOKEN_LEN);
-        assert_eq!(urls, vec!["https://example.com/page", "http://spam.biz/buy"]);
+        let text =
+            "Visit https://example.com/page?x=1 or http://spam.biz/buy now.\nNot a url: httpfoo";
+        let urls: Vec<String> = extract_urls_from_text(text, MAX_TOKEN_LEN).collect();
+        assert_eq!(
+            urls,
+            vec!["https://example.com/page", "http://spam.biz/buy"]
+        );
     }
 
     #[test]
@@ -957,7 +1080,7 @@ mod tests {
         // The exact production URL shape that panicked v0.2.0 (byte index 40
         // inside '圳'). Must truncate at a char boundary, never panic.
         let text = "click http://a.spread48.com/74987-2139538/深圳思齐软件有限公司.newsletter/forward.aspx now";
-        let urls = extract_urls_from_text(text, MAX_TOKEN_LEN);
+        let urls: Vec<String> = extract_urls_from_text(text, MAX_TOKEN_LEN).collect();
         assert_eq!(urls.len(), 1);
         assert!(urls[0].len() <= MAX_TOKEN_LEN);
         assert!(urls[0].starts_with("http://a.spread48.com/"));
@@ -1058,6 +1181,38 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_url_bounds_large_input_without_changing_token() {
+        fn unbounded_reference(url: &str, max_len: usize) -> String {
+            let cut = url.find(['?', '#']).unwrap_or(url.len());
+            let lowered = url[..cut].to_lowercase();
+            if lowered.len() <= max_len {
+                return lowered;
+            }
+            let mut end = max_len;
+            while end > 0 && !lowered.is_char_boundary(end) {
+                end -= 1;
+            }
+            lowered[..end].to_string()
+        }
+
+        let prefix_limit = MAX_TOKEN_LEN * 4;
+        let mut boundary = "https://host.invalid/".to_string();
+        boundary.push_str(&"A".repeat(prefix_limit - boundary.len()));
+        assert_eq!(boundary.len(), prefix_limit);
+        assert_eq!(
+            normalize_url(&boundary, MAX_TOKEN_LEN),
+            unbounded_reference(&boundary, MAX_TOKEN_LEN)
+        );
+
+        let mut huge = boundary.clone();
+        huge.push_str(&"Z".repeat(1 << 20));
+        assert_eq!(
+            normalize_url(&huge, MAX_TOKEN_LEN),
+            normalize_url(&huge[..prefix_limit], MAX_TOKEN_LEN)
+        );
+    }
+
+    #[test]
     fn test_decompose_host() {
         assert_eq!(
             decompose_host("partners.intrepidtravel.com"),
@@ -1092,8 +1247,14 @@ mod tests {
         let tokens = tokenize(email);
         assert!(tokens.iter().any(|t| t == "h:from:stay@orh.outrigger.com"));
         assert!(tokens.iter().any(|t| t == "h:from:orh.outrigger.com"));
-        assert!(tokens.iter().any(|t| t == "h:from:outrigger.com"), "registrable anchor missing: {tokens:?}");
-        assert!(tokens.iter().any(|t| t == "h:from:outrigger"), "brand anchor missing: {tokens:?}");
+        assert!(
+            tokens.iter().any(|t| t == "h:from:outrigger.com"),
+            "registrable anchor missing: {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "h:from:outrigger"),
+            "brand anchor missing: {tokens:?}"
+        );
     }
 
     #[test]
@@ -1101,7 +1262,10 @@ mod tests {
         let email = b"From: ESP <bounce@mail123.sendgrid.net>\r\nReply-To: agent@tourradar.com\r\nSubject: x\r\n\r\nbody\r\n";
         let tokens = tokenize(email);
         assert!(tokens.iter().any(|t| t == "h:replyto:agent@tourradar.com"));
-        assert!(tokens.iter().any(|t| t == "h:replyto:tourradar"), "reply-to brand anchor missing: {tokens:?}");
+        assert!(
+            tokens.iter().any(|t| t == "h:replyto:tourradar"),
+            "reply-to brand anchor missing: {tokens:?}"
+        );
     }
 
     #[test]
@@ -1112,7 +1276,10 @@ mod tests {
         let email = b"From: x@y.com\r\nSubject: s\r\n\r\nunsubscribe unsubscribe unsubscribe UNSUBSCRIBE unsubscribe\r\n";
         let tokens = tokenize(email);
         let count = tokens.iter().filter(|t| *t == "b:unsubscribe").count();
-        assert_eq!(count, 1, "repeated word must produce a single token: {tokens:?}");
+        assert_eq!(
+            count, 1,
+            "repeated word must produce a single token: {tokens:?}"
+        );
     }
 
     // ---- anti-evasion features (all default-off; opt in per config) ----
@@ -1129,7 +1296,8 @@ mod tests {
         assert!(!c.tld_feature && !c.homoglyph_fold && !c.brand_mismatch && !c.auth_tokens);
         // A homoglyph/throwaway-TLD message must tokenize identically to before
         // when no feature flag is set — production behaviour is unchanged.
-        let email = "From: WB <at@spammer.life>\r\nSubject: your accᴏunt\r\n\r\nciick now\r\n".as_bytes();
+        let email =
+            "From: WB <at@spammer.life>\r\nSubject: your accᴏunt\r\n\r\nciick now\r\n".as_bytes();
         let toks = tokenize(email);
         assert!(!toks.iter().any(|t| t.starts_with("x:")));
     }
@@ -1153,7 +1321,10 @@ mod tests {
         assert_eq!(effective_tld("spammer.life").as_deref(), Some("life"));
         assert_eq!(effective_tld("flybuys.com.au").as_deref(), Some("com.au"));
         assert_eq!(effective_tld("apple.com").as_deref(), Some("com"));
-        assert_eq!(effective_tld("sub.survey.qatarairways.com.qa").as_deref(), Some("com.qa"));
+        assert_eq!(
+            effective_tld("sub.survey.qatarairways.com.qa").as_deref(),
+            Some("com.qa")
+        );
         assert_eq!(effective_tld("192.168.0.1"), None);
         assert_eq!(effective_tld("localhost"), None);
     }
@@ -1161,9 +1332,13 @@ mod tests {
     #[test]
     fn test_homoglyph_fold_small_caps() {
         // `accᴏunt` (U+1D0F) must fold onto the trained `account`.
-        let email = "From: x@y.com\r\nSubject: your accᴏunt\r\n\r\nreview your accᴏunt now\r\n".as_bytes();
+        let email =
+            "From: x@y.com\r\nSubject: your accᴏunt\r\n\r\nreview your accᴏunt now\r\n".as_bytes();
         let toks = tokenize_with_config(email, &cfg(|c| c.homoglyph_fold = true));
-        assert!(toks.iter().any(|t| t == "b:account"), "skeleton missing: {toks:?}");
+        assert!(
+            toks.iter().any(|t| t == "b:account"),
+            "skeleton missing: {toks:?}"
+        );
         assert!(toks.iter().any(|t| t == "h:subject:account"), "{toks:?}");
         assert!(toks.iter().any(|t| t == "x:confusable"), "{toks:?}");
     }
@@ -1209,10 +1384,14 @@ mod tests {
     #[test]
     fn test_brand_mismatch_flag() {
         // "AIdi" (ASCII cap-I for l) from a throwaway domain → brandmiss:aldi.
-        let email = b"From: AIdi Administrator <amkfm@throwaway.info>\r\nSubject: hi\r\n\r\nbody\r\n";
+        let email =
+            b"From: AIdi Administrator <amkfm@throwaway.info>\r\nSubject: hi\r\n\r\nbody\r\n";
         let toks = tokenize_with_config(email, &cfg(|c| c.brand_mismatch = true));
         assert!(toks.iter().any(|t| t == "x:brandmiss:aldl"), "{toks:?}");
-        assert!(toks.iter().any(|t| t.starts_with("h:fromname:")), "{toks:?}");
+        assert!(
+            toks.iter().any(|t| t.starts_with("h:fromname:")),
+            "{toks:?}"
+        );
     }
 
     #[test]
@@ -1220,7 +1399,10 @@ mod tests {
         // Real Apple from apple.com must NOT flag (domain brand matches).
         let email = b"From: Apple <no-reply@apple.com>\r\nSubject: receipt\r\n\r\nbody\r\n";
         let toks = tokenize_with_config(email, &cfg(|c| c.brand_mismatch = true));
-        assert!(!toks.iter().any(|t| t.starts_with("x:brandmiss:")), "{toks:?}");
+        assert!(
+            !toks.iter().any(|t| t.starts_with("x:brandmiss:")),
+            "{toks:?}"
+        );
     }
 
     #[test]
