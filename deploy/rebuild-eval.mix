@@ -181,14 +181,6 @@ fn untrain_tests($db, $paths, $km, $cls)
   return $n
 end
 
-fn pad_right($s, $n)
-  $out = "" .. $s
-  while len($out) < $n
-    $out = $out .. " "
-  end
-  return $out
-end
-
 fn count_at_or_above($vals, $t)
   $n = 0
   $i = 0
@@ -302,7 +294,7 @@ while $ti < len($ths)
     end
     $fp = count_at_or_above($r[1], $t)
     $fn = len($r[2]) - count_at_or_above($r[2], $t)
-    print("  " .. pad_right($r[0], 20) .. " " .. pad_right($g .. "g/" .. $s .. "s", 17) .. " " .. pad_right($fp .. "/" .. len($r[1]), 16) .. " " .. $fn .. "/" .. len($r[2]))
+    print("  " .. rpad_w($r[0], 20) .. " " .. rpad_w($g .. "g/" .. $s .. "s", 17) .. " " .. rpad_w($fp .. "/" .. len($r[1]), 16) .. " " .. $fn .. "/" .. len($r[2]))
     $i = $i + 1
   end
   $ti = $ti + 1
