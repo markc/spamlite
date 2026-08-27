@@ -59,6 +59,12 @@ pub struct TokenizerConfig {
     /// `expanded_headers` off, `h:to:` is emitted by nothing else, so remapping
     /// would mint orphan tokens no classification ever consults.
     ///
+    /// Mail the user sent to themselves emits no sender at all. The user is not
+    /// their own correspondent, the copy that arrives in INBOX is already
+    /// trained by the reconciler, and it is the only remaining path by which
+    /// the swap could hand a spoof of the user's own address a pile of ham
+    /// counts. Everything else about the message still trains.
+    ///
     /// **Corpus shape, not a feature flag** — unlike every other field here it
     /// must differ between training and classification, so it is deliberately
     /// absent from [`TokenizerConfig::from_env`]: an exported variable inherited
@@ -222,8 +228,32 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         let to_count = message.to().map(|t| t.iter().count()).unwrap_or(0);
         let cc_count = message.cc().map(|c| c.iter().count()).unwrap_or(0);
         if to_count == 1 && cc_count == 0 {
+            // Self-addressed mail is the one recipient that must not train. The
+            // user is not their own correspondent, the copy that lands in INBOX
+            // is already trained by the reconciler — so emitting it here
+            // double-counts one observation — and it is the only path by which
+            // the swap can still hand a from-spoof of the user's own address a
+            // pile of ham counts. Compared on address alone; a display name
+            // says nothing about identity.
+            let from_addrs: Vec<String> = message
+                .from()
+                .map(|f| {
+                    f.iter()
+                        .filter_map(|a| a.address.as_deref())
+                        .map(|a| a.to_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
             if let Some(to) = message.to() {
                 for addr in to.iter() {
+                    let is_self = addr
+                        .address
+                        .as_deref()
+                        .map(|a| from_addrs.contains(&a.to_lowercase()))
+                        .unwrap_or(false);
+                    if is_self {
+                        continue;
+                    }
                     // `h:from:` deliberately, and deliberately NOT gated on
                     // expanded_headers: `h:to:` is off by default fleet-wide, so
                     // gating here would make the whole feature a no-op. The
@@ -1604,5 +1634,77 @@ body\r\n";
         std::env::set_var("SPAMLITE_SENT_SWAP", "1");
         assert!(!TokenizerConfig::from_env().sent_swap);
         std::env::remove_var("SPAMLITE_SENT_SWAP");
+    }
+}
+
+#[cfg(test)]
+mod sent_swap_self_tests {
+    use super::*;
+
+    fn swap() -> TokenizerConfig {
+        TokenizerConfig {
+            sent_swap: true,
+            ..Default::default()
+        }
+    }
+
+    /// Mail the user sends to themselves trains twice — once here as their own
+    /// correspondent, and again from INBOX by the reconciler when the copy
+    /// lands. It is also the only remaining way the swap can feed a spoof of
+    /// the user's own address. Emit nothing.
+    #[test]
+    fn self_addressed_mail_trains_no_sender() {
+        let raw = b"From: Brett <brett@brettclarke.com>\r\n\
+To: brett@brettclarke.com\r\n\
+Subject: note to self\r\n\
+\r\n\
+remember the thing\r\n";
+        let toks = tokenize_with_config(raw, &swap());
+        assert!(!toks.iter().any(|t| t.starts_with("h:from:")), "{toks:?}");
+        // The message is still ham and its content still trains.
+        assert!(toks.contains(&"h:subject:note".to_string()), "{toks:?}");
+    }
+
+    /// Compared case-insensitively, and on the address only — a display name is
+    /// not identity.
+    #[test]
+    fn self_match_ignores_case_and_display_name() {
+        let raw = b"From: brett@brettclarke.com\r\n\
+To: \"Someone Else\" <BRETT@BrettClarke.COM>\r\n\
+Subject: note to self\r\n\
+\r\n\
+body\r\n";
+        let toks = tokenize_with_config(raw, &swap());
+        assert!(!toks.iter().any(|t| t.starts_with("h:from:")), "{toks:?}");
+    }
+
+    /// The guard is exact: a real correspondent at the user's own domain is
+    /// still a correspondent and must keep training.
+    #[test]
+    fn same_domain_correspondent_still_trains() {
+        let raw = b"From: brett@brettclarke.com\r\n\
+To: lauren@brettclarke.com\r\n\
+Subject: quote for the job\r\n\
+\r\n\
+body\r\n";
+        let toks = tokenize_with_config(raw, &swap());
+        assert!(
+            toks.contains(&"h:from:lauren@brettclarke.com".to_string()),
+            "{toks:?}"
+        );
+    }
+
+    /// No From: to compare against — emit the recipient rather than guess.
+    #[test]
+    fn missing_from_still_trains_the_recipient() {
+        let raw = b"To: bob@partner.example.com\r\n\
+Subject: quote for the job\r\n\
+\r\n\
+body\r\n";
+        let toks = tokenize_with_config(raw, &swap());
+        assert!(
+            toks.contains(&"h:from:bob@partner.example.com".to_string()),
+            "{toks:?}"
+        );
     }
 }
