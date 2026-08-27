@@ -115,7 +115,28 @@ INBOX + 150 Junk messages, false positives fell 10 → 8 at his threshold of 0.6
 and 29 → 23 at 0.5, with false negatives unchanged. **His `threshold = 0.6`
 stays** — 0.5 is still far worse for him even after the fix.
 
-The 404 residual is genuine self-correspondence: mail brett sends to himself is
-trained once from Sent (recipient = himself under `--sent`) and again from INBOX
-by the reconciler. A `To: == From:` guard in the swap would remove that
-double-count; not implemented.
+### 0.9.5 / 0.9.6, same day
+
+0.9.5 added the `To: == From:` guard — self-addressed mail emits no sender at
+all. 0.9.6 added `untrain --sent`, without which a `--sent` train had no
+inverse, plus `--was-sent` on the redo script and epoch-stamped backups.
+Both promoted on all three hosts after the same gate (80/80 identical on mbx).
+
+brett was restored from the pre-swap backup and redone under the guard, so the
+three corpus states are directly comparable:
+
+| `h:from:` token | raw top-up | swap, no guard | swap + guard |
+|---|---|---|---|
+| `brett@brettclarke.com` | 1649 | 404 | **282** |
+| `brettclarke.com` | 1667 | 561 | **439** |
+| `brettclarke` | 1369 | 263 | **141** |
+
+282 is exactly the pre-top-up value: Sent training now contributes nothing to
+his own address. The 439/141 residual is real correspondents at his own domain.
+False positives were 10/150 raw and 8/150 for both swap variants at his
+threshold of 0.6, so the guard cost nothing and removed 122 phantom ham counts
+from the address a phish would forge.
+
+Three attachment-only sends now fail with `no tokens`: without the swap they
+still emitted `h:from:<brett>`, and with it there is nothing left to train.
+Correct, and excluded from the batch rather than counted.
