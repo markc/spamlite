@@ -1,0 +1,231 @@
+#!/opt/cosmix/bin/mix
+-- sent-swap-verify.mix — pre-promotion gate for a spamlite candidate binary.
+--
+--   sent-swap-verify.mix <user@domain> <old-binary> <new-binary> [n]
+--
+-- Two independent checks, both against COPIES of the user's live db so the
+-- live corpus is never touched:
+--
+--   1. DELIVERY REGRESSION — score n real INBOX + Junk messages with both
+--      binaries against the same db copy. `--sent` is default-off, so every
+--      byte of delivery-path output must be identical. Any divergence fails.
+--
+--   2. SENT SWAP — train n real Sent messages into two fresh copies, one with
+--      `--sent` and one without, then diff the exported token tables. Asserts
+--      the own domain gains h:from: ham counts WITHOUT the flag and none WITH
+--      it, and that correspondent domains gain them only WITH it.
+--
+-- mdbox only (doveadm staging). Exit 0 = both checks passed.
+$a = args()
+if len($a) < 3 then print("usage: sent-swap-verify.mix <user@domain> <old-bin> <new-bin> [n]"); exit(1) end
+$login = $a[0]
+$OLD = $a[1]
+$NEW = $a[2]
+$N = 40
+if len($a) >= 4 then $N = to_number($a[3]) end
+
+$up = split($login, "@")
+$domain = $up[1]
+$D = "/srv/" .. $domain .. "/msg/" .. $up[0]
+$live = $D .. "/.spamlite/db.sqlite"
+if is_file($live) == false then print("FAIL: no live db at " .. $live); exit(1) end
+
+$W = "/root/sent-swap-verify"
+remove_dir($W)
+mkdir($W)
+mkdir($W .. "/msgs")
+
+-- ---------------------------------------------------------------- staging
+-- Stage the newest $n messages of one mailbox as individual files, using the
+-- same doveadm fetch + `sed 1d` path the reconciler stages mdbox mail with.
+fn stage($login, $box, $n, $dir)
+  mkdir($dir)
+  $r = run_argv(["doveadm", "search", "-u", $login, "mailbox", $box, "all"], {timeout: 300})
+  if $r.exit_code != 0 then
+    print("FAIL: doveadm search " .. $box .. ": " .. strip($r.stderr))
+    exit(1)
+  end
+  $lines = split(strip($r.stdout), "\n")
+  $uids = []
+  $i = len($lines) - 1
+  while $i >= 0 and len($uids) < $n
+    $p = split(strip($lines[$i]), " ")
+    if len($p) >= 2 then
+      push($uids, $p[1])
+    end
+    $i = $i - 1
+  end
+  $got = 0
+  $i = 0
+  while $i < len($uids)
+    $raw = $dir .. "/.raw"
+    $f = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $box, "uid", $uids[$i]], {stdout: {file: $raw}, timeout: 120})
+    if $f.exit_code == 0 then
+      $s = run_argv(["sed", "1d", $raw], {stdout: {file: $dir .. "/m" .. $uids[$i]}})
+      if $s.exit_code == 0 then
+        $got = $got + 1
+      end
+    end
+    $i = $i + 1
+  end
+  run_argv(["rm", "-f", $dir .. "/.raw"])
+  return $got
+end
+
+-- Export a db to a word -> "good,spam" map.
+fn counts($bin, $db)
+  $r = run_argv([$bin, "-d", $db, "export"], {timeout: 600})
+  $m = {}
+  $ll = split($r.stdout, "\n")
+  $i = 0
+  while $i < len($ll)
+    $p = split($ll[$i], ",")
+    if len($p) >= 4 then
+      $w = $ll[$i]
+      $q = pos("\"", $w)
+      if $q > 0 then
+        $w = substr($w, $q, len($w))
+        $w = replace($w, "\"", "")
+        $m[$w] = $p[0] .. "," .. $p[1]
+      end
+    end
+    $i = $i + 1
+  end
+  return $m
+end
+
+-- Tokens that are h:from: and carry $needle, whose good count grew.
+fn grew($before, $after, $needle)
+  $out = []
+  $ks = keys($after)
+  $i = 0
+  while $i < len($ks)
+    $k = $ks[$i]
+    if pos("h:from:", $k) == 1 and pos($needle, $k) > 0 then
+      $b = "0,0"
+      if $before[$k] != nil then
+        $b = $before[$k]
+      end
+      if $b != $after[$k] then
+        push($out, $k .. " " .. $b .. " -> " .. $after[$k])
+      end
+    end
+    $i = $i + 1
+  end
+  return sort($out)
+end
+
+-- ------------------------------------------------- 1. delivery regression
+print("== 1. delivery regression: " .. $OLD .. " vs " .. $NEW)
+$ndel = 0
+$ndel = $ndel + stage($login, "INBOX", $N, $W .. "/msgs/inbox")
+$ndel = $ndel + stage($login, "Junk", $N, $W .. "/msgs/junk")
+print("staged " .. $ndel .. " delivery-path messages")
+if $ndel == 0 then print("FAIL: nothing staged"); exit(1) end
+
+mkdir($W .. "/regress")
+copy($live, $W .. "/regress/db.sqlite")
+$files = concat(glob($W .. "/msgs/inbox/m*"), glob($W .. "/msgs/junk/m*"))
+$diverged = 0
+$scored = 0
+$i = 0
+while $i < len($files)
+  $o = run_argv([$OLD, "-d", $W .. "/regress", "score"], {stdin: {file: $files[$i]}, timeout: 60})
+  $n = run_argv([$NEW, "-d", $W .. "/regress", "score"], {stdin: {file: $files[$i]}, timeout: 60})
+  $scored = $scored + 1
+  if $o.stdout != $n.stdout or $o.exit_code != $n.exit_code then
+    $diverged = $diverged + 1
+    print("  DIVERGE " .. basename($files[$i]) .. ": old=" .. strip($o.stdout) .. " new=" .. strip($n.stdout))
+  end
+  $i = $i + 1
+end
+print("scored=" .. $scored .. " diverged=" .. $diverged)
+if $diverged != 0 then print("FAIL: delivery path is not byte-identical"); exit(1) end
+print("PASS: " .. $scored .. "/" .. $scored .. " identical")
+
+-- --------------------------------------------------------- 2. sent swap
+print("")
+print("== 2. sent swap on " .. $N .. " real Sent messages")
+$nsent = stage($login, "Sent", $N, $W .. "/msgs/sent")
+print("staged " .. $nsent .. " Sent messages")
+if $nsent == 0 then print("FAIL: no Sent mail staged"); exit(1) end
+
+mkdir($W .. "/raw")
+mkdir($W .. "/swap")
+copy($live, $W .. "/raw/db.sqlite")
+copy($live, $W .. "/swap/db.sqlite")
+$base = counts($NEW, $W .. "/raw")
+
+$tr = run_argv([$NEW, "-d", $W .. "/raw", "train-dir", $W .. "/msgs/sent", "good"], {timeout: 1800})
+$ts = run_argv([$NEW, "-d", $W .. "/swap", "train-dir", $W .. "/msgs/sent", "good", "--sent"], {timeout: 1800})
+print("raw train:  " .. strip($tr.stderr))
+print("swap train: " .. strip($ts.stderr))
+
+$craw = counts($NEW, $W .. "/raw")
+$cswap = counts($NEW, $W .. "/swap")
+
+-- Keyed on the exact login, not the domain: an admin writing to their own
+-- domain's users has correspondents that legitimately share the domain, so a
+-- domain-level assertion would fail on a correct swap. Only the user's own
+-- ADDRESS must never be trained as a sender.
+$own_raw = grew($base, $craw, $login)
+$own_swap = grew($base, $cswap, $login)
+print("")
+print("own-ADDRESS h:from: tokens that gained counts WITHOUT --sent: " .. len($own_raw))
+$i = 0
+while $i < len($own_raw) and $i < 8
+  print("  " .. $own_raw[$i])
+  $i = $i + 1
+end
+print("own-ADDRESS h:from: tokens that gained counts WITH --sent:    " .. len($own_swap))
+$i = 0
+while $i < len($own_swap) and $i < 8
+  print("  " .. $own_swap[$i])
+  $i = $i + 1
+end
+
+-- Correspondent side: every h:from: token that moved, minus the own-domain ones.
+fn moved_from($before, $after)
+  $n = 0
+  $ks = keys($after)
+  $i = 0
+  while $i < len($ks)
+    $k = $ks[$i]
+    if pos("h:from:", $k) == 1 then
+      $b = "0,0"
+      if $before[$k] != nil then
+        $b = $before[$k]
+      end
+      if $b != $after[$k] then
+        $n = $n + 1
+      end
+    end
+    $i = $i + 1
+  end
+  return $n
+end
+$mv_raw = moved_from($base, $craw)
+$mv_swap = moved_from($base, $cswap)
+print("")
+print("total h:from: tokens moved  without --sent: " .. $mv_raw)
+print("total h:from: tokens moved  with    --sent: " .. $mv_swap)
+
+$ok = 1
+if len($own_raw) == 0 then
+  print("INCONCLUSIVE: own address gained nothing even without --sent (does this user's Sent mail carry their own From:?)")
+  $ok = 0
+end
+if len($own_swap) != 0 then
+  print("FAIL: --sent still trained the user's own address as a sender")
+  $ok = 0
+end
+if $mv_swap == 0 then
+  print("FAIL: --sent trained no sender tokens at all")
+  $ok = 0
+end
+if $ok == 1 then
+  print("")
+  print("PASS: own address trained without --sent, not with it; correspondents trained with it")
+  exit(0)
+end
+exit(1)
