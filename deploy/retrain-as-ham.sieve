@@ -7,13 +7,35 @@ if header :matches "message-id" "*" { set "msgid" "${1}"; }
 set "mbox" "unknown";
 if environment :matches "imap.mailbox" "*" { set "mbox" "${1}"; }
 
-# 2026-07-03: only train ham when the message is rescued to INBOX.
-# Junk purges / sync jobs move mail to Trash/Junk/archive folders and were
-# firing this script, poisoning good corpora (~100 msgs/day fleet-wide).
-if not string :is "${mbox}" "INBOX" {
+# Trained ham = the user rescued this OUT of Junk into somewhere they keep mail.
+#
+# 2026-07-03: originally an INBOX-only allowlist, because Junk purges and client
+# sync jobs were firing this script and poisoning good corpora (~100 msgs/day
+# fleet-wide).
+#
+# 2026-08-27: widened to a denylist. The allowlist was discarding real rescues —
+# 11 in 14 days on mrn, into folders like "Accounts", "Bills to Pay",
+# "Wordpress" — which are exactly as much a ham signal as INBOX is. What must be
+# excluded is not "everything but INBOX", it is the destinations that are not a
+# keep signal:
+#   - Trash / Deleted Items  — deleting junk is not "this was ham"
+#   - any junk-shaped folder  — Junk E-mail, Junk Email, ESET Antispam, Spam,
+#     INBOX.Junk. Junk->Junk churn is the single biggest non-signal on the fleet
+#     (1801 events in 14 days from one Outlook client alone), and a Trash-only
+#     guard would train every one of them as ham.
+#   - Drafts / Sent  — not a filing destination for received mail
+if anyof (string :is "${mbox}" "Trash",
+          string :is "${mbox}" "Drafts",
+          string :is "${mbox}" "Sent",
+          string :matches "${mbox}" "Deleted Items*",
+          string :matches "${mbox}" "*Junk*",
+          string :matches "${mbox}" "*junk*",
+          string :matches "${mbox}" "*Spam*",
+          string :matches "${mbox}" "*spam*",
+          string :matches "${mbox}" "*Trash*") {
   debug_log "TRAIN-SKIP: ${user} ${msgid} -> good skipped (dest=${mbox})";
   stop;
 }
 
-debug_log "TRAIN: ${user} ${msgid} -> good";
+debug_log "TRAIN: ${user} ${msgid} -> good (dest=${mbox})";
 pipe :copy "spamfilter-retrain" ["good"];
