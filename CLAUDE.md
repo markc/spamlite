@@ -44,7 +44,9 @@ The modules have clean boundaries:
   throws the correspondent away with the `h:to:` header that `expanded_headers`
   leaves off by default. `--sent` emits the recipient under `h:from:` and drops
   the self-side headers (From, Reply-To, Sender, Cc, Received), reproducing the
-  token shape that correspondent's inbound mail would produce. It is a corpus
+  token shape that correspondent's inbound mail would produce. Mail the user
+  sent to themselves emits no sender at all — the INBOX copy is already trained
+  by the reconciler, so emitting it would double-count. It is a corpus
   shape, not a feature flag: deliberately unreachable from `SPAMLITE_*` env, since
   an exported variable inherited by the delivery path would invert live mail.
 
