@@ -2,15 +2,22 @@
 -- sent-swap-redo.mix — undo a pre-`--sent` Sent-folder ham top-up and re-run it
 -- with the swap, for one Maildir user.
 --
---   sent-swap-redo.mix <user@domain> <topup-timestamp> [--commit]
+--   sent-swap-redo.mix <user@domain> <topup-timestamp> [--commit] [--was-sent]
 --
 -- The top-up writes every sidecar line with the SAME `G <ts> <key>` timestamp,
 -- so that timestamp names its cohort exactly. This script:
 --
 --   1. backs up db.sqlite (sqlite3 .backup, consistent under WAL) + the sidecar
 --   2. maps each cohort key back to its file in Maildir/.Sent/cur
---   3. untrains each as good, with the SAME raw geometry it was trained with —
---      no --sent, or the decrements would not match the increments
+--   3. untrains each as good with the SAME geometry it was trained with. A
+--      cohort predating `--sent` was trained raw, so it is untrained raw; pass
+--      `--was-sent` for a cohort that was itself trained with `--sent`. Getting
+--      this wrong decrements tokens the train never incremented and strands the
+--      ones it did, so the flag is not optional bookkeeping.
+--
+--      A cohort trained by a DIFFERENT binary version whose `--sent` semantics
+--      have since changed cannot be reversed by any flag here — restore the db
+--      backup instead.
 --   4. drops the whole cohort from reconciled.log so the top-up will re-train it
 --
 -- Re-running the top-up (which now passes --sent) is left to the caller, so the
@@ -19,11 +26,21 @@
 -- Keys whose message has since been deleted from Sent cannot be untrained;
 -- their ham counts are stranded in the db permanently and are reported as such.
 $a = args()
-if len($a) < 2 then print("usage: sent-swap-redo.mix <user@domain> <topup-ts> [--commit]"); exit(1) end
+if len($a) < 2 then print("usage: sent-swap-redo.mix <user@domain> <topup-ts> [--commit] [--was-sent]"); exit(1) end
 $login = $a[0]
 $TS = $a[1]
 $commit = 0
-if len($a) >= 3 and $a[2] == "--commit" then $commit = 1 end
+$was_sent = 0
+$i = 2
+while $i < len($a)
+  if $a[$i] == "--commit" then
+    $commit = 1
+  end
+  if $a[$i] == "--was-sent" then
+    $was_sent = 1
+  end
+  $i = $i + 1
+end
 
 $up = split($login, "@")
 $D = "/srv/" .. $up[1] .. "/msg/" .. $up[0]
@@ -89,7 +106,9 @@ if $commit == 0 then
 end
 
 -- 3. backups
-$stamp = "20260827-pre-sentswap"
+-- Epoch-stamped: a second run must never clobber the backup taken by the
+-- first, which may be the only exact record of the pre-redo corpus.
+$stamp = "presentswap-" .. floor(time())
 $bk = $db .. ".bak-" .. $stamp
 $b = run_argv(["sqlite3", $db, ".backup '" .. $bk .. "'"], {timeout: 600})
 if $b.exit_code != 0 then print("FAIL: db backup: " .. strip($b.stderr)); exit(1) end
@@ -98,12 +117,17 @@ print("backed up -> " .. $bk .. " and " .. $log .. ".bak-" .. $stamp)
 print($SL .. " stats BEFORE:")
 print(run_argv([$SL, "-d", $dbdir, "stats"]).stdout)
 
--- 4. untrain, raw geometry (no --sent) so decrements match the increments
+-- 4. untrain with the geometry the cohort was trained with
+$uargv = [$SL, "-d", $dbdir, "untrain", "good"]
+if $was_sent == 1 then
+  $uargv = concat($uargv, ["--sent"])
+end
+print("untrain geometry: " .. join(slice($uargv, 3, len($uargv)), " "))
 $ok = 0
 $fail = 0
 $i = 0
 while $i < len($paths)
-  $r = run_argv([$SL, "-d", $dbdir, "untrain", "good"], {stdin: {file: $paths[$i]}, timeout: 60})
+  $r = run_argv($uargv, {stdin: {file: $paths[$i]}, timeout: 60})
   if $r.exit_code == 0 then
     $ok = $ok + 1
   else
