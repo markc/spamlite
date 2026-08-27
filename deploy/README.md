@@ -80,3 +80,42 @@ followed by `Terminated with non-zero exit code 1`. 5 such errors in
 2026-04-12..2026-04-15 logs. The wrapper fix bypasses the sieve bug without
 touching `global.sieve`. The underlying sieve script should still be fixed
 with `:lower_case` modifiers when convenient.
+
+## Sent-folder ham tooling (0.9.4+)
+
+- **`sent-swap-verify.mix <user@domain> <old-bin> <new-bin> [n]`** — pre-promotion
+  gate for a candidate binary, run against copies of a live db so the corpus is
+  never touched. Check 1 scores n real INBOX+Junk messages with both binaries and
+  requires byte-identical output (`--sent` is default-off, so the delivery path
+  must not move). Check 2 trains n real Sent messages into two copies, with and
+  without `--sent`, and asserts the user's own ADDRESS gains `h:from:` ham counts
+  only without the flag. mdbox hosts only (doveadm staging).
+- **`sent-swap-redo.mix <user@domain> <topup-ts> [--commit]`** — undoes a Sent
+  top-up performed before `--sent` existed and clears the way to redo it. The
+  top-up stamps its whole cohort with one `G <ts> <key>` sidecar timestamp, which
+  names it exactly. Backs up the db (`sqlite3 .backup`) and sidecar, untrains each
+  message with the same raw geometry it was trained with, then drops the cohort
+  from `reconciled.log`. Re-running the top-up is left to the caller. Maildir only.
+
+### 2026-08-27 rollout
+
+0.9.4 promoted on mbx, mrn and mbc (`/usr/local/bin/spamlite`, previous binary
+kept as `spamlite.bak-20260827-pre-0.9.4`; every host's
+`sieve_execute_bin_dir` entry is a symlink to that path). Delivery-path
+regression: 361 real messages across 4 users on 3 hosts, zero divergence.
+
+`--sent` measured on admin@spiderweb.com.au over 40 real Sent messages:
+`h:from:admin@spiderweb.com.au` 15 → 51 good without the flag, unchanged with
+it; sender tokens moved 4 → 59.
+
+brett@brettclarke.com's 2026-08-23 top-up (cohort `G 1787467991`) was undone and
+redone with `--sent`: 1367/1368 untrained (1 message deleted since, its counts
+stranded), 1379 retrained. `h:from:brett@brettclarke.com` 1649 → 404. On 150
+INBOX + 150 Junk messages, false positives fell 10 → 8 at his threshold of 0.6
+and 29 → 23 at 0.5, with false negatives unchanged. **His `threshold = 0.6`
+stays** — 0.5 is still far worse for him even after the fix.
+
+The 404 residual is genuine self-correspondence: mail brett sends to himself is
+trained once from Sent (recipient = himself under `--sent`) and again from INBOX
+by the reconciler. A `To: == From:` guard in the swap would remove that
+double-count; not implemented.
