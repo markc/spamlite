@@ -46,6 +46,25 @@ pub struct TokenizerConfig {
     /// Authentication-Results / Received-SPF when present. Inert when the
     /// delivery path does not stamp those headers (feasibility-gated per site).
     pub auth_tokens: bool,
+    /// Tokenize the message as Sent-folder ham: emit the recipient under
+    /// `h:from:` and drop every self-side header (From, Reply-To, Sender, Cc,
+    /// Received). Sent mail is high-quality ham with inverted geometry — the
+    /// user is the sender — so training it raw teaches `h:from:<own domain>` =
+    /// ham, which is a gift to the from-spoofing phish that forges the user's
+    /// own address, while the correspondent it was supposed to learn is
+    /// discarded with the `h:to:` header. The swap reproduces the token shape
+    /// that correspondent's inbound mail would have produced.
+    ///
+    /// Self-side headers are DROPPED rather than remapped to `h:to:`: with
+    /// `expanded_headers` off, `h:to:` is emitted by nothing else, so remapping
+    /// would mint orphan tokens no classification ever consults.
+    ///
+    /// **Corpus shape, not a feature flag** — unlike every other field here it
+    /// must differ between training and classification, so it is deliberately
+    /// absent from [`TokenizerConfig::from_env`]: an exported variable inherited
+    /// by the delivery path would invert live inbound mail. It is reachable
+    /// only from `train-dir --sent`.
+    pub sent_swap: bool,
 }
 
 impl Default for TokenizerConfig {
@@ -58,6 +77,7 @@ impl Default for TokenizerConfig {
             homoglyph_fold: false,
             brand_mismatch: false,
             auth_tokens: false,
+            sent_swap: false,
         }
     }
 }
@@ -190,43 +210,75 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         }
     }
 
-    // From header
-    if let Some(from) = message.from() {
-        for addr in from.iter() {
-            push_addr(&mut tokens, "h:from:", addr, &valid, config);
-        }
-    }
-
-    // Reply-To / Sender — carry the real supplier identity when a bulk ESP
-    // rewrites From into its own envelope domain. Decomposed to brand anchors
-    // by push_addr, same as From. Default-on: additive per-sender signal.
-    if let Some(reply_to) = message.reply_to() {
-        for addr in reply_to.iter() {
-            push_addr(&mut tokens, "h:replyto:", addr, &valid, config);
-        }
-    }
-    if let Some(sender) = message.sender() {
-        for addr in sender.iter() {
-            push_addr(&mut tokens, "h:sender:", addr, &valid, config);
-        }
-    }
-
-    // To / Cc headers (expanded coverage)
-    if config.expanded_headers {
-        if let Some(to) = message.to() {
-            for addr in to.iter() {
-                push_addr(&mut tokens, "h:to:", addr, &valid, config);
+    // Address headers. Inbound mail puts the counterparty in From/Reply-To/
+    // Sender and the user in To/Cc; Sent-folder ham inverts that, so under
+    // `sent_swap` the recipient is emitted under `h:from:` and every self-side
+    // header is dropped. See the field docs for why dropping beats remapping.
+    if config.sent_swap {
+        // One correspondent per message: a five-recipient send would otherwise
+        // credit five addresses for a single ham observation where the inbound
+        // mail it is meant to imitate credits exactly one. Subject and body
+        // still train for these messages; only the address tokens are withheld.
+        let to_count = message.to().map(|t| t.iter().count()).unwrap_or(0);
+        let cc_count = message.cc().map(|c| c.iter().count()).unwrap_or(0);
+        if to_count == 1 && cc_count == 0 {
+            if let Some(to) = message.to() {
+                for addr in to.iter() {
+                    // `h:from:` deliberately, and deliberately NOT gated on
+                    // expanded_headers: `h:to:` is off by default fleet-wide, so
+                    // gating here would make the whole feature a no-op. The
+                    // literal prefix also re-arms push_addr's `h:fromname:` /
+                    // `x:brandmiss:` block on the correspondent's display name,
+                    // which is the header that carries the impersonation signal.
+                    push_addr(&mut tokens, "h:from:", addr, &valid, config);
+                }
             }
         }
-        if let Some(cc) = message.cc() {
-            for addr in cc.iter() {
-                push_addr(&mut tokens, "h:cc:", addr, &valid, config);
+    } else {
+        // From header
+        if let Some(from) = message.from() {
+            for addr in from.iter() {
+                push_addr(&mut tokens, "h:from:", addr, &valid, config);
+            }
+        }
+
+        // Reply-To / Sender — carry the real supplier identity when a bulk ESP
+        // rewrites From into its own envelope domain. Decomposed to brand anchors
+        // by push_addr, same as From. Default-on: additive per-sender signal.
+        if let Some(reply_to) = message.reply_to() {
+            for addr in reply_to.iter() {
+                push_addr(&mut tokens, "h:replyto:", addr, &valid, config);
+            }
+        }
+        if let Some(sender) = message.sender() {
+            for addr in sender.iter() {
+                push_addr(&mut tokens, "h:sender:", addr, &valid, config);
+            }
+        }
+
+        // To / Cc headers (expanded coverage)
+        if config.expanded_headers {
+            if let Some(to) = message.to() {
+                for addr in to.iter() {
+                    push_addr(&mut tokens, "h:to:", addr, &valid, config);
+                }
+            }
+            if let Some(cc) = message.cc() {
+                for addr in cc.iter() {
+                    push_addr(&mut tokens, "h:cc:", addr, &valid, config);
+                }
             }
         }
     }
 
-    // Received headers — split first hop from subsequent when expanded
-    if config.expanded_headers {
+    // Received headers — split first hop from subsequent when expanded. The
+    // only hop on Sent mail is the user's own submission MX, a host that
+    // appears in none of their inbound mail, so `sent_swap` drops it rather
+    // than train an orphan token. Nothing is synthesised in its place: a
+    // guessed inbound MTA would be fabricated evidence.
+    if config.sent_swap {
+        // no inbound chain to learn from
+    } else if config.expanded_headers {
         let mut first = true;
         let root_headers = message
             .parts
@@ -1420,5 +1472,137 @@ mod tests {
         let email = b"From: x@y.com\r\nSubject: hi\r\n\r\nbody\r\n";
         let toks = tokenize_with_config(email, &cfg(|c| c.auth_tokens = true));
         assert!(!toks.iter().any(|t| t.starts_with("x:auth:")), "{toks:?}");
+    }
+}
+
+#[cfg(test)]
+mod sent_swap_tests {
+    use super::*;
+
+    fn cfg(f: impl FnOnce(&mut TokenizerConfig)) -> TokenizerConfig {
+        let mut c = TokenizerConfig::default();
+        f(&mut c);
+        c
+    }
+
+    const SENT: &[u8] = b"From: Mark Constable <brett@brettclarke.com>\r\n\
+Reply-To: brett@brettclarke.com\r\n\
+To: Bob Smith <bob@partner.example.com>\r\n\
+Subject: quote for the job\r\n\
+Received: from mx.brettclarke.com by submission.brettclarke.com\r\n\
+\r\n\
+Here is the quote you asked for.\r\n";
+
+    const INBOUND: &[u8] = b"From: Bob Smith <bob@partner.example.com>\r\n\
+To: brett@brettclarke.com\r\n\
+Subject: re: quote for the job\r\n\
+\r\n\
+Thanks for the quote.\r\n";
+
+    /// The whole point: a swapped Sent message lands the correspondent on the
+    /// same `h:from:*` tokens that their inbound mail produces.
+    #[test]
+    fn swap_reproduces_inbound_sender_tokens() {
+        let sent = tokenize_with_config(SENT, &cfg(|c| c.sent_swap = true));
+        let inbound = tokenize_with_config(INBOUND, &TokenizerConfig::default());
+
+        let sender_of = |toks: &[String]| -> Vec<String> {
+            let mut v: Vec<String> = toks
+                .iter()
+                .filter(|t| t.starts_with("h:from:"))
+                .cloned()
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(sender_of(&sent), sender_of(&inbound), "{sent:?}");
+        assert!(sent.contains(&"h:from:bob@partner.example.com".to_string()));
+    }
+
+    /// The live defect the swap exists to remove: training Sent mail raw gives
+    /// the user's own domain a ham count, which a from-spoofing phish inherits.
+    #[test]
+    fn swap_drops_own_domain_and_self_headers() {
+        let raw = tokenize_with_config(SENT, &TokenizerConfig::default());
+        assert!(
+            raw.contains(&"h:from:brettclarke.com".to_string()),
+            "{raw:?}"
+        );
+
+        let swapped = tokenize_with_config(SENT, &cfg(|c| c.sent_swap = true));
+        assert!(
+            !swapped.iter().any(|t| t.contains("brettclarke.com")),
+            "own domain must not survive the swap: {swapped:?}"
+        );
+        assert!(!swapped.iter().any(|t| t.starts_with("h:replyto:")));
+        assert!(!swapped.iter().any(|t| t.starts_with("h:received:")));
+        // Content still trains — only the address geometry changes.
+        assert!(
+            swapped.contains(&"h:subject:quote".to_string()),
+            "{swapped:?}"
+        );
+    }
+
+    /// Self-side headers are dropped, not remapped: `h:to:` is off by default,
+    /// so remapping would mint tokens no classification ever looks up.
+    #[test]
+    fn swap_mints_no_recipient_side_tokens() {
+        let swapped = tokenize_with_config(SENT, &cfg(|c| c.sent_swap = true));
+        assert!(
+            !swapped.iter().any(|t| t.starts_with("h:to:")),
+            "{swapped:?}"
+        );
+        assert!(!swapped.iter().any(|t| t.starts_with("h:cc:")));
+    }
+
+    /// One ham observation must credit one correspondent, as inbound mail does.
+    #[test]
+    fn swap_withholds_addresses_from_multi_recipient_mail() {
+        let multi = b"From: brett@brettclarke.com\r\n\
+To: bob@partner.example.com, carol@other.example.com\r\n\
+Subject: quote for the job\r\n\
+\r\n\
+body\r\n";
+        let toks = tokenize_with_config(multi, &cfg(|c| c.sent_swap = true));
+        assert!(!toks.iter().any(|t| t.starts_with("h:from:")), "{toks:?}");
+        assert!(toks.contains(&"h:subject:quote".to_string()), "{toks:?}");
+
+        let cc = b"From: brett@brettclarke.com\r\n\
+To: bob@partner.example.com\r\n\
+Cc: carol@other.example.com\r\n\
+Subject: quote for the job\r\n\
+\r\n\
+body\r\n";
+        let toks = tokenize_with_config(cc, &cfg(|c| c.sent_swap = true));
+        assert!(!toks.iter().any(|t| t.starts_with("h:from:")), "{toks:?}");
+    }
+
+    /// push_addr gates the display-name / brand-impersonation block on the
+    /// literal `h:from:` prefix, so the swap re-aims it at the correspondent's
+    /// display name — the header that actually carries a spoof. Load-bearing:
+    /// changing that gate to a config field would silently disarm this.
+    #[test]
+    fn swap_aims_display_name_tokens_at_the_correspondent() {
+        let toks = tokenize_with_config(
+            SENT,
+            &cfg(|c| {
+                c.sent_swap = true;
+                c.brand_mismatch = true;
+            }),
+        );
+        assert!(toks.contains(&"h:fromname:smith".to_string()), "{toks:?}");
+        assert!(
+            !toks.iter().any(|t| t == "h:fromname:constable"),
+            "the user's own display name must not train as a sender: {toks:?}"
+        );
+    }
+
+    /// Corpus shape, not a feature flag: it must never be reachable from the
+    /// environment, or an exported variable would invert live inbound mail.
+    #[test]
+    fn sent_swap_is_not_settable_from_env() {
+        std::env::set_var("SPAMLITE_SENT_SWAP", "1");
+        assert!(!TokenizerConfig::from_env().sent_swap);
+        std::env::remove_var("SPAMLITE_SENT_SWAP");
     }
 }

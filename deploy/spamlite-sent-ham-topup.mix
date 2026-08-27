@@ -6,10 +6,21 @@
 -- Trains every Sent message sent on/after the date as GOOD, via the same
 -- staging -> train-dir -> reconciled.log sidecar path the nightly reconciler
 -- uses, so each key trains once and the reconciler never re-trains it.
--- Why Sent: it carries the user's real correspondents (To: addresses, quoted
--- replies, own-domain tokens) — the ham the inbox window under-supplies on a
--- spam-heavy mailbox. Why a cutoff: decade-old mail dilutes current tokens.
--- First use: brett@brettclarke.com 2026-08-23, 1368 msgs, 2386->3754 good.
+-- Why Sent: it carries the user's real correspondents — the ham the inbox
+-- window under-supplies on a spam-heavy mailbox. Why a cutoff: decade-old mail
+-- dilutes current tokens.
+--
+-- Trained with `--sent`, WHICH IS NOT OPTIONAL: Sent mail's header geometry is
+-- inverted (the user is the sender), so training it raw gives the user's own
+-- domain a large ham count that a from-spoofing phish inherits, while the
+-- correspondent it was meant to learn is discarded along with the h:to: header
+-- that expanded_headers leaves off by default. --sent emits the recipient
+-- under h:from: and drops the self-side headers. See TokenizerConfig::sent_swap.
+--
+-- First use: brett@brettclarke.com 2026-08-23, 1368 msgs, 2386->3754 good —
+-- run BEFORE --sent existed, so that db carries the own-domain ham counts and
+-- none of the correspondent tokens. Untrain those keys from the sidecar and
+-- re-run before treating his corpus as correct.
 $a = args()
 if len($a) < 1 then print("usage: spamlite-sent-ham-topup.mix <user@domain> [YYYY-MM-DD]"); exit(1) end
 $login = $a[0]
@@ -88,7 +99,7 @@ if len($paths) == 0 then print("nothing to do"); exit(0) end
 remove_dir($STAGE)
 mkdir($STAGE)
 run_argv(concat(["ln", "-s", "-t", $STAGE], $paths))
-$tr = run_argv([$SL, "-d", $db, "train-dir", $STAGE, "good"], {timeout: 1800})
+$tr = run_argv([$SL, "-d", $db, "train-dir", $STAGE, "good", "--sent"], {timeout: 1800})
 $ok = 0
 $fail = 0
 $tl = split(strip($tr.stdout), "\n")
