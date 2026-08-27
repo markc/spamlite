@@ -1,3 +1,4 @@
+# mbc retrain-as-good.sieve — wired by dovecot.conf `imapsieve_from Junk`.
 require ["vnd.dovecot.pipe", "vnd.dovecot.debug", "copy", "imapsieve", "environment", "variables"];
 
 if environment :matches "imap.user" "*" { set "user" "${1}"; }
@@ -14,16 +15,16 @@ if environment :matches "imap.mailbox" "*" { set "mbox" "${1}"; }
 # fleet-wide).
 #
 # 2026-08-27: widened to a denylist. The allowlist was discarding real rescues —
-# 11 in 14 days on mrn, into folders like "Accounts", "Bills to Pay",
-# "Wordpress" — which are exactly as much a ham signal as INBOX is. What must be
+# 11 in 14 days on mrn, into folders like "Accounts", "Bills to Pay" and
+# "Wordpress", which are as much a keep signal as INBOX is. What must be
 # excluded is not "everything but INBOX", it is the destinations that are not a
-# keep signal:
-#   - Trash / Deleted Items  — deleting junk is not "this was ham"
-#   - any junk-shaped folder  — Junk E-mail, Junk Email, ESET Antispam, Spam,
-#     INBOX.Junk. Junk->Junk churn is the single biggest non-signal on the fleet
-#     (1801 events in 14 days from one Outlook client alone), and a Trash-only
+# keep signal at all:
+#   - Trash / Deleted Items — deleting junk is not "this was ham"
+#   - any junk-shaped folder — Junk E-mail, Junk Email, ESET Antispam, Spam,
+#     INBOX.Junk. Junk->Junk churn is the single largest non-signal on the fleet
+#     (1801 events in 14 days from one Outlook client alone) and a Trash-only
 #     guard would train every one of them as ham.
-#   - Drafts / Sent  — not a filing destination for received mail
+#   - Drafts / Sent — not a filing destination for received mail
 if anyof (string :is "${mbox}" "Trash",
           string :is "${mbox}" "Drafts",
           string :is "${mbox}" "Sent",
