@@ -74,7 +74,7 @@ Sieve scripts on mrn are in `/etc/dovecot/sieve/`:
 The sieve scripts do **not** invoke `spamlite` directly. They call the `spamfilter`
 and `spamfilter-retrain` wrappers at `/usr/local/bin/` which dispatch between
 spamlite and spamprobe per-user based on whether `.spamlite/` exists in the user's
-Maildir. The `spamfilter` wrapper hardcodes `-t 0.6` as the global threshold —
+Maildir. The `spamfilter` wrapper hardcodes `-t 0.5` as the global threshold (and OMITS -t entirely for users with a params.toml, or the flag would override their per-user value) —
 this is the injection point for per-user threshold overrides, not spamlite itself.
 
 Per-user databases live at `/srv/{domain}/msg/{user}/.spamlite/db.sqlite`. See

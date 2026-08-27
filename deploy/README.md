@@ -14,7 +14,7 @@ Example identities in this file are anonymized.
   `/usr/local/bin/spamfilter` on mrn. Dispatches spamlite vs spamprobe per
   user based on `.spamlite/` existence. Runs shadow mode when
   `/etc/spamlite-shadow.allow` is present and matches (or contains `*`).
-  Hardcodes `-t 0.6` as the global threshold — injection point for per-user
+  Hardcodes `-t 0.5` as the global threshold, and omits -t entirely for users with a params.toml — injection point for per-user
   threshold overrides (Phase 1.1).
 
 ## Companion binaries
