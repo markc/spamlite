@@ -1,0 +1,311 @@
+#!/opt/cosmix/bin/mix
+-- rebuild-eval.mix — measure a from-scratch corpus rebuild against the live db,
+-- offline, before anything touches a mailbox.
+--
+--   rebuild-eval.mix <user@domain> [inbox_n] [test_n]
+--
+-- The question this answers: if you threw the donor-seeded db away and rebuilt
+-- from the user's own Junk and Sent, would their mail classify better or worse?
+-- An empty-db rebuild has been refuted twice on false positives, so it is not a
+-- thing to try on a live mailbox first and measure second.
+--
+-- Three candidates, all built in /root/rebuild-eval, all carrying the user's
+-- own params.toml so the combiner and threshold match production:
+--
+--   A  the live db, copied — the baseline, CONTAMINATED: the reconciler has
+--      already trained 99% of Junk and the recent INBOX window, so scoring it
+--      on that mail is scoring it on its own training data
+--   A* the live db with every test message untrained out of it — the honest
+--      baseline, and the only one of the two worth comparing against
+--   B  empty + Junk spam + Sent ham (`--sent`) — the proposed rebuild
+--   C  empty + Junk spam + Sent ham + INBOX-backlog ham — the same rebuild with
+--      the genre gap closed. Sent mail is the user's own outgoing prose and
+--      shares little vocabulary with the commercial mail they legitimately
+--      receive; a ham side made only of Sent leaves newsletters, invoices and
+--      notifications with nothing on the ham side to match, while the spam side
+--      is full of exactly that vocabulary. C tests whether that is what hurts.
+--
+-- Scored on a held-out slice of the user's OWN labelled mail: the newest test_n
+-- INBOX messages (expected GOOD) and the newest test_n Junk messages (expected
+-- SPAM), none of which are trained into any candidate. mdbox only.
+$a = args()
+if len($a) < 1 then print("usage: rebuild-eval.mix <user@domain> [inbox_n] [test_n]"); exit(1) end
+$login = $a[0]
+$INBOX_N = 1200
+if len($a) >= 2 then $INBOX_N = to_number($a[1]) end
+$TEST_N = 150
+if len($a) >= 3 then $TEST_N = to_number($a[2]) end
+
+$up = split($login, "@")
+$D = "/srv/" .. $up[1] .. "/msg/" .. $up[0]
+$live = $D .. "/.spamlite/db.sqlite"
+$liveparams = $D .. "/.spamlite/params.toml"
+$SL = "/usr/local/bin/spamlite"
+if is_file($live) == false then print("FAIL: no live db at " .. $live); exit(1) end
+
+$W = "/root/rebuild-eval"
+remove_dir($W)
+mkdir($W)
+mkdir($W .. "/msgs")
+mkdir($W .. "/sets")
+
+-- Stage the newest $n messages of one mailbox as files, newest first, using the
+-- doveadm path the reconciler stages mdbox mail with. Returns the paths.
+fn stage($login, $box, $n, $dir)
+  mkdir($dir)
+  $r = run_argv(["doveadm", "search", "-u", $login, "mailbox", $box, "all"], {timeout: 600})
+  if $r.exit_code != 0 then
+    print("FAIL: doveadm search " .. $box .. ": " .. strip($r.stderr))
+    exit(1)
+  end
+  $lines = split(strip($r.stdout), "\n")
+  $uids = []
+  $i = len($lines) - 1
+  while $i >= 0 and len($uids) < $n
+    $p = split(strip($lines[$i]), " ")
+    if len($p) >= 2 then
+      push($uids, $p[1])
+    end
+    $i = $i - 1
+  end
+  $out = []
+  $i = 0
+  while $i < len($uids)
+    $raw = $dir .. "/.raw"
+    $f = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $box, "uid", $uids[$i]], {stdout: {file: $raw}, timeout: 120})
+    if $f.exit_code == 0 then
+      $dst = $dir .. "/m" .. $uids[$i]
+      $s = run_argv(["sed", "1d", $raw], {stdout: {file: $dst}})
+      if $s.exit_code == 0 then
+        push($out, $dst)
+      end
+    end
+    $i = $i + 1
+  end
+  run_argv(["rm", "-f", $dir .. "/.raw"])
+  print("  staged " .. $box .. ": " .. len($out))
+  return $out
+end
+
+-- Materialise a subset as a directory of symlinks for train-dir.
+fn linkset($paths, $dir)
+  remove_dir($dir)
+  mkdir($dir)
+  if len($paths) == 0 then return $dir end
+  $r = run_argv(concat(["ln", "-s", "-t", $dir], $paths))
+  if $r.exit_code != 0 then
+    print("FAIL: linking " .. $dir .. ": " .. strip($r.stderr))
+    exit(1)
+  end
+  return $dir
+end
+
+fn newdb($dir, $liveparams)
+  mkdir($dir)
+  $r = run_argv(["/usr/local/bin/spamlite", "-d", $dir, "import"], {stdin: {file: "/dev/null"}, timeout: 120})
+  if $r.exit_code != 0 then
+    print("FAIL: creating empty db in " .. $dir .. ": " .. strip($r.stderr))
+    exit(1)
+  end
+  if is_file($liveparams) then copy($liveparams, $dir .. "/params.toml") end
+  return $dir
+end
+
+fn traindir($db, $dir, $class, $swap)
+  $argv = ["/usr/local/bin/spamlite", "-d", $db, "train-dir", $dir, $class]
+  if $swap == 1 then $argv = concat($argv, ["--sent"]) end
+  $r = run_argv($argv, {timeout: 3600})
+  print("  " .. $db .. " <- " .. basename($dir) .. " " .. $class .. ": " .. strip($r.stderr))
+end
+
+-- Score a list of messages, return the numeric scores.
+fn scores($db, $paths)
+  $out = []
+  $i = 0
+  while $i < len($paths)
+    $r = run_argv(["/usr/local/bin/spamlite", "-d", $db, "score"], {stdin: {file: $paths[$i]}, timeout: 60})
+    $p = split(strip($r.stdout), " ")
+    if len($p) >= 2 then
+      push($out, to_number($p[1]))
+    end
+    $i = $i + 1
+  end
+  return $out
+end
+
+-- key -> class from the reconciler sidecar (G=good, S=spam).
+fn sidecar_classes($log)
+  $m = {}
+  if is_file($log) == false then return $m end
+  $ll = read_lines($log)
+  $i = 0
+  while $i < len($ll)
+    $p = split($ll[$i], " ")
+    if len($p) >= 3 then
+      $m[$p[2]] = $p[0]
+    end
+    $i = $i + 1
+  end
+  return $m
+end
+
+-- staged path -> message-id key, via the same msgids verb the reconciler uses.
+fn keymap($dir)
+  $m = {}
+  $r = run_argv(["/usr/local/bin/spamlite", "msgids", $dir], {timeout: 600})
+  $ll = split($r.stdout, "\n")
+  $i = 0
+  while $i < len($ll)
+    $p = split($ll[$i], "\t")
+    if len($p) >= 3 then
+      $m[$p[2]] = lower(replace(replace($p[0], "<", ""), ">", ""))
+    end
+    $i = $i + 1
+  end
+  return $m
+end
+
+fn untrain_tests($db, $paths, $km, $cls)
+  $n = 0
+  $i = 0
+  while $i < len($paths)
+    $k = $km[$paths[$i]]
+    if $k != nil and $cls[$k] != nil then
+      $c = "good"
+      if $cls[$k] == "S" then $c = "spam" end
+      $r = run_argv(["/usr/local/bin/spamlite", "-d", $db, "untrain", $c], {stdin: {file: $paths[$i]}, timeout: 60})
+      if $r.exit_code == 0 then $n = $n + 1 end
+    end
+    $i = $i + 1
+  end
+  return $n
+end
+
+fn pad_right($s, $n)
+  $out = "" .. $s
+  while len($out) < $n
+    $out = $out .. " "
+  end
+  return $out
+end
+
+fn count_at_or_above($vals, $t)
+  $n = 0
+  $i = 0
+  while $i < len($vals)
+    if $vals[$i] >= $t then $n = $n + 1 end
+    $i = $i + 1
+  end
+  return $n
+end
+
+-- ------------------------------------------------------------------ staging
+print("staging " .. $login .. " (this is the slow part)")
+$junk = stage($login, "Junk", 2000, $W .. "/msgs/junk")
+$sent = stage($login, "Sent", 2000, $W .. "/msgs/sent")
+$inbox = stage($login, "INBOX", $INBOX_N, $W .. "/msgs/inbox")
+if len($junk) < $TEST_N * 2 or len($inbox) < $TEST_N * 2 then
+  print("FAIL: not enough Junk/INBOX to both train and hold out")
+  exit(1)
+end
+
+-- Newest slice of each is the test set and is trained into nothing.
+$test_junk = slice($junk, 0, $TEST_N)
+$train_junk = slice($junk, $TEST_N, len($junk))
+$test_inbox = slice($inbox, 0, $TEST_N)
+$train_inbox = slice($inbox, $TEST_N, len($inbox))
+$sent_b = slice($sent, 0, 835)
+print("")
+print("train: junk=" .. len($train_junk) .. " sent(B)=" .. len($sent_b) .. " sent(C)=" .. len($sent) .. " inbox(C)=" .. len($train_inbox))
+print("test:  junk=" .. len($test_junk) .. " (expect SPAM)  inbox=" .. len($test_inbox) .. " (expect GOOD)")
+
+$d_junk = linkset($train_junk, $W .. "/sets/junk")
+$d_sentb = linkset($sent_b, $W .. "/sets/sentb")
+$d_sentc = linkset($sent, $W .. "/sets/sentc")
+$d_inbox = linkset($train_inbox, $W .. "/sets/inbox")
+
+-- --------------------------------------------------------------- candidates
+print("")
+print("building candidates")
+$A = $W .. "/A"
+mkdir($A)
+copy($live, $A .. "/db.sqlite")
+if is_file($liveparams) then copy($liveparams, $A .. "/params.toml") end
+print("  A = live db copy")
+
+-- A* — A with the test set untrained, using the class the sidecar recorded and
+-- the raw geometry those paths were trained with. Without this the baseline is
+-- being quizzed on its own homework and wins by memorisation.
+$AS = $W .. "/As"
+mkdir($AS)
+copy($live, $AS .. "/db.sqlite")
+if is_file($liveparams) then copy($liveparams, $AS .. "/params.toml") end
+$cls = sidecar_classes($D .. "/.spamlite/reconciled.log")
+$k1 = keymap($W .. "/msgs/inbox")
+$k2 = keymap($W .. "/msgs/junk")
+$un = untrain_tests($AS, $test_inbox, $k1, $cls) + untrain_tests($AS, $test_junk, $k2, $cls)
+print("  A* = live db with " .. $un .. " test messages untrained out of it")
+
+$B = newdb($W .. "/B", $liveparams)
+traindir($B, $d_junk, "spam", 0)
+traindir($B, $d_sentb, "good", 1)
+
+$C = newdb($W .. "/C", $liveparams)
+traindir($C, $d_junk, "spam", 0)
+traindir($C, $d_sentc, "good", 1)
+traindir($C, $d_inbox, "good", 0)
+
+-- D — the live db with the Sent ham top-up added, built on A* so it inherits
+-- the same decontamination. This is the additive alternative to a rebuild, and
+-- the one that has to be measured before it is recommended: more ham shifts
+-- every score hamward, which trades false positives for false negatives.
+$DD = $W .. "/D"
+mkdir($DD)
+copy($AS .. "/db.sqlite", $DD .. "/db.sqlite")
+if is_file($liveparams) then copy($liveparams, $DD .. "/params.toml") end
+traindir($DD, $d_sentc, "good", 1)
+
+-- -------------------------------------------------------------------- score
+print("")
+print("scoring the held-out slice")
+$names = ["A* live (honest baseline)", "B rebuild: junk+sent", "C rebuild: +inbox ham", "D live + sent ham"]
+$dbs = [$AS, $B, $C, $DD]
+$rows = []
+$i = 0
+while $i < len($dbs)
+  $sg = scores($dbs[$i], $test_inbox)
+  $ss = scores($dbs[$i], $test_junk)
+  push($rows, [$names[$i], $sg, $ss])
+  $i = $i + 1
+end
+
+$ths = [0.5, 0.6, 0.75, 0.9]
+$ti = 0
+while $ti < len($ths)
+  $t = $ths[$ti]
+  print("")
+  print("== threshold " .. $t)
+  print("  candidate            corpus            FP (ham->Junk)   FN (spam->INBOX)")
+  $i = 0
+  while $i < len($rows)
+    $r = $rows[$i]
+    $st = run_argv([$SL, "-d", $dbs[$i], "stats"]).stdout
+    $g = ""
+    $s = ""
+    $sl = split($st, "\n")
+    $j = 0
+    while $j < len($sl)
+      $p = split(strip($sl[$j]), " ")
+      if len($p) >= 2 and $p[0] == "good" then $g = $p[1] end
+      if len($p) >= 2 and $p[0] == "spam" then $s = $p[1] end
+      $j = $j + 1
+    end
+    $fp = count_at_or_above($r[1], $t)
+    $fn = len($r[2]) - count_at_or_above($r[2], $t)
+    print("  " .. pad_right($r[0], 20) .. " " .. pad_right($g .. "g/" .. $s .. "s", 17) .. " " .. pad_right($fp .. "/" .. len($r[1]), 16) .. " " .. $fn .. "/" .. len($r[2]))
+    $i = $i + 1
+  end
+  $ti = $ti + 1
+end
+print("")
+print("nothing was written to " .. $live)
