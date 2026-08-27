@@ -348,16 +348,31 @@ fn cmd_train(is_spam: bool) {
     }
 }
 
+/// Returns `(class, sent_swap)`. `--sent` exists here for symmetry with
+/// `train-dir --sent`: an untrain must tokenize a message exactly as the train
+/// that is being reversed did, or it decrements tokens the train never
+/// incremented and strands the ones it did.
+fn match_untrain_args(args: &[String]) -> Option<(&str, bool)> {
+    match args {
+        [class] if class == "spam" || class == "good" => Some((class.as_str(), false)),
+        [class, flag] if class == "good" && flag == "--sent" => Some((class.as_str(), true)),
+        _ => None,
+    }
+}
+
 fn cmd_untrain(args: &[String]) {
-    let class = match args {
-        [class] if class == "spam" || class == "good" => class.as_str(),
-        _ => {
-            eprintln!("spamlite: usage: untrain spam|good");
+    let (class, sent_swap) = match match_untrain_args(args) {
+        Some(parsed) => parsed,
+        None => {
+            eprintln!("spamlite: usage: untrain spam|good [--sent]");
             process::exit(1);
         }
     };
     let raw = read_stdin();
-    let config = tokenizer::TokenizerConfig::from_env();
+    let mut config = tokenizer::TokenizerConfig::from_env();
+    // Flag only, never env — same reason as train-dir: an exported variable
+    // inherited by the delivery path would invert live inbound mail.
+    config.sent_swap = sent_swap;
     let tokens = tokenizer::tokenize_for_training(&raw, &config);
     let db = open_db_existing_for_correction();
     let result = db.untrain(&tokens, class == "spam").unwrap_or_else(|e| {
@@ -884,8 +899,11 @@ Usage:
   spamlite [-d DIR] [-t THRESHOLD] explain             Verbose token-level breakdown (debug)
   spamlite [-d DIR] spam                               Train message from stdin as spam
   spamlite [-d DIR] good                               Train message from stdin as good/ham
-  spamlite [-d DIR] untrain spam|good                  Remove stdin message from one class
-                                                       (db must already exist)
+  spamlite [-d DIR] untrain spam|good [--sent]         Remove stdin message from one class
+                                                       (db must already exist). --sent (good
+                                                       only) reverses a train-dir --sent: the
+                                                       untrain must tokenize exactly as the
+                                                       train being reversed did
   spamlite [-d DIR] train-dir <MSGDIR> spam|good
                               [--from spam|good]       Bulk-train every file in MSGDIR (durable
                               [--sent]                 transaction per 500-message chunk; label
@@ -1133,5 +1151,34 @@ mod tests {
         }
 
         assert_eq!(panic_values, vec!["unwind"]);
+    }
+}
+
+#[cfg(test)]
+mod untrain_arg_tests {
+    use super::*;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn untrain_sent_flag_is_good_only_and_off_by_default() {
+        assert_eq!(
+            match_untrain_args(&strings(&["good"])),
+            Some(("good", false))
+        );
+        assert_eq!(
+            match_untrain_args(&strings(&["spam"])),
+            Some(("spam", false))
+        );
+        assert_eq!(
+            match_untrain_args(&strings(&["good", "--sent"])),
+            Some(("good", true))
+        );
+        // Sent mail is ham by construction, so there is no spam swap to reverse.
+        assert!(match_untrain_args(&strings(&["spam", "--sent"])).is_none());
+        assert!(match_untrain_args(&strings(&["good", "--nope"])).is_none());
+        assert!(match_untrain_args(&strings(&[])).is_none());
     }
 }
