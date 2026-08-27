@@ -38,6 +38,15 @@ The modules have clean boundaries:
 - **Location-prefixed tokens** — `h:subject:`, `h:from:`, `b:`, `u:` improve accuracy
 - **Subject bigrams** — `h:subject:make_money` catches phrase-level spam signals
 - **Export/import CSV** — compatible with spamprobe format: `good,spam,flags,"word"`
+- **Sent-folder ham needs `train-dir <dir> good --sent`** — Sent mail's header
+  geometry is inverted (the user is the sender). Trained raw it gives the user's
+  own domain a large `h:from:` ham count that a from-spoofing phish inherits, and
+  throws the correspondent away with the `h:to:` header that `expanded_headers`
+  leaves off by default. `--sent` emits the recipient under `h:from:` and drops
+  the self-side headers (From, Reply-To, Sender, Cc, Received), reproducing the
+  token shape that correspondent's inbound mail would produce. It is a corpus
+  shape, not a feature flag: deliberately unreachable from `SPAMLITE_*` env, since
+  an exported variable inherited by the delivery path would invert live mail.
 
 ## Build
 

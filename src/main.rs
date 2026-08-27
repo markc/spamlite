@@ -656,10 +656,17 @@ const TRAIN_CHUNK: usize = 500;
 /// Real mail runs well under 10k raw tokens; this only bites synthetic input.
 const TRAIN_CHUNK_TOKEN_BUDGET: usize = 1_000_000;
 
-fn match_train_dir_args(args: &[String]) -> Option<(&str, &str, Option<&str>)> {
+/// Returns `(dir, class, from_class, sent_swap)`. `--sent` is accepted only for
+/// `good` and only without `--from`: it declares the directory to be Sent-folder
+/// mail, which is ham by construction, and a class correction of Sent mail is
+/// not a thing the reconciler or a user can produce.
+fn match_train_dir_args(args: &[String]) -> Option<(&str, &str, Option<&str>, bool)> {
     match args {
         [dir, class] if class == "spam" || class == "good" => {
-            Some((dir.as_str(), class.as_str(), None))
+            Some((dir.as_str(), class.as_str(), None, false))
+        }
+        [dir, class, flag] if class == "good" && flag == "--sent" => {
+            Some((dir.as_str(), class.as_str(), None, true))
         }
         [dir, class, flag, from]
             if (class == "spam" || class == "good")
@@ -667,24 +674,27 @@ fn match_train_dir_args(args: &[String]) -> Option<(&str, &str, Option<&str>)> {
                 && (from == "spam" || from == "good")
                 && from != class =>
         {
-            Some((dir.as_str(), class.as_str(), Some(from.as_str())))
+            Some((dir.as_str(), class.as_str(), Some(from.as_str()), false))
         }
         _ => None,
     }
 }
 
 fn cmd_train_dir(args: &[String]) {
-    let (dir, class, from_class) = match match_train_dir_args(args) {
+    let (dir, class, from_class, sent_swap) = match match_train_dir_args(args) {
         Some(parsed) => parsed,
         None => {
-            eprintln!("spamlite: usage: train-dir <dir> spam|good [--from spam|good]");
+            eprintln!("spamlite: usage: train-dir <dir> spam|good [--from spam|good] [--sent]");
             process::exit(1);
         }
     };
     let is_spam = class == "spam";
     let from_spam = from_class.map(|from| from == "spam");
     let db = open_db_existing_for_correction();
-    let tokenizer_config = tokenizer::TokenizerConfig::from_env();
+    let mut tokenizer_config = tokenizer::TokenizerConfig::from_env();
+    // Set from the flag only — never from the environment, so a variable
+    // exported around the delivery path cannot invert live inbound mail.
+    tokenizer_config.sent_swap = sent_swap;
 
     let scan = list_message_files(dir);
     let mut ok = 0u64;
@@ -878,11 +888,15 @@ Usage:
                                                        (db must already exist)
   spamlite [-d DIR] train-dir <MSGDIR> spam|good
                               [--from spam|good]       Bulk-train every file in MSGDIR (durable
-                                                       transaction per 500-message chunk; label
+                              [--sent]                 transaction per 500-message chunk; label
                                                        headers stripped; TSV report on stdout,
                                                        printed post-commit; db must exist). With
                                                        --from, atomically correct each message
-                                                       from the named class to the target class
+                                                       from the named class to the target class.
+                                                       With --sent (good only), treat MSGDIR as
+                                                       the user's Sent folder: train the
+                                                       recipient as the sender and drop the
+                                                       self-side headers
   spamlite msgids <MSGDIR>                             Print msgid/from/path TSV per file
   spamlite [-d DIR] stats                              Machine-readable stats (key value lines)
   spamlite [-d DIR] counts                             Show database statistics
@@ -1044,6 +1058,31 @@ mod tests {
         assert!(match_train_dir_args(&strings(&["dir", "spam", "--from", "spam"])).is_none());
         assert!(match_train_dir_args(&strings(&["dir", "spam"])).is_some());
         assert!(match_train_dir_args(&strings(&["dir", "spam", "--from", "good"])).is_some());
+    }
+
+    #[test]
+    fn train_dir_sent_flag_is_good_only_and_off_by_default() {
+        let strings = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            match_train_dir_args(&strings(&["dir", "good", "--sent"])),
+            Some(("dir", "good", None, true))
+        );
+        // Sent mail is ham by construction; the other shapes are not a thing.
+        assert!(match_train_dir_args(&strings(&["dir", "spam", "--sent"])).is_none());
+        assert!(
+            match_train_dir_args(&strings(&["dir", "good", "--sent", "--from", "spam"])).is_none()
+        );
+        // Every existing invocation keeps the unswapped tokenizer.
+        assert_eq!(
+            match_train_dir_args(&strings(&["dir", "good"])),
+            Some(("dir", "good", None, false))
+        );
     }
 
     #[test]
