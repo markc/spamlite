@@ -1,0 +1,86 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-trend.mix — per-day spamlite trend for one user from the sieve
+-- DELIVERY / TRAIN lines in /var/log/mail.log*. Answers "is it getting better"
+-- without touching the db: the actionable column is junk.6-.85 (junk scored
+-- inside the false-positive risk band) and rescued->good (the user dragging
+-- mail back out of Junk). Fleet-generic; run on the mail host, or ship it with
+-- ssh_mix(host, read_file("deploy/spamlite-trend.mix"),
+--         {env: {SPAMLITE_USER: "u@d", SPAMLITE_SINCE: "YYYY-MM-DD"}}).
+--
+--   spamlite-trend.mix <user@domain> [since YYYY-MM-DD]   (default: 14 days back)
+--   env SPAMLITE_USER / SPAMLITE_SINCE override the positionals (for ssh_mix).
+--
+-- Columns:
+--   inbox / junk        deliveries by destination
+--   junk>=.85           confident junk (not worth reading)
+--   junk.6-.85          borderline junk = possible false positives
+--   junk<.6             junk under 0.6 (non-empty only while a user's threshold is 0.5)
+--   inbox>=.4           inbox near-misses (ham the filter almost junked)
+--   rescued->good       imapsieve TRAIN->good (Junk -> Inbox), re-fires collapsed
+--   moved->spam         imapsieve TRAIN->spam (Inbox -> Junk), re-fires collapsed
+--
+-- The 0.6 / 0.85 band edges are the fleet review convention (threshold + 0.25),
+-- not read from params.toml — a user on threshold 0.5 shows their 0.5-0.6 junk in
+-- junk<.6. grep -a is required: rotated mail.log files trip grep's binary sniff.
+
+$a = args()
+$U = env("SPAMLITE_USER", if len($a) > 0 then; $a[0]; else; ""; end)
+if $U == "" then
+  print("usage: spamlite-trend.mix <user@domain> [since YYYY-MM-DD]")
+  exit(2)
+end
+$SINCE = env("SPAMLITE_SINCE", if len($a) > 1 then; $a[1]; else; date_format(time() - 14 * 86400, "%Y-%m-%d"); end)
+
+$logs = run("ls -r /var/log/mail.log* 2>/dev/null | tr '\\n' ' '")
+$raw = run("zcat -f " .. $logs .. " | grep -a '" .. $U .. "' | grep -aE 'DELIVERY:|TRAIN:'")
+
+$days = {}
+$lastgood = ""
+$lastspam = ""
+for each $l in split($raw, "\n")
+  if $l == "" then; continue; end
+  $d = substr($l, 0, 10)
+  if $d < $SINCE then; continue; end
+  $rec = $days[$d] ?? {inbox: 0, junk: 0, hi: 0, band: 0, lo: 0, near: 0, tgood: 0, tspam: 0}
+  if regex_match("DELIVERY:", $l) then
+    $r = regex_find("(SPAM|GOOD) ([0-9.]+)", $l)
+    if len($r) > 0 then
+      $s = to_number($r[0].groups[1])
+      if regex_match("-> Junk", $l) then
+        $rec.junk = $rec.junk + 1
+        if $s >= 0.85 then; $rec.hi = $rec.hi + 1; end
+        if $s >= 0.6 and $s < 0.85 then; $rec.band = $rec.band + 1; end
+        if $s < 0.6 then; $rec.lo = $rec.lo + 1; end
+      else
+        $rec.inbox = $rec.inbox + 1
+        if $s >= 0.4 then; $rec.near = $rec.near + 1; end
+      end
+    end
+  else
+    -- imapsieve re-fires the same TRAIN a few seconds apart: collapse hits
+    -- within 20s of the previous one on the same day and direction.
+    $ts = substr($l, 11, 8)
+    $sec = to_number(substr($ts, 0, 2)) * 3600 + to_number(substr($ts, 3, 2)) * 60 + to_number(substr($ts, 6, 2))
+    $key = $d .. ":" .. $sec
+    if regex_match("-> good", $l) then
+      if $lastgood == "" or substr($lastgood, 0, 10) != $d or $sec - to_number(substr($lastgood, 11)) > 20 then
+        $rec.tgood = $rec.tgood + 1
+      end
+      $lastgood = $key
+    end
+    if regex_match("-> spam", $l) then
+      if $lastspam == "" or substr($lastspam, 0, 10) != $d or $sec - to_number(substr($lastspam, 11)) > 20 then
+        $rec.tspam = $rec.tspam + 1
+      end
+      $lastspam = $key
+    end
+  end
+  $days[$d] = $rec
+end
+
+print("spamlite trend - " .. $U .. " - since " .. $SINCE)
+print("day         inbox junk | junk>=.85 junk.6-.85 junk<.6 | inbox>=.4 | rescued->good  moved->spam")
+for each $d in sort(keys($days))
+  $r = $days[$d]
+  print($d .. lpad($r.inbox, 6) .. lpad($r.junk, 5) .. " |" .. lpad($r.hi, 10) .. lpad($r.band, 11) .. lpad($r.lo, 8) .. " |" .. lpad($r.near, 10) .. " |" .. lpad($r.tgood, 14) .. lpad($r.tspam, 13))
+end
