@@ -17,6 +17,12 @@ Example identities in this file are anonymized.
   Hardcodes `-t 0.5` as the global threshold, and omits -t entirely for users with a params.toml — injection point for per-user
   threshold overrides (Phase 1.1).
 
+- **`spamlite-trend.mix`** — per-day filtering trend for one user from the
+  sieve DELIVERY/TRAIN lines in `/var/log/mail.log*` (no db access). The
+  columns that decide anything are `junk.6-.85` (borderline junk = FP risk) and
+  `rescued->good`. `spamlite-trend.mix u@d [since]`, or ship it with
+  `ssh_mix(host, read_file(...), {env: {SPAMLITE_USER: "u@d"}})`.
+
 ## Companion binaries
 
 Not in this directory (they're built from `src/`):
