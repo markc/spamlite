@@ -22,6 +22,7 @@
 -- The 0.6 / 0.85 band edges are the fleet review convention (threshold + 0.25),
 -- not read from params.toml — a user on threshold 0.5 shows their 0.5-0.6 junk in
 -- junk<.6. grep -a is required: rotated mail.log files trip grep's binary sniff.
+-- Source: /var/log/mail.log* when present, else journalctl (mbx is journald-only).
 
 $a = args()
 $U = env("SPAMLITE_USER", if len($a) > 0 then; $a[0]; else; ""; end)
@@ -31,8 +32,14 @@ if $U == "" then
 end
 $SINCE = env("SPAMLITE_SINCE", if len($a) > 1 then; $a[1]; else; date_format(time() - 14 * 86400, "%Y-%m-%d"); end)
 
-$logs = run("ls -r /var/log/mail.log* 2>/dev/null | tr '\\n' ' '")
-$raw = run("zcat -f " .. $logs .. " | grep -a '" .. $U .. "' | grep -aE 'DELIVERY:|TRAIN:'")
+-- File hosts (mrn/mbc) keep /var/log/mail.log*; journald-only hosts (mbx) fall
+-- back to journalctl. short-iso puts the date/time at the same offsets.
+$logs = run("ls -r /var/log/mail.log* 2>/dev/null | tr '\\n' ' ' || true")
+if strip($logs) != "" then
+  $raw = run("zcat -f " .. $logs .. " | grep -a '" .. $U .. "' | grep -aE 'DELIVERY:|TRAIN:' || true")
+else
+  $raw = run("journalctl --since '" .. $SINCE .. "' --no-pager -o short-iso -g '" .. $U .. "' 2>/dev/null | grep -aE 'DELIVERY:|TRAIN:' || true")
+end
 
 $days = {}
 $lastgood = ""
