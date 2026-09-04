@@ -41,7 +41,7 @@ end
 $abuse = [".lol", ".store", ".cloud", ".space", ".shop", ".click", ".top", ".xyz", ".online", ".site", ".fun", ".live", ".biz"]
 
 fn cap1($pat, $s)
-  $r = regex_find($pat, $s)
+  $r = re_find($s, $pat)
   if length($r) == 0 then return nil end
   return $r[0].groups[0]
 end

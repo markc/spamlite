@@ -56,7 +56,7 @@ function read_score($path)
   try
     $bytes = read_file_bytes($path, $HEADER_BYTES)
     $head = bytes_to_string($bytes, {"lossy": true})
-    $m = regex_find($SCORE_RE, $head)
+    $m = re_find($head, $SCORE_RE)
     if length($m) == 0 then
       return nil
     end
