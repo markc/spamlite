@@ -49,11 +49,11 @@ for each $l in split($raw, "\n")
   $d = substr($l, 0, 10)
   if $d < $SINCE then; continue; end
   $rec = $days[$d] ?? {inbox: 0, junk: 0, hi: 0, band: 0, lo: 0, near: 0, tgood: 0, tspam: 0}
-  if regex_match("DELIVERY:", $l) then
-    $r = regex_find("(SPAM|GOOD) ([0-9.]+)", $l)
+  if re_match($l, "DELIVERY:") then
+    $r = re_find($l, "(SPAM|GOOD) ([0-9.]+)")
     if len($r) > 0 then
       $s = to_number($r[0].groups[1])
-      if regex_match("-> Junk", $l) then
+      if re_match($l, "-> Junk") then
         $rec.junk = $rec.junk + 1
         if $s >= 0.85 then; $rec.hi = $rec.hi + 1; end
         if $s >= 0.6 and $s < 0.85 then; $rec.band = $rec.band + 1; end
@@ -69,13 +69,13 @@ for each $l in split($raw, "\n")
     $ts = substr($l, 11, 8)
     $sec = to_number(substr($ts, 0, 2)) * 3600 + to_number(substr($ts, 3, 2)) * 60 + to_number(substr($ts, 6, 2))
     $key = $d .. ":" .. $sec
-    if regex_match("-> good", $l) then
+    if re_match($l, "-> good") then
       if $lastgood == "" or substr($lastgood, 0, 10) != $d or $sec - to_number(substr($lastgood, 11)) > 20 then
         $rec.tgood = $rec.tgood + 1
       end
       $lastgood = $key
     end
-    if regex_match("-> spam", $l) then
+    if re_match($l, "-> spam") then
       if $lastspam == "" or substr($lastspam, 0, 10) != $d or $sec - to_number(substr($lastspam, 11)) > 20 then
         $rec.tspam = $rec.tspam + 1
       end
