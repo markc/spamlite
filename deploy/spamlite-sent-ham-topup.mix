@@ -49,7 +49,11 @@ if is_file($log) then
 end
 
 -- 2. msgids wanted: doveadm search scope -> message-ids (lowercase, no <>)
-$r = run_argv(["doveadm", "fetch", "-u", $login, "hdr.message-id", "mailbox", "Sent", "sentsince", $SINCE], {timeout: 300})
+$r = run_argv(["doveadm", "fetch", "-u", $login, "hdr.message-id", "mailbox", "Sent", "sentsince", $SINCE], {timeout: 1800})
+if $r.exit_code != 0 then
+  print("ERROR: doveadm fetch failed (exit=" .. $r.exit_code .. ", timed_out=" .. $r.timed_out .. ") — refusing to continue with an empty want-set")
+  exit(1)
+end
 $want = {}
 $nwant = 0
 $ls = split($r.stdout, "\n")
@@ -65,11 +69,22 @@ while $i < len($ls)
 end
 
 -- 3. map msgid -> file via spamlite msgids over the Sent maildir
-$m = run_argv([$SL, "msgids", $D .. "/Maildir/.Sent/cur"], {timeout: 300})
+-- msgids goes to a file route, NOT captured stdout: run_argv capture is capped
+-- at 8 MiB by default (exit still 0), and a ~66k-message Sent/ scan is ~12 MB —
+-- the truncated tail is the RECENT mail, so every wanted message vanished and
+-- the run reported mapped=0 as if that were a fact (2026-09-07,
+-- lauren@indoorsport.com.au on mbc). File routes are uncapped.
+$MTMP = "/root/sent-ham-msgids.tsv"
+$m = run_argv([$SL, "msgids", $D .. "/Maildir/.Sent/cur"], {timeout: 1800, stdout: {file: $MTMP}})
+if $m.exit_code != 0 then
+  print("ERROR: spamlite msgids failed (exit=" .. $m.exit_code .. ", timed_out=" .. $m.timed_out .. ") — a large Sent/ scan that dies here used to report mapped=0 as if it were success")
+  exit(1)
+end
 $paths = []
 $key_bn = {}
 $skipped_seen = 0
-$ml = split($m.stdout, "\n")
+$ml = read_lines($MTMP)
+remove($MTMP)
 $i = 0
 while $i < len($ml)
   $p = split($ml[$i], "\t")
