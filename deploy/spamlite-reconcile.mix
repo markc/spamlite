@@ -6,8 +6,24 @@
 --   spam: everything in Junk and its child mailboxes
 --   ham:  everything in INBOX older than RIPEN (survived triage) and younger
 --         than WINDOW (older mail either trained already or missed)
+--   ham:  everything the user FILED into a kept folder, same window
+--         (2026-09-17). "Kept" = not junk/spam/trash/deleted/drafts/sent/
+--         outbox/templates by name (the retrain-as-ham.sieve denylist, applied
+--         per hierarchy component), and on Maildir not a symlinked alias
+--         (Outlook's "Junk E-mail" -> .Junk). Filed mail whose From is the
+--         user's own address is skipped (archived Sent mail has inverted
+--         geometry — see spamlite-sent-ham-topup.mix). Why: users who file
+--         INBOX mail into named folders within RIPEN supplied NO ham at all
+--         while Junk kept supplying spam, and daily automated mail left in
+--         Junk climbed to 1.000 (a 2026-09-17 production case: 131 S vs 4 G
+--         in the sidecar, zero ham growth since the seed).
+--         Only SEEN, undeleted filed mail counts (rule-filed unread mail is
+--         not a keep signal); filed gets its own nightly cap (FILED_CAP)
+--         inside the ham cap; a filed-folder failure only drops filed.
 --   never: Trash (deletion is not a class signal), unseen new/ mail
--- Ham policy is deliberately unchanged: only the ripened INBOX window trains.
+-- A key seen in BOTH a spam source and a ham source on the same night trains
+-- neither (ambiguous: a copy left behind); a key seen twice in one class
+-- trains once.
 --
 -- Mailbox access per user dir (auto-detected):
 --   Maildir/  — direct file globs (Junk = .Junk/{cur,new} plus
@@ -61,6 +77,7 @@ $SL = env("SPAMLITE_BIN", "/usr/local/bin/spamlite")
 $RIPEN = 259200
 $WINDOW = 2592000
 $CAP = 200
+$FILED_CAP = 100
 $DRY = 0
 $FILTER = ""
 $ROOT = "/srv"
@@ -87,6 +104,39 @@ fn first_line($s)
   $clean = strip($s)
   if $clean == "" then return "-" end
   return split($clean, "\n")[0]
+end
+
+-- A mailbox the user keeps mail in: no hierarchy component (either separator)
+-- names a non-keep destination. INBOX itself and the Junk tree are handled by
+-- their own sources and are never "filed".
+fn kept_box($box)
+  $l = lower(strip($box))
+  if $l == "" or $l == "." or $l == "inbox" or starts_with($l, ".") then return 0 end
+  for $bad in ["junk", "spam", "detected items", "infected items", "quarantine", "bulk", "virus", "phish", "unwanted", "suspect"]
+    if contains($l, $bad) then return 0 end
+  end
+  $parts = split(replace($l, "/", "."), ".")
+  -- shared / public / virtual namespaces hold other people's or aggregated mail
+  $top = strip($parts[0])
+  if $top == "shared" or $top == "public" or $top == "virtual" then return 0 end
+  for $part in $parts
+    $c = strip($part)
+    for $pre in ["trash", "deleted", "draft", "sent", "outbox", "template", "papierkorb", "gesendet", "gelöscht", "elementos enviados", "elementos eliminados", "envoy", "corbeille"]
+      if starts_with($c, $pre) then return 0 end
+    end
+  end
+  return 1
+end
+
+-- 1 = a real directory we may scan; 0 = symlinked alias or vanished mid-run
+fn real_dir($path)
+  try
+    $st = stat($path, {follow_symlinks: false})
+    if $st.is_symlink then return 0 end
+    return 1
+  catch $e
+    return 0
+  end
 end
 
 fn checked_glob($pattern)
@@ -236,6 +286,9 @@ while $u < len($users)
     $key_bn = {}
     $from_bn = {}
     $box_bn = {}
+    $filed_bn = {}
+    $filed_note = ""
+    $nfiled = 0
     $key_path = {}
     $from_path = {}
     $fallback_path = {}
@@ -329,8 +382,61 @@ while $u < len($users)
           end
         end
       end
+      -- filed ham: every kept, non-symlinked .<box>/cur, same epoch window.
+      -- An unreadable folder is skipped with a note, not failed closed: this
+      -- source only ever adds ham, and the INBOX + Junk sources are intact.
+      -- Only SEEN, not-deleted files count: a folder a server/client rule fills
+      -- unread is not a keep signal (Maildir flags after ":2,": S seen, T
+      -- trashed). Grouped per folder so staging never collides on basenames.
+      $filed = []
+      $filed_groups = []
+      $filed_note = ""
+      if $enumeration_failed == 0 then
+        $fcur = checked_glob($d .. "/Maildir/.*/cur")
+        if $fcur.ok == 0 then
+          $filed_note = " filed-skipped=" .. first_line("" .. $fcur.error)
+        else
+          $fdi = 0
+          while $fdi < len($fcur.files)
+            $fcd = $fcur.files[$fdi]
+            $fbox_dir = substr($fcd, 0, len($fcd) - 4)
+            $fparts = split($fbox_dir, "/")
+            $fname = $fparts[len($fparts) - 1]
+            $fbox = substr($fname, 1, len($fname) - 1)
+            if kept_box($fbox) == 1 and real_dir($fbox_dir) == 1 then
+              if not access($fcd, "rx") then
+                $filed_note = $filed_note .. " filed-unreadable=" .. $fbox
+              else
+                $fg = checked_glob($fcd .. "/*")
+                if $fg.ok == 0 then
+                  $filed_note = $filed_note .. " filed-unreadable=" .. $fbox
+                else
+                  $grp = []
+                  $ffi = 0
+                  while $ffi < len($fg.files)
+                    $fps = split($fg.files[$ffi], "/")
+                    $fbase = $fps[len($fps) - 1]
+                    $fe = to_number(substr($fbase, 0, 10))
+                    $fflags = after($fbase, ":2,") or ""
+                    if $fe != nil and $fe >= $HAM_LO and $fe <= $HAM_HI and contains($fflags, "S") and not contains($fflags, "T") then
+                      push($filed, $fg.files[$ffi])
+                      push($grp, $fg.files[$ffi])
+                    end
+                    $ffi = $ffi + 1
+                  end
+                  if len($grp) > 0 then
+                    push($filed_groups, $grp)
+                  end
+                end
+              end
+            end
+            $fdi = $fdi + 1
+          end
+        end
+      end
       $njunk = len($junk)
       $nham = len($inbox)
+      $nfiled = len($filed)
 
       -- keys via `spamlite msgids`: Junk dirs scanned whole; the inbox window
       -- is a subset of cur/, so it is staged as symlinks for its scan. A file
@@ -357,6 +463,54 @@ while $u < len($users)
             $fallback_path[$scan .. "/" .. $ib] = "f:" .. $ibn
             $ifi = $ifi + 1
           end
+        end
+      end
+      $scanf = $STAGE .. ".scanf"
+      remove_dir($scanf)
+      mkdir($scanf)
+      -- filed: one scan subdir per folder chunk (<= 1000 links) — basenames
+      -- are unique only within a folder, and one giant argv can hit E2BIG.
+      $filed_scan = {}
+      $filed_dirs = []
+      if len($filed) > 0 and $enumeration_failed == 0 then
+        $stage_ok = 1
+        $gi = 0
+        $chunk_no = 0
+        while $gi < len($filed_groups) and $stage_ok == 1
+          $grp = $filed_groups[$gi]
+          $off = 0
+          while $off < len($grp) and $stage_ok == 1
+            $part = slice($grp, $off, $off + 1000)
+            $cdir = $scanf .. "/" .. $chunk_no
+            mkdir($cdir)
+            $link_r = run_argv(concat(["ln", "-s", "-t", $cdir], $part))
+            if $link_r.exit_code != 0 then
+              -- filed is additive: drop the source for tonight, keep the rest
+              $filed_note = $filed_note .. " filed-stage-failed=" .. first_line($link_r.stderr .. " " .. ($link_r.error or ""))
+              $stage_ok = 0
+            else
+              push($filed_dirs, $cdir)
+              for $src in $part
+                $fparts = split($src, "/")
+                $fb = $fparts[len($fparts) - 1]
+                $fbn = $fb
+                $ffl = pos(":2,", $fbn)
+                if $ffl > 0 then
+                  $fbn = substr($fbn, 0, $ffl - 1)
+                end
+                $filed_scan[$src] = $cdir .. "/" .. $fb
+                $fallback_path[$cdir .. "/" .. $fb] = "f:" .. $fparts[len($fparts) - 3] .. "/" .. $fbn
+              end
+            end
+            $off = $off + 1000
+            $chunk_no = $chunk_no + 1
+          end
+          $gi = $gi + 1
+        end
+        if $stage_ok == 0 then
+          $filed = []
+          $filed_dirs = []
+          $nfiled = 0
         end
       end
       $kl = []
@@ -388,7 +542,32 @@ while $u < len($users)
           end
         end
       end
+      if len($filed) > 0 and $enumeration_failed == 0 then
+        $fkl = []
+        $scan_ok = 1
+        for $cdir in $filed_dirs
+          if $scan_ok == 1 then
+            $r = run_argv([$SL, "msgids", $cdir], {timeout: 300})
+            if $r.exit_code != 0 then
+              -- a file moved mid-run: drop filed for tonight, keep the rest
+              $filed_note = $filed_note .. " filed-scan-failed=" .. first_line($r.stderr)
+              $scan_ok = 0
+            else
+              if strip($r.stdout) != "" then
+                $fkl = concat($fkl, split(strip($r.stdout), "\n"))
+              end
+            end
+          end
+        end
+        if $scan_ok == 1 then
+          $kl = concat($kl, $fkl)
+        else
+          $filed = []
+          $nfiled = 0
+        end
+      end
       remove_dir($scan)
+      remove_dir($scanf)
       $ki = 0
       while $ki < len($kl)
         $p = split($kl[$ki], "\t")
@@ -414,12 +593,13 @@ while $u < len($users)
         $ki = $ki + 1
       end
 
-      $sets = [["S", $junk], ["G", $inbox]]
+      $sets = [["S", $junk, ""], ["G", $inbox, $scan], ["G", $filed, "filed"]]
       $si = 0
       $ref_num = 0
       while $si < len($sets)
         $cls = $sets[$si][0]
         $files = $sets[$si][1]
+        $scan_dir = $sets[$si][2]
         $fi = 0
         while $fi < len($files)
           $f = $files[$fi]
@@ -431,12 +611,19 @@ while $u < len($users)
             $bn = substr($bn, 0, $fl - 1)
           end
           $key_source = $f
-          if $cls == "G" then
-            $key_source = $scan .. "/" .. $b
+          if $scan_dir == "filed" then
+            $key_source = $filed_scan[$f]
+          else
+            if $scan_dir != "" then
+              $key_source = $scan_dir .. "/" .. $b
+            end
           end
           $ref = "m." .. $ref_num
           $key_bn[$ref] = $key_path[$key_source]
           $from_bn[$ref] = $from_path[$key_source]
+          if $si == 2 then
+            $filed_bn[$ref] = 1
+          end
           push($cand, substr($b, 0, 10) .. "|" .. $cls .. "|" .. $f .. "|" .. $ref)
           $ref_num = $ref_num + 1
           $fi = $fi + 1
@@ -484,6 +671,18 @@ while $u < len($users)
       end
       if $enumeration_failed == 0 then
         push($plans, ["G", "INBOX", ["mailbox", "INBOX", "savedsince", "" .. $HAM_LO, "savedbefore", "" .. $HAM_HI]])
+        -- filed ham: one plan per kept mailbox (a list failure only skips filed)
+        $al = run_argv(["doveadm", "mailbox", "list", "-u", $login], {timeout: 300})
+        if $al.exit_code != 0 then
+          $filed_note = " filed-skipped=" .. first_line($al.stderr)
+        else
+          for $fb_line in split($al.stdout, "\n")
+            $fbox = strip($fb_line)
+            if kept_box($fbox) == 1 then
+              push($plans, ["G", $fbox, ["mailbox", $fbox, "seen", "undeleted", "savedsince", "" .. $HAM_LO, "savedbefore", "" .. $HAM_HI]])
+            end
+          end
+        end
       end
       $pi = 0
       while $pi < len($plans) and $enumeration_failed == 0
@@ -491,6 +690,12 @@ while $u < len($users)
         $box = $plans[$pi][1]
         $q = $plans[$pi][2]
         $r = run_argv(concat(["doveadm", "fetch", "-u", $login, "uid date.saved.unixtime hdr.message-id hdr.from"], $q), {timeout: 600})
+        if $r.exit_code != 0 and $cls == "G" and $box != "INBOX" then
+          -- filed is additive: one bad folder must not stop the user's night
+          $filed_note = $filed_note .. " filed-failed=" .. $box
+          $pi = $pi + 1
+          continue
+        end
         if $r.exit_code != 0 then
           $enumeration_failed = 1
           $enumeration_error = first_line($r.stderr)
@@ -523,6 +728,10 @@ while $u < len($users)
               $key_bn[$ref] = $key
               $from_bn[$ref] = $frm
               $box_bn[$ref] = $box
+              if $cls == "G" and $box != "INBOX" then
+                $filed_bn[$ref] = 1
+                $nfiled = $nfiled + 1
+              end
               $saved_epoch = to_number($saved)
               $uz = "0000000000" .. $uid
               if $saved_epoch == nil then
@@ -539,7 +748,9 @@ while $u < len($users)
               if $cls == "S" then
                 $njunk = $njunk + 1
               else
-                $nham = $nham + 1
+                if $box == "INBOX" then
+                  $nham = $nham + 1
+                end
               end
             end
             $uid = strip(substr($line, 5, len($line) - 5))
@@ -559,15 +770,13 @@ while $u < len($users)
                   $frm = strip(substr($line, 9, len($line) - 9))
                   $last = "frm"
                 else
-                  if pos(" ", $line) == 1 then
+                  if pos(" ", $line) == 1 or pos("\t", $line) == 1 then
                     -- folded header continuation
                     if $last == "mid" then
                       $mid = $mid .. strip($line)
                     end
-                  end
-                  if pos("\t", $line) == 1 then
-                    if $last == "mid" then
-                      $mid = $mid .. strip($line)
+                    if $last == "frm" then
+                      $frm = $frm .. " " .. strip($line)
                     end
                   end
                 end
@@ -608,6 +817,30 @@ while $u < len($users)
       $sel_g_corr = []
       $ndec = 0
       $nstrand = 0
+      $skip_conflict = 0
+      $skip_dup = 0
+      $skip_own = 0
+      $filed_n = 0
+      -- pre-pass: which classes does each key appear under tonight?
+      $key_cls = {}
+      $ti = 0
+      while $ti < len($cand)
+        $p = split($cand[$ti], "|")
+        $k = $key_bn[$p[3]]
+        if $k != nil then
+          $prev = $key_cls[$k]
+          if $prev == nil then
+            $key_cls[$k] = $p[1]
+          else
+            if $prev != $p[1] then
+              $key_cls[$k] = "X"
+            end
+          end
+        end
+        $ti = $ti + 1
+      end
+      $picked = {}
+      $me = lower($user_id)
       $ti = 0
       while $ti < len($cand)
         $p = split($cand[$ti], "|")
@@ -617,7 +850,32 @@ while $u < len($users)
         $key = $key_bn[$bn]
         $want = 0
         $corr = 0
+        $gate = 1
         if $key != nil then
+          if $key_cls[$key] == "X" then
+            $gate = 0
+            $skip_conflict = $skip_conflict + 1
+          else
+            if $picked[$key] != nil then
+              $gate = 0
+              $skip_dup = $skip_dup + 1
+            end
+          end
+        end
+        if $gate == 1 and $filed_bn[$bn] != nil then
+          -- exact address: msgids emits the bare address, doveadm the raw header
+          $ffrom = lower(strip("" .. ($from_bn[$bn] or "")))
+          $inner = between($ffrom, "<", ">")
+          if $inner != nil then
+            $ffrom = strip($inner)
+          end
+          if $ffrom == $me then
+            $gate = 0
+            $skip_own = $skip_own + 1
+          end
+        end
+        if $key != nil and $gate == 1 then
+          $picked[$key] = 1
           $c = $seen[$key]
           $want = 1
           $other = "G"
@@ -648,6 +906,11 @@ while $u < len($users)
             if $ng >= $CAP then
               $room = 0
             end
+            -- filed has its own, smaller share of the ham cap so a mass
+            -- re-file (new basenames = new epochs) trickles in over nights
+            if $filed_bn[$bn] != nil and $filed_n >= $FILED_CAP then
+              $room = 0
+            end
           end
           if $room == 0 then
             $defer = $defer + 1
@@ -656,6 +919,9 @@ while $u < len($users)
               $ns = $ns + 1
             else
               $ng = $ng + 1
+              if $filed_bn[$bn] != nil then
+                $filed_n = $filed_n + 1
+              end
             end
             if $corr == 1 then
               $ncorr = $ncorr + 1
@@ -844,7 +1110,7 @@ while $u < len($users)
       if $DRY == 1 then
         $verb = "would-train"
       end
-      print($d .. " [" .. $modetag .. "]: junk=" .. $njunk .. " inbox-window=" .. $nham .. " | " .. $verb .. " spam=" .. $ns .. " good=" .. $ng .. " (corrective=" .. $ncorr .. " decremented=" .. $ndec .. " stranded=" .. $nstrand .. ") | already=" .. $skip_done .. " frozen=" .. $skip_frozen .. " deferred=" .. $defer .. " failed=" .. $fail .. $skipped_junk_summary)
+      print($d .. " [" .. $modetag .. "]: junk=" .. $njunk .. " inbox-window=" .. $nham .. " filed-window=" .. $nfiled .. " | " .. $verb .. " spam=" .. $ns .. " good=" .. $ng .. " (corrective=" .. $ncorr .. " decremented=" .. $ndec .. " stranded=" .. $nstrand .. ") | already=" .. $skip_done .. " frozen=" .. $skip_frozen .. " conflict=" .. $skip_conflict .. " dup=" .. $skip_dup .. " own-from=" .. $skip_own .. " deferred=" .. $defer .. " failed=" .. $fail .. $skipped_junk_summary .. $filed_note)
 
       -- root-run hygiene: give WAL/shm/log back to the mail user
       if $DRY == 0 then
