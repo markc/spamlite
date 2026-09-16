@@ -1,0 +1,220 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-rescued-sweep.mix — find (and optionally correct) messages the nightly
+-- reconciler trained as SPAM that the user has since rescued into a folder they
+-- keep mail in. 2026-09-17 (ns mrn _journal/2026-09-17.md).
+--
+--   spamlite-rescued-sweep.mix dry   [substr]   -> /var/tmp/rescued-sweep/candidates.tsv
+--   spamlite-rescued-sweep.mix apply [substr]   -> corrects every candidate in that TSV
+--
+-- Candidate = sidecar key whose ONLY entry is S (a 2-entry key is frozen), not a
+-- f: fallback key, present in >= 1 "keep" mailbox and in NO junk-shaped mailbox.
+-- "keep" uses the retrain-as-ham.sieve denylist (Trash/Drafts/Sent/Deleted/junk/spam),
+-- widened for Outlook names (Sent Items, Detected/Infected Items, Outbox).
+-- apply: backs up db + sidecar, fetches each message via doveadm (layout-proof),
+-- checks its Message-ID, runs `train-dir good --from spam` as the mail user and
+-- appends a G sidecar line per ok row (2nd entry freezes the key as good).
+
+$SL = "/usr/local/bin/spamlite"
+$W = "/var/tmp/rescued-sweep"
+$TSV = $W .. "/candidates.tsv"
+$a = args()
+$mode = "dry"
+if len($a) >= 1 then $mode = $a[0] end
+$filt = ""
+if len($a) >= 2 then $filt = $a[1] end
+run_argv(["mkdir", "-p", $W])
+
+function junky($mb)
+  $l = lower($mb)
+  return contains($l, "junk") or contains($l, "spam") or contains($l, "detected items") or contains($l, "infected items")
+end
+
+function keep($mb)
+  if junky($mb) then return false end
+  $l = lower($mb)
+  for $part in split(replace($l, "/", "."), ".")
+    $p = trim($part)
+    if starts_with($p, "trash") or starts_with($p, "deleted") or starts_with($p, "draft") or starts_with($p, "sent") or $p == "outbox" then
+      return false
+    end
+  end
+  return true
+end
+
+function users()
+  $out = []
+  for $dom in ls("/srv")
+    $m = "/srv/" .. $dom .. "/msg"
+    if is_dir($m) then
+      for $u in ls($m)
+        if is_file($m .. "/" .. $u .. "/.spamlite/reconciled.log") then
+          $login = $u .. "@" .. $dom
+          if $filt == "" or contains($login, $filt) then
+            push($out, [$login, $m .. "/" .. $u])
+          end
+        end
+      end
+    end
+  end
+  return $out
+end
+
+function dry()
+  $rows = ""
+  $tot = {cands: 0, still_junk: 0, users: 0, failed: 0}
+  $bymb = {}
+  for $ud in users()
+    $login = $ud[0]
+    $db = $ud[1] .. "/.spamlite"
+    -- sidecar: count entries + last class per key
+    $n = {}
+    $last = {}
+    $epoch = {}
+    for $l in lines(read_file($db .. "/reconciled.log"))
+      $p = split($l, " ")
+      if len($p) >= 3 then
+        $n[$p[2]] = ($n[$p[2]] or 0) + 1
+        $last[$p[2]] = $p[0]
+        $epoch[$p[2]] = $p[1]
+      end
+    end
+    $want = {}
+    $any = false
+    for $k in keys($n)
+      if $n[$k] == 1 and $last[$k] == "S" and not starts_with($k, "f:") then
+        $want[$k] = true
+        $any = true
+      end
+    end
+    if $any then
+      $tot.users = $tot.users + 1
+      $f = $W .. "/mids.tmp"
+      $r = run_argv(["doveadm", "fetch", "-u", $login, "mailbox hdr.message-id", "all"], {stdout: {file: $f}, timeout: 900})
+      if $r.exit_code != 0 then
+        eprint("FETCH FAILED " .. $login .. ": " .. trim($r.stderr))
+        $tot.failed = $tot.failed + 1
+      else
+        $locs = {}
+        $mb = ""
+        for $l in lines(bytes_to_string(read_file_bytes($f), {lossy: true}))
+          if starts_with($l, "mailbox: ") then $mb = after($l, "mailbox: ") end
+          if starts_with($l, "hdr.message-id: ") then
+            $id = lower(trim(after($l, "hdr.message-id: "), "<> \t"))
+            if $want[$id] then
+              if $locs[$id] == nil then $locs[$id] = [] end
+              if not contains($locs[$id], $mb) then $locs[$id] = push($locs[$id], $mb) end
+            end
+          end
+        end
+        for $id in keys($locs)
+          $kept = ""
+          $inj = false
+          for $m in $locs[$id]
+            if junky($m) then $inj = true end
+            if $kept == "" and keep($m) then $kept = $m end
+          end
+          if $kept != "" and $inj then $tot.still_junk = $tot.still_junk + 1 end
+          if $kept != "" and not $inj then
+            $rows = $rows .. $login .. "\t" .. $id .. "\t" .. $kept .. "\t" .. $epoch[$id] .. "\n"
+            $tot.cands = $tot.cands + 1
+            $bymb[$kept] = ($bymb[$kept] or 0) + 1
+          end
+        end
+      end
+    end
+  end
+  write_file($TSV, $rows)
+  print("users with S keys: " .. $tot.users .. "  fetch failures: " .. $tot.failed)
+  print("candidates: " .. $tot.cands .. "  skipped (also still in junk): " .. $tot.still_junk)
+  print("by mailbox:")
+  for $k in keys($bymb)
+    print("  " .. $bymb[$k] .. "\t" .. $k)
+  end
+  print("TSV: " .. $TSV)
+end
+
+function apply()
+  $by = {}
+  for $l in lines(read_file($TSV))
+    $f = split($l, "\t")
+    if len($f) >= 3 and ($filt == "" or contains($f[0], $filt)) then
+      if $by[$f[0]] == nil then $by[$f[0]] = [] end
+      $by[$f[0]] = push($by[$f[0]], [$f[1], $f[2]])
+    end
+  end
+  $grand = 0
+  for $login in keys($by)
+    $up = split($login, "@")
+    $home = "/srv/" .. $up[1] .. "/msg/" .. $up[0]
+    $db = $home .. "/.spamlite"
+    $owner = trim(run_argv(["stat", "-c", "%U", $db]).stdout)
+    $stage = $W .. "/stage/" .. $login
+    run_argv(["rm", "-rf", $stage])
+    run_argv(["mkdir", "-p", $stage])
+    $i = 0
+    for $c in $by[$login]
+      -- uid first (header search is a substring match; msgids check below
+      -- rejects a wrong hit), then the raw text straight to a file so
+      -- non-UTF-8 mail is staged byte-exact; `sed 1d` drops the "text:" line.
+      $r = run_argv(["doveadm", "fetch", "-u", $login, "uid", "mailbox", $c[1], "header", "message-id", $c[0]], {timeout: 120})
+      $uid = ""
+      for $l in lines($r.stdout)
+        if $uid == "" and starts_with($l, "uid: ") then $uid = trim(after($l, "uid: ")) end
+      end
+      $ok = false
+      if $r.exit_code == 0 and $uid != "" then
+        $i = $i + 1
+        $raw = $stage .. "/raw"
+        $f1 = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $c[1], "uid", $uid], {stdout: {file: $raw}, timeout: 120})
+        if $f1.exit_code == 0 then
+          $f2 = run_argv(["sed", "1d", $raw], {stdout: {file: $stage .. "/" .. $i .. ".eml"}})
+          $ok = $f2.exit_code == 0
+        end
+        run_argv(["rm", "-f", $raw])
+      end
+      if not $ok then
+        eprint("  fetch miss " .. $login .. " " .. $c[0])
+      end
+    end
+    -- drop anything whose Message-ID isn't exactly a wanted key
+    $wantk = {}
+    for $c in $by[$login]
+      $wantk[$c[0]] = true
+    end
+    for $l in lines(run_argv([$SL, "msgids", $stage]).stdout)
+      $f = split($l, "\t")
+      if len($f) >= 3 and not $wantk[lower(trim($f[0], "<> "))] then
+        eprint("  msgid mismatch, dropped: " .. $f[2])
+        run_argv(["rm", "-f", $f[2]])
+      end
+    end
+    run_argv(["chown", "-R", $owner .. ":" .. $owner, $stage])
+    run_argv(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-20260917-sweep"])
+    run_argv(["cp", "-a", $db .. "/reconciled.log", $db .. "/reconciled.log.bak-20260917-sweep"])
+    $r = run_argv(["runuser", "-u", $owner, "--", $SL, "-d", $db, "train-dir", $stage, "good", "--from", "spam"], {timeout: 900})
+    if $r.exit_code != 0 then
+      eprint("TRAIN FAILED " .. $login .. ": " .. trim($r.stderr))
+    else
+      $now = "" .. floor(time())
+      $add = ""
+      $ok = 0
+      for $l in lines($r.stdout)
+        $f = split($l, "\t")
+        if $f[0] == "ok" then
+          $add = $add .. "G " .. $now .. " " .. lower(trim($f[1], "<> ")) .. "\n"
+          $ok = $ok + 1
+        end
+      end
+      if $add != "" then append_file($db .. "/reconciled.log", $add) end
+      $grand = $grand + $ok
+      print($login .. "\tcorrected " .. $ok .. "/" .. len($by[$login]) .. "\t" .. trim($r.stderr))
+    end
+  end
+  print("TOTAL corrected: " .. $grand)
+end
+
+if $mode == "apply" then
+  apply()
+else
+  dry()
+end
