@@ -1,0 +1,274 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-fleet-audit.mix — READ-ONLY per-user health audit (2026-09-17).
+--
+--   spamlite-fleet-audit.mix [path-substring]  -> /var/tmp/spamlite-audit/*.tsv + summary
+--
+-- For every <root>/<domain>/msg/<user> with a .spamlite/db.sqlite:
+--   loop.tsv   senders the user READ and KEPT (INBOX or a kept folder, not
+--              their own address) whose h:from: token is spam-heavy
+--              (spam >= 5 and spam > 2 * good) — the "daily automated mail
+--              left in Junk, trained as spam every night" pattern.
+--   junk.tsv   messages in the canonical Junk tree right now whose sender the
+--              user also reads and keeps, with a live read-only score —
+--              likely false positives that the 01:40 reconciler will train as
+--              spam unless rescued.
+--   stall.tsv  learning balance from the sidecar: G/S entries in the last 30
+--              days, days since the last G, current corpus counts, and (where
+--              .spamlite-stats.jsonl exists) the 30-day good/spam delta.
+-- Nothing is written to any mailbox or corpus. Every spamlite/sqlite3 call
+-- runs as the mailbox owner so no root-owned -wal/-shm can appear.
+
+$W = "/var/tmp/spamlite-audit"
+$SL = "/usr/local/bin/spamlite"
+$NOW = floor(time())
+$D30 = $NOW - 30 * 86400
+$a = args()
+$filt = ""
+if len($a) >= 1 then $filt = $a[0] end
+run_argv(["mkdir", "-p", $W .. "/msg"])
+run_argv(["chmod", "0755", $W, $W .. "/msg"])
+
+fn kept_box($box)
+  $l = lower(strip($box))
+  if $l == "" or $l == "." or $l == "inbox" or starts_with($l, ".") then return 0 end
+  for $bad in ["junk", "spam", "detected items", "infected items", "quarantine", "bulk", "virus", "phish", "unwanted", "suspect"]
+    if contains($l, $bad) then return 0 end
+  end
+  $parts = split(replace($l, "/", "."), ".")
+  $top = strip($parts[0])
+  if $top == "shared" or $top == "public" or $top == "virtual" then return 0 end
+  for $part in $parts
+    $c = strip($part)
+    for $pre in ["trash", "deleted", "draft", "sent", "outbox", "template", "papierkorb", "gesendet", "gelöscht", "elementos enviados", "elementos eliminados", "envoy", "corbeille"]
+      if starts_with($c, $pre) then return 0 end
+    end
+  end
+  return 1
+end
+
+fn canon_junk($box)
+  return $box == "Junk" or starts_with($box, "Junk.") or starts_with($box, "Junk/")
+end
+
+-- bare lowercase address from a From header, "" if none
+fn addr_of($s)
+  $l = lower(strip($s))
+  $in = between($l, "<", ">")
+  if $in != nil then $l = strip($in) end
+  if not contains($l, "@") then return "" end
+  for $w in split($l, " ")
+    if contains($w, "@") then
+      return trim($w, "\"'<>(),;")
+    end
+  end
+  return ""
+end
+
+-- only addresses safe to splice into a quoted sqlite3 literal
+fn safe_addr($x)
+  if $x == "" or len($x) > 200 then return false end
+  return len(re_find($x, "^[a-z0-9._%+=-]+@[a-z0-9.-]+$")) == 1
+end
+
+fn as_owner($owner, $argv, $opts)
+  return run_argv(concat(["runuser", "-u", $owner, "--"], $argv), $opts)
+end
+
+-- doveadm fetch output -> list of record maps (field -> value), folded lines joined
+fn parse_fetch($path)
+  $recs = []
+  $cur = nil
+  $lastk = ""
+  $txt = bytes_to_string(read_file_bytes($path), {lossy: true})
+  for $l in lines($txt)
+    if starts_with($l, "mailbox: ") then
+      if $cur != nil then push($recs, $cur) end
+      $cur = {mailbox: after($l, "mailbox: ")}
+      $lastk = "mailbox"
+    else
+      if $cur != nil then
+        if starts_with($l, " ") or starts_with($l, "\t") then
+          if $lastk != "" then $cur[$lastk] = ($cur[$lastk] or "") .. " " .. strip($l) end
+        else
+          $kv = split_once($l, ": ")
+          if $kv != nil then
+            $cur[$kv[0]] = $kv[1]
+            $lastk = $kv[0]
+          else
+            if ends_with($l, ":") then
+              $k = strip_suffix($l, ":")
+              $cur[$k] = ""
+              $lastk = $k
+            end
+          end
+        end
+      end
+    end
+  end
+  if $cur != nil then push($recs, $cur) end
+  return $recs
+end
+
+$loop_rows = "login\tsender\tkept_read\tjunk_now\ttok_good\ttok_spam\n"
+$junk_rows = "login\tscore_now\tsender\tkept_read\treceived\tsubject\tmessage_id\tmailbox\n"
+$stall_rows = "login\tgood\tspam\tG_30d\tS_30d\tdays_since_G\tgood_delta_30d\tspam_delta_30d\tfiled_read_30d\n"
+$tot = {users: 0, fail: 0, loop: 0, junk: 0, stalled: 0}
+
+for $dom in ls("/srv")
+  $m = "/srv/" .. $dom .. "/msg"
+  if is_dir($m) then
+    for $u in ls($m)
+      $home = $m .. "/" .. $u
+      $db = $home .. "/.spamlite"
+      $login = $u .. "@" .. $dom
+      if is_file($db .. "/db.sqlite") and ($filt == "" or contains($home, $filt)) then
+        $tot.users = $tot.users + 1
+        $owner = strip(run_argv(["stat", "-c", "%U", $db .. "/db.sqlite"]).stdout)
+
+        -- ---------- mailbox survey ----------
+        $f = $W .. "/all.tmp"
+        $r = run_argv(["doveadm", "fetch", "-u", $login, "mailbox flags date.saved.unixtime hdr.from", "all"], {stdout: {file: $f}, timeout: 1200})
+        if $r.exit_code != 0 then
+          eprint("FETCH FAILED " .. $login .. ": " .. strip($r.stderr))
+          $tot.fail = $tot.fail + 1
+          continue
+        end
+        $kept = {}
+        $junkn = {}
+        $filed30 = 0
+        for $rec in parse_fetch($f)
+          $mb = $rec["mailbox"]
+          $ad = addr_of($rec["hdr.from"] or "")
+          $seen = contains($rec["flags"] or "", "\\Seen")
+          if $ad != "" and $ad != $login then
+            if $seen and ($mb == "INBOX" or kept_box($mb) == 1) then
+              $kept[$ad] = ($kept[$ad] or 0) + 1
+            end
+            if canon_junk($mb) then
+              $junkn[$ad] = ($junkn[$ad] or 0) + 1
+            end
+          end
+          if $seen and kept_box($mb) == 1 and (to_number($rec["date.saved.unixtime"] or "0") or 0) >= $D30 then
+            $filed30 = $filed30 + 1
+          end
+        end
+
+        -- ---------- check 1: spam-heavy sender tokens for kept senders ----------
+        $cand = []
+        for $ad in keys($kept)
+          if $kept[$ad] >= 2 and safe_addr($ad) then push($cand, $ad) end
+        end
+        $off = 0
+        while $off < len($cand)
+          $chunk = slice($cand, $off, $off + 400)
+          $in = []
+          for $ad in $chunk
+            push($in, "'h:from:" .. $ad .. "'")
+          end
+          $q = "select word, good, spam from tokens where spam >= 5 and spam > 2 * good and word in (" .. join($in, ",") .. ");"
+          $qr = as_owner($owner, ["sqlite3", "-readonly", "-separator", "\t", $db .. "/db.sqlite", $q], {timeout: 120})
+          if $qr.exit_code != 0 then
+            eprint("SQL FAILED " .. $login .. ": " .. strip($qr.stderr))
+          end
+          for $row in lines($qr.stdout)
+            $c = split($row, "\t")
+            if len($c) >= 3 then
+              $ad = strip_prefix($c[0], "h:from:")
+              $loop_rows = $loop_rows .. $login .. "\t" .. $ad .. "\t" .. $kept[$ad] .. "\t" .. ($junkn[$ad] or 0) .. "\t" .. $c[1] .. "\t" .. $c[2] .. "\n"
+              $tot.loop = $tot.loop + 1
+            end
+          end
+          $off = $off + 400
+        end
+
+        -- ---------- check 2: kept senders sitting in Junk now ----------
+        $hit = false
+        for $ad in keys($junkn)
+          if ($kept[$ad] or 0) >= 1 then $hit = true end
+        end
+        if $hit then
+          $jf = $W .. "/junk.tmp"
+          $jr = run_argv(["doveadm", "fetch", "-u", $login, "mailbox uid date.received hdr.from hdr.subject hdr.message-id", "mailbox", "Junk*"], {stdout: {file: $jf}, timeout: 600})
+          if $jr.exit_code == 0 then
+            for $rec in parse_fetch($jf)
+              $mb = $rec["mailbox"]
+              $ad = addr_of($rec["hdr.from"] or "")
+              if canon_junk($mb) and $ad != "" and ($kept[$ad] or 0) >= 1 then
+                $sc = "?"
+                $mf = $W .. "/msg/m.eml"
+                $raw = $W .. "/msg/raw"
+                $t1 = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $mb, "uid", $rec["uid"]], {stdout: {file: $raw}, timeout: 60})
+                if $t1.exit_code == 0 then
+                  run_argv(["sed", "1d", $raw], {stdout: {file: $mf, mode: 420}})
+                  $s = as_owner($owner, [$SL, "-d", $db, "score"], {stdin: {file: $mf}, timeout: 60})
+                  if $s.exit_code == 0 then $sc = strip($s.stdout) end
+                end
+                run_argv(["rm", "-f", $raw, $mf])
+                $subj = replace(replace(rfc2047_decode($rec["hdr.subject"] or ""), "\t", " "), "\n", " ")
+                $junk_rows = $junk_rows .. $login .. "\t" .. $sc .. "\t" .. $ad .. "\t" .. $kept[$ad] .. "\t" .. ($rec["date.received"] or "") .. "\t" .. left($subj, 90) .. "\t" .. lower(trim($rec["hdr.message-id"] or "", "<> ")) .. "\t" .. $mb .. "\n"
+                $tot.junk = $tot.junk + 1
+              end
+            end
+          else
+            eprint("JUNK FETCH FAILED " .. $login .. ": " .. strip($jr.stderr))
+          end
+        end
+
+        -- ---------- check 3: learning balance ----------
+        $g30 = 0
+        $s30 = 0
+        $lastg = 0
+        if is_file($db .. "/reconciled.log") then
+          for $l in lines(bytes_to_string(read_file_bytes($db .. "/reconciled.log"), {lossy: true}))
+            $p = split($l, " ")
+            if len($p) >= 3 then
+              $e = to_number($p[1]) or 0
+              if $p[0] == "G" then
+                if $e > $lastg then $lastg = $e end
+                if $e >= $D30 then $g30 = $g30 + 1 end
+              end
+              if $p[0] == "S" and $e >= $D30 then $s30 = $s30 + 1 end
+            end
+          end
+        end
+        $good = "?"
+        $spam = "?"
+        $st = as_owner($owner, [$SL, "-d", $db, "stats"], {timeout: 60})
+        for $l in lines($st.stdout)
+          $p = split($l, " ")
+          if len($p) >= 2 and $p[0] == "good" then $good = $p[1] end
+          if len($p) >= 2 and $p[0] == "spam" then $spam = $p[1] end
+        end
+        $gd = "-"
+        $sd = "-"
+        $sj = $home .. "/.spamlite-stats.jsonl"
+        if is_file($sj) then
+          $recs = read_jsonl($sj, {skip_errors: true})
+          if len($recs) > 0 then
+            $old = nil
+            $cut = date_format($D30, "%Y-%m-%d")
+            for $rj in $recs
+              if $old == nil and $rj["d"] != nil and $rj["d"] >= $cut then $old = $rj end
+            end
+            $new = $recs[len($recs) - 1]
+            if $old != nil and $old["db"] != nil and $new["db"] != nil then
+              $gd = "" .. ($new["db"][0] - $old["db"][0])
+              $sd = "" .. ($new["db"][1] - $old["db"][1])
+            end
+          end
+        end
+        $dsg = "never"
+        if $lastg > 0 then $dsg = "" .. floor(($NOW - $lastg) / 86400) end
+        $stall_rows = $stall_rows .. $login .. "\t" .. $good .. "\t" .. $spam .. "\t" .. $g30 .. "\t" .. $s30 .. "\t" .. $dsg .. "\t" .. $gd .. "\t" .. $sd .. "\t" .. $filed30 .. "\n"
+        if $g30 == 0 and $s30 >= 5 then $tot.stalled = $tot.stalled + 1 end
+      end
+    end
+  end
+end
+
+write_file($W .. "/loop.tsv", $loop_rows)
+write_file($W .. "/junk.tsv", $junk_rows)
+write_file($W .. "/stall.tsv", $stall_rows)
+run_argv(["rm", "-f", $W .. "/all.tmp", $W .. "/junk.tmp"])
+print("users=" .. $tot.users .. " fetch_failed=" .. $tot.fail .. " loop_senders=" .. $tot.loop .. " junk_candidates=" .. $tot.junk .. " stalled(G30=0,S30>=5)=" .. $tot.stalled)
+print("reports: " .. $W .. "/{loop,junk,stall}.tsv")
