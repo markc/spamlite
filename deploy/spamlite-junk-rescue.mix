@@ -1,0 +1,169 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-junk-rescue.mix — retrain a REVIEWED list of Junk false positives
+-- as good and (optionally) move recent ones back to INBOX. 2026-09-17.
+--
+--   spamlite-junk-rescue.mix dry|apply <list.tsv> <move-cutoff YYYY-MM-DD>
+--
+-- list.tsv columns: login, message_id, mailbox, received ("YYYY-MM-DD ...").
+-- Per user: back up db + sidecar, stage each message byte-exact via doveadm,
+-- verify its Message-ID, then as the mail user:
+--   sidecar last entry S (1 entry)  -> train-dir good --from spam  (2nd entry freezes G)
+--   no sidecar entry                -> train-dir good, and ALWAYS moved out of Junk
+--                                      (a G-only key left in Junk would be flipped
+--                                      back to S by the nightly reconciler)
+--   already G, or frozen            -> not retrained (reported)
+-- A G sidecar line is appended per ok row. Messages received on/after the
+-- cutoff are moved to INBOX; older retrained ones stay in Junk, frozen as G.
+
+$SL = "/usr/local/bin/spamlite"
+$a = args()
+if len($a) < 3 then
+  print("usage: spamlite-junk-rescue.mix dry|apply <list.tsv> <YYYY-MM-DD>")
+  exit(1)
+end
+$mode = $a[0]
+$CUT = $a[2]
+$W = "/var/tmp/junk-rescue"
+run_argv(["mkdir", "-p", $W])
+$by = {}
+for $l in lines(read_file($a[1]))
+  $c = split($l, "\t")
+  if len($c) >= 4 and contains($c[0], "@") then
+    if $by[$c[0]] == nil then $by[$c[0]] = [] end
+    $by[$c[0]] = push($by[$c[0]], $c)
+  end
+end
+
+$T = {corr: 0, plain: 0, skipped: 0, moved: 0, missing: 0, failed: 0}
+for $login in sort(keys($by))
+  $up = split($login, "@")
+  $db = "/srv/" .. $up[1] .. "/msg/" .. $up[0] .. "/.spamlite"
+  $log = $db .. "/reconciled.log"
+  $owner = strip(run_argv(["stat", "-c", "%U", $db .. "/db.sqlite"]).stdout)
+  $last = {}
+  $cnt = {}
+  if is_file($log) then
+    for $l in lines(bytes_to_string(read_file_bytes($log), {lossy: true}))
+      $p = split($l, " ")
+      if len($p) >= 3 then
+        $last[$p[2]] = $p[0]
+        $cnt[$p[2]] = ($cnt[$p[2]] or 0) + 1
+      end
+    end
+  end
+  $stage = $W .. "/" .. $login
+  run_argv(["rm", "-rf", $stage])
+  run_argv(["mkdir", "-p", $stage .. "/corr", $stage .. "/plain"])
+  $uidof = {}
+  $boxof = {}
+  $moveit = {}
+  $nc = 0
+  $np = 0
+  $ns = 0
+  $i = 0
+  for $c in $by[$login]
+    $k = $c[1]
+    $kind = ""
+    if $last[$k] == nil then
+      $kind = "plain"
+    else
+      if $last[$k] == "S" and $cnt[$k] == 1 then $kind = "corr" end
+    end
+    $r = run_argv(["doveadm", "fetch", "-u", $login, "uid", "mailbox", $c[2], "header", "message-id", $k], {timeout: 120})
+    $uid = ""
+    for $l in lines($r.stdout)
+      if $uid == "" and starts_with($l, "uid: ") then $uid = strip(after($l, "uid: ")) end
+    end
+    if $uid == "" then
+      $T.missing = $T.missing + 1
+      continue
+    end
+    $recent = left($c[3], 10) >= $CUT
+    if $kind == "" then
+      $ns = $ns + 1
+      if $recent and $last[$k] == "G" then
+        $uidof[$k] = $uid
+        $boxof[$k] = $c[2]
+        $moveit[$k] = true
+      end
+      continue
+    end
+    $i = $i + 1
+    $raw = $stage .. "/raw"
+    $f1 = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $c[2], "uid", $uid], {stdout: {file: $raw}, timeout: 120})
+    if $f1.exit_code != 0 then
+      $T.failed = $T.failed + 1
+      continue
+    end
+    $f2 = run_argv(["sed", "1d", $raw], {stdout: {file: $stage .. "/" .. $kind .. "/" .. $i .. ".eml", mode: 420}})
+    run_argv(["rm", "-f", $raw])
+    $uidof[$k] = $uid
+    $boxof[$k] = $c[2]
+    if $recent or $kind == "plain" then $moveit[$k] = true end
+    if $kind == "corr" then $nc = $nc + 1 else $np = $np + 1 end
+  end
+  -- drop anything whose Message-ID isn't one we asked for
+  $want = {}
+  for $c in $by[$login]
+    $want[$c[1]] = true
+  end
+  for $sub in ["corr", "plain"]
+    for $l in lines(run_argv([$SL, "msgids", $stage .. "/" .. $sub]).stdout)
+      $f = split($l, "\t")
+      if len($f) >= 3 and not $want[lower(trim($f[0], "<> "))] then
+        eprint("  msgid mismatch dropped: " .. $f[2])
+        run_argv(["rm", "-f", $f[2]])
+      end
+    end
+  end
+  run_argv(["chmod", "-R", "a+rX", $stage])
+  $nm = 0
+  for $k in keys($moveit)
+    $nm = $nm + 1
+  end
+  print($login .. ": retrain corr=" .. $nc .. " plain=" .. $np .. "  not-retrained=" .. $ns .. "  to-move=" .. $nm)
+  if $mode != "apply" then continue end
+
+  run_argv(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-20260917-rescue"])
+  if is_file($log) then run_argv(["cp", "-a", $log, $log .. ".bak-20260917-rescue"]) end
+  $trained = {}
+  for $sub in ["corr", "plain"]
+    $argv = [$SL, "-d", $db, "train-dir", $stage .. "/" .. $sub, "good"]
+    if $sub == "corr" then
+      $argv = concat($argv, ["--from", "spam"])
+    end
+    if len(ls($stage .. "/" .. $sub)) > 0 then
+      $tr = run_argv(concat(["runuser", "-u", $owner, "--"], $argv), {timeout: 900})
+      if $tr.exit_code != 0 then
+        eprint("  TRAIN FAILED " .. $login .. " " .. $sub .. ": " .. strip($tr.stderr))
+        $T.failed = $T.failed + 1
+      end
+      $now = "" .. floor(time())
+      $add = ""
+      for $l in lines($tr.stdout)
+        $f = split($l, "\t")
+        if $f[0] == "ok" then
+          $kk = lower(trim($f[1], "<> "))
+          $add = $add .. "G " .. $now .. " " .. $kk .. "\n"
+          $trained[$kk] = true
+          if $sub == "corr" then $T.corr = $T.corr + 1 else $T.plain = $T.plain + 1 end
+        end
+      end
+      if $add != "" then append_file($log, $add) end
+    end
+  end
+  -- move: only what was trained now, or was already G
+  for $k in keys($moveit)
+    if $trained[$k] or $last[$k] == "G" then
+      $mv = run_argv(["doveadm", "move", "-u", $login, "INBOX", "mailbox", $boxof[$k], "uid", $uidof[$k]], {timeout: 120})
+      if $mv.exit_code == 0 then
+        $T.moved = $T.moved + 1
+      else
+        eprint("  MOVE FAILED " .. $login .. " " .. $k .. ": " .. strip($mv.stderr))
+        $T.failed = $T.failed + 1
+      end
+    end
+  end
+  $T.skipped = $T.skipped + $ns
+end
+print("TOTAL mode=" .. $mode .. " corr=" .. $T.corr .. " plain=" .. $T.plain .. " not-retrained=" .. $T.skipped .. " moved=" .. $T.moved .. " missing=" .. $T.missing .. " failed=" .. $T.failed)
