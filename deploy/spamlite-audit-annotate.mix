@@ -1,0 +1,62 @@
+#!/opt/cosmix/bin/mix
+-- spamlite-audit-annotate.mix — add the delivery verdict to junk.tsv.
+--
+--   spamlite-audit-annotate.mix   -> /var/tmp/spamlite-audit/junk-annotated.tsv
+--
+-- Appends the message's own X-Spam-Status header (stamped at delivery) as a
+-- column: "SPAM …" = the filter junked it on arrival (a candidate false
+-- positive); "GOOD …" = it was delivered to the Inbox and the USER dragged it
+-- to Junk (their call, not a filter error); "-" = no header (pre-filter or
+-- appended mail). Read-only: one doveadm fetch per user.
+
+$W = "/var/tmp/spamlite-audit"
+$rows = lines(bytes_to_string(read_file_bytes($W .. "/junk.tsv"), {lossy: true}))
+$users = {}
+for $i = 1 to len($rows) - 1
+  $c = split($rows[$i], "\t")
+  if len($c) >= 7 then $users[$c[0]] = true end
+end
+$verdict = {}
+$dmarc = {}
+for $login in keys($users)
+  $f = $W .. "/ann.tmp"
+  $r = run_argv(["doveadm", "fetch", "-u", $login, "mailbox hdr.message-id hdr.x-spam-status hdr.x-spamd-result hdr.authentication-results", "mailbox", "Junk*"], {stdout: {file: $f}, timeout: 600})
+  if $r.exit_code != 0 then
+    eprint("FETCH FAILED " .. $login .. ": " .. strip($r.stderr))
+    continue
+  end
+  $mid = ""
+  for $l in lines(bytes_to_string(read_file_bytes($f), {lossy: true}))
+    if starts_with($l, "mailbox: ") then $mid = "" end
+    if starts_with($l, "hdr.message-id: ") then
+      $mid = lower(trim(after($l, "hdr.message-id: "), "<> \t"))
+    end
+    if starts_with($l, "hdr.x-spam-status: ") and $mid != "" then
+      $v = strip(after($l, "hdr.x-spam-status: "))
+      $verdict[$login .. " " .. $mid] = $v
+    end
+    -- DMARC pass for the From domain: rspamd symbol (proxy) or an
+    -- Authentication-Results dmarc=pass (hosts that verify locally).
+    -- Field order is message-id first, so $mid is set for these lines.
+    if $mid != "" and (contains($l, "DMARC_POLICY_ALLOW(") or contains($l, "dmarc=pass")) then
+      $dmarc[$login .. " " .. $mid] = "pass"
+    end
+  end
+end
+$out = $rows[0] .. "\tdelivered_as\tdmarc\n"
+$cnt = {}
+for $i = 1 to len($rows) - 1
+  $c = split($rows[$i], "\t")
+  if len($c) >= 7 then
+    $v = $verdict[$c[0] .. " " .. $c[6]] or "-"
+    $dm = $dmarc[$c[0] .. " " .. $c[6]] or "-"
+    $out = $out .. $rows[$i] .. "\t" .. $v .. "\t" .. $dm .. "\n"
+    $k = $c[0] .. " " .. (before($v, " ") or $v) .. " dmarc=" .. $dm
+    $cnt[$k] = ($cnt[$k] or 0) + 1
+  end
+end
+write_file($W .. "/junk-annotated.tsv", $out)
+run_argv(["rm", "-f", $W .. "/ann.tmp"])
+for $k in sort(keys($cnt))
+  print($cnt[$k] .. "\t" .. $k)
+end
