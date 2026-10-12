@@ -1,6 +1,6 @@
-// Copyright 2026 Mark Constable <mc@netserva.org>
-// SPDX-License-Identifier: MIT
-//
+// SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // spamlite-tune — per-user parameter tuner.
 //
 // Walks a user's ham/spam corpus, fetches token counts once, then sweeps

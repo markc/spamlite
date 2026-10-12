@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-sent-ham-topup.mix — one-off ham top-up from a user's Sent folder.
 --
 --   spamlite-sent-ham-topup.mix <user@domain> [sentsince YYYY-MM-DD]   (default 2022-01-01)

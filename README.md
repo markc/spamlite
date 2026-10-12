@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
 # spamlite
 
 Per-user Bayesian spam filter in Rust. Drop-in replacement for
@@ -63,8 +68,8 @@ would require persisting the trained token set per message.
 
 ```
 spamlite 0.9.3 — per-user Bayesian spam filter
-Copyright 2026 Mark Constable <mc@netserva.org>
-MIT License — https://github.com/markc/spamlite
+Copyright 2026 Mark Constable <mc@mixos.dev>
+MIT OR Apache-2.0 — https://github.com/markc/spamlite
 
 Usage:
   spamlite [-d DIR] receive          Classify message (stdin → "SPAM 0.999976" / "GOOD 0.000232")
@@ -271,4 +276,15 @@ X-Spam-Status: GOOD 0.000003 [spamlite]
 
 ## License
 
-MIT License — Copyright 2026 Mark Constable <mc@netserva.org>
+Copyright 2026 Mark Constable <mc@mixos.dev>
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work, as defined in the Apache-2.0 license,
+shall be dual licensed as above, without any additional terms or conditions.

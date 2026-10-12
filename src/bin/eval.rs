@@ -1,6 +1,6 @@
-// Copyright 2026 Mark Constable <mc@netserva.org>
-// SPDX-License-Identifier: MIT
-//
+// SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // spamlite-eval — offline accuracy harness.
 //
 // Walks a maildir with user-supplied ham/spam folder labels, classifies every

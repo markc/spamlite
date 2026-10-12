@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
 # spamlite — Project Guide
 
 ## What This Is

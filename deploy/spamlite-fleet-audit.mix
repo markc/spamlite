@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-fleet-audit.mix — READ-ONLY per-user health audit (2026-09-17).
 --
 --   spamlite-fleet-audit.mix [path-substring]  -> /var/tmp/spamlite-audit/*.tsv + summary

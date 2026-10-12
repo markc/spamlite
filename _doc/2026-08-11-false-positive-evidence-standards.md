@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
 # Evidence standards for false-positive work
 
 What counts as proof that spamlite got a message wrong, and three ways the obvious

@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- arm-build.mix — build one candidate db ("arm") for fp-eval.mix, using 0.9.0 train-dir.
 --
 --   arm-build.mix build <workdir> <arm> live|empty <params-file|-> <ham.list|-> <spam.list|->

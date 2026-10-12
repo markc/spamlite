@@ -1,6 +1,6 @@
-// Copyright 2026 Mark Constable <mc@netserva.org>
-// SPDX-License-Identifier: MIT
-//
+// SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // spamlite-harvest — Parse dovecot mail.log files for spamlite-relevant
 // events and emit one JSONL record per event. Output goes to stdout; summary
 // counts go to stderr. Reads file paths from argv, or stdin if none given.

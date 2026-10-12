@@ -1,5 +1,5 @@
-// Copyright 2026 Mark Constable <mc@netserva.org>
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::io::{self, BufReader, Read};
 use std::path::PathBuf;
@@ -890,8 +890,8 @@ fn cmd_stats() {
 fn usage() {
     eprintln!(
         "spamlite {} — per-user Bayesian spam filter
-Copyright 2026 Mark Constable <mc@netserva.org>
-MIT License — https://github.com/markc/spamlite
+Copyright 2026 Mark Constable <mc@mixos.dev>
+MIT OR Apache-2.0 — https://github.com/markc/spamlite
 
 Usage:
   spamlite [-d DIR] [-t THRESHOLD] [-g GATE] receive   Classify + train on confident verdicts

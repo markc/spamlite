@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
 # Porting spamlite-stats-collect from Python to Mix — evaluation & test case
 
 > Names and customer domains are anonymized for public release.

@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- sent-swap-verify.mix — pre-promotion gate for a spamlite candidate binary.
 --
 --   sent-swap-verify.mix <user@domain> <old-binary> <new-binary> [n]

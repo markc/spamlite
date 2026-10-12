@@ -1,6 +1,6 @@
-// Copyright 2026 Mark Constable <mc@netserva.org>
-// SPDX-License-Identifier: MIT
-//
+// SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // spamlite-correlate — Cross-reference spamlite-harvest delivery records
 // against a user's current Maildir state to recover labelled fp/fn/tp/tn
 // events. Produces the Phase 1.7 benchmark corpus by joining logged

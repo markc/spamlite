@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
 # spamlite — Per-User Bayesian Spam Filter in Rust
 
 ## Status: Planning / Research (2026-03-03)

@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- sent-swap-redo.mix — undo a pre-`--sent` Sent-folder ham top-up and re-run it
 -- with the swap, for one Maildir user.
 --

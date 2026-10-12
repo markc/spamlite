@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-reconcile.mix — nightly STATE-based trainer.
 --
 -- Folder state is the label source, not imapsieve events (events lose ~97% of

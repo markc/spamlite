@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
 # Algorithm Design: Robinson-Fisher Bayesian Classification
 
 > Names and customer domains are anonymized for public release.

@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- rebuild-eval.mix — measure a from-scratch corpus rebuild against the live db,
 -- offline, before anything touches a mailbox.
 --

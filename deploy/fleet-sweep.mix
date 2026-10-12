@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- fleet-sweep.mix — offline, scoring-only fleet comparison: each user's LIVE combiner vs the
 -- tuned triple (strength 0.3 / unknown_prob 0.4 / max_interesting 27), on held-out mail.
 --
