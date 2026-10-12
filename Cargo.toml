@@ -1,14 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "spamlite"
-version = "0.9.6"
+version = "0.9.7"
 edition = "2021"
 description = "Per-user Bayesian spam filter — drop-in spamprobe replacement"
-license = "MIT"
-authors = ["Mark Constable <mc@netserva.org>"]
+license = "MIT OR Apache-2.0"
+authors = ["Mark Constable <mc@mixos.dev>"]
 repository = "https://github.com/markc/spamlite"
 readme = "README.md"
 # Only these ship to crates.io; deploy, private docs and notes stay in git.
-include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [features]
 default = ["cli"]

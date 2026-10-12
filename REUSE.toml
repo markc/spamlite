@@ -1,0 +1,8 @@
+# REUSE-format licence annotations (https://reuse.software/spec/) for files
+# that cannot carry an inline SPDX header. Every other file has its own.
+version = 1
+
+[[annotations]]
+path = "Cargo.lock"
+SPDX-FileCopyrightText = "2026 Mark Constable <mc@mixos.dev>"
+SPDX-License-Identifier = "MIT OR Apache-2.0"

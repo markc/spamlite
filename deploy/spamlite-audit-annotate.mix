@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-audit-annotate.mix — add the delivery verdict to junk.tsv.
 --
 --   spamlite-audit-annotate.mix   -> /var/tmp/spamlite-audit/junk-annotated.tsv

@@ -1,6 +1,6 @@
-// Copyright 2026 Mark Constable <mc@netserva.org>
-// SPDX-License-Identifier: MIT
-//
+// SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // spamlite-shadow-report — summarise shadow.jsonl divergence logs.
 //
 // Reads one or more `shadow.jsonl` files written by the shadow-mode

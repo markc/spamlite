@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-stats-collect — nightly per-user spamlite score & correction collector.
 --
 -- Installed at /usr/local/bin/spamlite-stats-collect on the mail server.

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # reconcile-strip.awk — drop X-Spam-Status/X-SpamProbe headers (train-time
 # label leak) and pass the rest of the message through verbatim.
 BEGIN { h = 1 }

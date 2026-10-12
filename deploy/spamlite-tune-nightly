@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-tune-nightly — per-user classifier parameter tuning, cluster-wide.
 --
 -- Installed at /usr/local/bin/spamlite-tune-nightly on mrn. Invoked by

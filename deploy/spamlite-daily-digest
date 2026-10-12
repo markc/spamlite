@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # spamlite-daily-digest — wraps the threshold digest + shadow-mode report
 # into a single email body, intended to be piped to sendmail from cron.
 #

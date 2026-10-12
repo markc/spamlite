@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+# SPDX-License-Identifier: MIT OR Apache-2.0
 # reconcile-keyext.awk — one "path|key" line per input file.
 # key = Message-ID (lowercased, <>/spaces stripped) or empty (caller applies
 # the f:<basename> fallback). Header-only scan: nextfile at the blank line.

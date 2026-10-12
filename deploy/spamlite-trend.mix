@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-trend.mix — per-day spamlite trend for one user from the sieve
 -- DELIVERY / TRAIN lines in /var/log/mail.log*. Answers "is it getting better"
 -- without touching the db: the actionable column is junk.6-.85 (junk scored

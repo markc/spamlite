@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- fp-validate.mix <days> <addr> [<addr>...] — is each "confirmed false positive"
 -- actually ham?
 --

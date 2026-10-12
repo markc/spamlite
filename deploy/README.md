@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
 # spamlite deployment artifacts
 
 Production files deployed to `mail.renta.net` (mrn). Keep this directory in

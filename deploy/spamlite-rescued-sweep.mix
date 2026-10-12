@@ -1,4 +1,6 @@
 #!/opt/cosmix/bin/mix
+-- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+-- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-rescued-sweep.mix — find (and optionally correct) messages the nightly
 -- reconciler trained as SPAM that the user has since rescued into a folder they
 -- keep mail in. 2026-09-17 (ns mrn _journal/2026-09-17.md).
