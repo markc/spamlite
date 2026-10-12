@@ -8,7 +8,7 @@ authors = ["Mark Constable <mc@netserva.org>"]
 repository = "https://github.com/markc/spamlite"
 readme = "README.md"
 # Only these ship to crates.io; deploy, private docs and notes stay in git.
-include = ["src/**", "tests/**", "Cargo.toml", "README.md", "LICENSE"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [features]
 default = ["cli"]
