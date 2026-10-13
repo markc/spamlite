@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# NS 1.0 layout (/home/u/<domain>/home/<user>) variant — deployed on msi 2026-10-13.
+
+require ["vnd.dovecot.pipe", "vnd.dovecot.debug", "copy", "imapsieve", "environment", "variables"];
+
+if environment :matches "imap.user" "*" { set "user" "${1}"; }
+set "msgid" "noid";
+if header :matches "message-id" "*" { set "msgid" "${1}"; }
+
+set "mbox" "unknown";
+if environment :matches "imap.mailbox" "*" { set "mbox" "${1}"; }
+
+# Trained ham = the user rescued this OUT of Junk into somewhere they keep mail.
+# Destinations that are not a keep signal are skipped (fleet denylist from
+# spamlite deploy/retrain-as-ham.sieve, 2026-08-27): Trash/Deleted, any
+# junk-shaped folder, Drafts, Sent.
+if anyof (string :is "${mbox}" "Trash",
+          string :is "${mbox}" "Drafts",
+          string :is "${mbox}" "Sent",
+          string :matches "${mbox}" "Deleted Items*",
+          string :matches "${mbox}" "*Junk*",
+          string :matches "${mbox}" "*junk*",
+          string :matches "${mbox}" "*Spam*",
+          string :matches "${mbox}" "*spam*",
+          string :matches "${mbox}" "*Trash*") {
+  debug_log "TRAIN-SKIP: ${user} ${msgid} -> good skipped (dest=${mbox})";
+  stop;
+}
+
+debug_log "TRAIN: ${user} ${msgid} -> good (dest=${mbox})";
+pipe :copy "spamlite" ["-d", ".spamlite", "good"];

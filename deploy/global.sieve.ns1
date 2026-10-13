@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# NS 1.0 layout (/home/u/<domain>/home/<user>) variant — deployed on msi 2026-10-13.
+
+require ["vnd.dovecot.execute", "vnd.dovecot.debug", "fileinto", "envelope", "variables", "editheader"];
+
+# Extract recipient for spamlite path (lowercased: the db dir is lowercase,
+# mixed-case RCPT TO would otherwise miss it)
+if envelope :localpart :matches "to" "*" { set :lower "lhs" "${1}"; }
+if envelope :domain :matches "to" "*" { set :lower "rhs" "${1}"; }
+
+# No subject → Trash
+if not exists ["Subject"] {
+  debug_log "DELIVERY: ${lhs}@${rhs} -> Trash (no subject)";
+  fileinto "Trash";
+  stop;
+}
+
+# System addresses → Trash
+if header :contains "from" ["root@", "daemon@", "postmaster@"] {
+  debug_log "DELIVERY: ${lhs}@${rhs} -> Trash (system sender)";
+  fileinto "Trash";
+  stop;
+}
+if header :contains "to" ["root@", "daemon@", "postmaster@"] {
+  debug_log "DELIVERY: ${lhs}@${rhs} -> Trash (system recipient)";
+  fileinto "Trash";
+  stop;
+}
+
+# Spamlite scoring — `score` is read-only; delivery never trains (0.9.x
+# `receive` would train on confident verdicts). Training comes from imapsieve
+# rescues and the nightly spamlite-reconcile.mix state reconciler.
+execute :pipe :output "SCORE" "spamlite" ["-d", "/home/u/${rhs}/home/${lhs}/.spamlite", "score"];
+addheader :last "X-Spam-Status" "${SCORE}";
+
+# Spam → Junk
+if header :matches "X-Spam-Status" "SPAM*" {
+  debug_log "DELIVERY: ${lhs}@${rhs} -> Junk (${SCORE})";
+  fileinto "Junk";
+  stop;
+}
+
+# Everything else → Inbox
+debug_log "DELIVERY: ${lhs}@${rhs} -> Inbox (${SCORE})";
