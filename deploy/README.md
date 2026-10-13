@@ -165,7 +165,12 @@ path the same way.
 `*.sieve.ns1` are the NS 1.0 global and imapsieve scripts. They call
 `spamlite` directly (no `spamfilter` wrapper), so the delivery verb is
 `score`, never `receive`: since 0.9.x `receive` trains on confident
-verdicts. Install them mode 0644 and precompile with `sievec`.
+verdicts. Install them mode 0644, then run `sievec` on the LIVE path
+(`sievec /etc/dovecot/sieve/global.sieve`). A `.svbin` compiled elsewhere
+records that source path, so Dovecot treats it as stale and recompiles on
+every delivery. lmtp can't write `/etc` (`Read-only file system` in
+mail.log), so the binary never gets saved, though mail is still filtered
+correctly.
 
 msi went from 0.2.0 to 0.9.7 with a verdict gate on database copies first
 (482 messages across 13 users: 476 identical, 6 spam->good, 0 good->spam).
