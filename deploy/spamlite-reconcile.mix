@@ -72,8 +72,15 @@
 -- durably trained message.
 -- Corrective batches pass `--from <old-class>` so old counts are decremented.
 --
--- Usage: spamlite-reconcile.mix [--dry-run] [--cap N] [--root DIR] [path-substring-filter]
+-- Usage: spamlite-reconcile.mix [--dry-run] [--cap N] [--root DIR] [--users-glob PATTERN]
+--                               [path-substring-filter]
 --        SPAMLITE_BIN=<path> overrides the engine binary (default /usr/local/bin/spamlite).
+--        User dirs are found by host layout when neither --root nor --users-glob
+--        is given: any "/srv/*/msg/*" -> NS 3.0; else any "/home/u/*/home/*" ->
+--        NS 1.0. --root DIR forces "<DIR>/*/msg/*";
+--        --users-glob sets the pattern outright. Any pattern must keep the
+--        domain two components above the user dir (<domain>/<x>/<user>):
+--        user@domain and the mdbox login are derived from that position.
 
 $SL = env("SPAMLITE_BIN", "/usr/local/bin/spamlite")
 $RIPEN = 259200
@@ -82,7 +89,8 @@ $CAP = 200
 $FILED_CAP = 100
 $DRY = 0
 $FILTER = ""
-$ROOT = "/srv"
+$ROOT = ""
+$USERS_GLOB = ""
 
 fn version_at_least($s, $maj, $min, $pat)
   $words = split(strip($s), " ")
@@ -163,7 +171,12 @@ while $i < len($a)
       $i = $i + 1
       $ROOT = $a[$i]
     else
+    if $a[$i] == "--users-glob" then
+      $i = $i + 1
+      $USERS_GLOB = $a[$i]
+    else
       $FILTER = $a[$i]
+    end
     end
     end
   end
@@ -187,7 +200,26 @@ $HAM_HI = $NOW - $RIPEN
 $HAM_LO = $NOW - $WINDOW
 $STAGE = "/dev/shm/slrec." .. $NOW
 
-$users = glob($ROOT .. "/*/msg/*")
+if $USERS_GLOB == "" then
+  if $ROOT != "" then
+    $USERS_GLOB = $ROOT .. "/*/msg/*"
+  else
+    -- test for mailbox dirs, not the parents: stock Debian/Ubuntu ship an
+    -- empty /srv, and NS 3.0 hosts can keep a leftover /home/u
+    if len(glob("/srv/*/msg/*")) > 0 then
+      $USERS_GLOB = "/srv/*/msg/*"
+    else
+      if len(glob("/home/u/*/home/*")) > 0 then
+        $USERS_GLOB = "/home/u/*/home/*"
+      else
+        print("ABORT: no --root/--users-glob and no mailbox dirs under /srv/*/msg (NS 3.0) or /home/u/*/home (NS 1.0)")
+        exit(2)
+      end
+    end
+  end
+end
+print("users: " .. $USERS_GLOB)
+$users = glob($USERS_GLOB)
 $u = 0
 while $u < len($users)
   $d = $users[$u]
@@ -635,7 +667,7 @@ while $u < len($users)
     end
 
     if $mode == "mdbox" then
-      -- login from the path: <root>/<domain>/msg/<user>
+      -- login from the path: <root>/<domain>/msg/<user> (or <domain>/home/<user>)
       $ps = split($d, "/")
       $login = $ps[len($ps) - 1] .. "@" .. $ps[len($ps) - 3]
       $plans = []

@@ -18,6 +18,7 @@
 -- cutoff are moved to INBOX; older retrained ones stay in Junk, frozen as G.
 
 $SL = "/usr/local/bin/spamlite"
+$STAMP = to_string(floor(time()))
 $a = args()
 if len($a) < 3 then
   print("usage: spamlite-junk-rescue.mix dry|apply <list.tsv> <YYYY-MM-DD>")
@@ -39,7 +40,11 @@ end
 $T = {corr: 0, plain: 0, skipped: 0, moved: 0, missing: 0, failed: 0}
 for $login in sort(keys($by))
   $up = split($login, "@")
+  -- NS 3.0 /srv/<dom>/msg/<user>, else NS 1.0 /home/u/<dom>/home/<user>
   $db = "/srv/" .. $up[1] .. "/msg/" .. $up[0] .. "/.spamlite"
+  if not is_dir($db) and is_dir("/home/u/" .. $up[1] .. "/home/" .. $up[0] .. "/.spamlite") then
+    $db = "/home/u/" .. $up[1] .. "/home/" .. $up[0] .. "/.spamlite"
+  end
   $log = $db .. "/reconciled.log"
   $owner = strip(run_argv(["stat", "-c", "%U", $db .. "/db.sqlite"]).stdout)
   $last = {}
@@ -126,8 +131,8 @@ for $login in sort(keys($by))
   print($login .. ": retrain corr=" .. $nc .. " plain=" .. $np .. "  not-retrained=" .. $ns .. "  to-move=" .. $nm)
   if $mode != "apply" then continue end
 
-  run_argv(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-20260917-rescue"])
-  if is_file($log) then run_argv(["cp", "-a", $log, $log .. ".bak-20260917-rescue"]) end
+  run_argv(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-" .. $STAMP .. "-rescue"])
+  if is_file($log) then run_argv(["cp", "-a", $log, $log .. ".bak-" .. $STAMP .. "-rescue"]) end
   $trained = {}
   for $sub in ["corr", "plain"]
     $argv = [$SL, "-d", $db, "train-dir", $stage .. "/" .. $sub, "good"]

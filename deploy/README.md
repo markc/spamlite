@@ -151,3 +151,26 @@ from the address a phish would forge.
 Three attachment-only sends now fail with `no tokens`: without the swap they
 still emitted `h:from:<brett>`, and with it there is nothing left to train.
 Correct, and excluded from the batch rather than counted.
+
+## NS 1.0 hosts (2026-10-13, msi)
+
+NS 1.0 mail lives at `/home/u/<domain>/home/<user>` (Maildir) instead of
+`/srv/<domain>/msg/<user>`. `spamlite-reconcile.mix` picks the layout itself
+when run without `--root`/`--users-glob`: any `/srv/*/msg/*` means NS 3.0,
+otherwise any `/home/u/*/home/*` means NS 1.0. It tests mailbox dirs, not the
+parents, because stock Debian/Ubuntu ship an empty `/srv` and NS 3.0 hosts can
+keep a leftover `/home/u`. `spamlite-junk-rescue.mix` falls back to the NS 1.0
+path the same way.
+
+`*.sieve.ns1` are the NS 1.0 global and imapsieve scripts. They call
+`spamlite` directly (no `spamfilter` wrapper), so the delivery verb is
+`score`, never `receive`: since 0.9.x `receive` trains on confident
+verdicts. Install them mode 0644 and precompile with `sievec`.
+
+msi went from 0.2.0 to 0.9.7 with a verdict gate on database copies first
+(482 messages across 13 users: 476 identical, 6 spam->good, 0 good->spam).
+0.9.x only adds the `labels` table, and 0.2.0 still reads the database
+afterwards, so rolling back the binary needs no database restore. Before
+arming the reconciler, run a dry run and rescue any known false positives
+still sitting in Junk (`spamlite-junk-rescue.mix`); otherwise the first real
+run trains them as spam.
