@@ -1,4 +1,4 @@
-#!/opt/cosmix/bin/mix
+#!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-user-review.mix — daily 24h review of one user's spamlite filtering,
@@ -12,7 +12,7 @@
 -- the ops canary keeps flying.
 --
 -- Cron (per host, one line per reviewed user), e.g.:
---   0 15 * * * root /opt/cosmix/bin/mix /usr/local/bin/spamlite-user-review.mix owner@example.net --to owner@example.net
+--   0 15 * * * root /opt/mixos/bin/mix /usr/local/bin/spamlite-user-review.mix owner@example.net --to owner@example.net
 --
 -- Reconciler-stack edition (spamlite 0.9.0): the actionable item is the
 -- BORDERLINE JUNK list — junk scored inside [threshold, threshold+0.25), the

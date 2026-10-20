@@ -1,4 +1,4 @@
-#!/opt/cosmix/bin/mix
+#!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
 -- spamlite-threshold-digest — daily cluster-wide digest of spamlite user stats.
