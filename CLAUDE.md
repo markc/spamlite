@@ -18,6 +18,7 @@ src/
   lib.rs          Engine layers and classifier compatibility alias
   storage.rs      SQLite schema + caller-transaction train/untrain/relabel ops + Database wrapper
   tokenizer.rs    MIME tokenizer; tokenize_for_training is the training entry
+  html.rs         HTML to text, bounded in stack depth and linear in time (private)
   scoring.rs      Robinson-Fisher scoring and DB-free classify_tokens seam
   main.rs         cli-feature binary wiring and policy
 ```
@@ -69,7 +70,13 @@ cargo build --release
 
 ## Deployment
 
-Binary goes to `/usr/bin/spamlite` on the mail server (where dovecot's `sieve_execute_bin_dir` points).
+Binary goes to `/usr/local/bin/spamlite` on mrn, which is the path the
+`spamfilter` wrapper calls. On hosts whose sieve calls `spamlite` directly
+(the NS 1.0 `global.sieve.ns1`), it goes wherever dovecot's
+`sieve_execute_bin_dir` points.
+
+Delivery uses `score`, never `receive`: `score` is read-only, and `receive`
+trains on its own confident verdicts.
 
 Sieve scripts on mrn are in `/etc/dovecot/sieve/`:
 - `global.sieve` — inbound classification, calls `spamfilter ... receive`
@@ -91,8 +98,8 @@ User-correction commands (`good`, `spam`, `untrain`, and `train-dir`) use a
 chunk commit within Dovecot's 20-second execute limit. Delivery-path `receive`
 and `score`, other CLI opens, and the library default remain at 5 seconds.
 The nightly reconciler trains spam from Junk and its child mailboxes, excluding
-similar-looking siblings such as `Junkyard`; its ham source remains only the
-ripened INBOX window. mdbox candidates use the saved-time Unix epoch for the
+similar-looking siblings such as `Junkyard`; its ham sources are the ripened
+INBOX window and seen mail the user filed into a kept folder in that window. mdbox candidates use the saved-time Unix epoch for the
 shared cap, and an enumeration failure skips both classes for that user.
 
 ## Testing
@@ -108,12 +115,23 @@ echo "Subject: test" | cargo run -- receive   # Quick classification test
 - SQLite WAL mode requires the `-wal` and `-shm` files to be writable by the mail user.
 - The `receive` command outputs to stdout without a trailing newline (intentional — sieve compat).
 - `mail-parser` 0.11's `received()` returns `Option<&Received>` (single), not an iterator.
-  Only the most recent Received header is tokenized.
+  It is the LAST Received header in file order: the oldest hop, written by the
+  sending side and so forgeable, not the most recent one. Switching to the
+  topmost header would change `h:received:` for every trained corpus, so it
+  needs a shadow evaluation, not a quick fix.
+- Any tokenizer change that alters the tokens of ordinary mail shifts scores
+  for every user and needs a shadow evaluation first (see the htmlfix verdict).
+  Changes that only bite on pathological input do not.
+- Root-run scripts must never write, chown or chmod inside a mail user's
+  directory as root: the user can plant a symlink there. Take the identity from
+  an lstat, refuse root, and write as that user (`setpriv ... tee -a`), as
+  `deploy/spamlite-reconcile.mix` does.
+- `Cargo.lock` is tracked; build with `--locked`.
 
 ## Future Work
 
-- Command-line flags for tuning parameters (thresholds, interesting token count, strength)
-- `dump` command to show token probabilities for a message (debugging)
-- Bulk training from Maildir (`spamlite train-dir --spam path/to/.Junk/cur/`)
 - Per-domain shared databases (optional, for domains with few users)
 - Benchmarking against real spam/ham corpora
+- `mail-parser` 1.0 (needs Rust 1.98, API changes, adds nesting and part-count limits)
+- Per-message training registry (the `labels` table is unused, so training the
+  same message twice counts twice)

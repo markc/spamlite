@@ -10,7 +10,8 @@ Per-user Bayesian spam filter in Rust. Drop-in replacement for
 [bogofilter](https://bogofilter.sourceforge.io/), designed to integrate
 with Dovecot via sieve `execute`.
 
-- **5-8 MB RSS** regardless of database size
+- **5-8 MB RSS** on ordinary mail, regardless of database size (the message
+  itself is read whole, capped at 64 MiB)
 - **SQLite WAL** storage — crash-safe, no BerkeleyDB corruption
 - **Robinson-Fisher** chi-squared classifier — same proven algorithm as bogofilter and SpamAssassin
 
@@ -66,31 +67,29 @@ would require persisting the trained token set per message.
 
 ## Usage
 
+`spamlite --help` prints the full, current list of commands, options and
+environment variables. The ones that matter day to day:
+
 ```
-spamlite 0.9.3 — per-user Bayesian spam filter
-Copyright 2026 Mark Constable <mc@mixos.dev>
-MIT OR Apache-2.0 — https://github.com/markc/spamlite
+spamlite [-d DIR] [-t THRESHOLD] score     Classify stdin, read-only → "SPAM 0.999976" / "GOOD 0.000232"
+spamlite [-d DIR] [-t THRESHOLD] explain   Token-level breakdown of a verdict
+spamlite [-d DIR] spam | good              Train stdin as spam / as ham
+spamlite [-d DIR] untrain spam|good        Remove stdin from one class
+spamlite [-d DIR] train-dir MSGDIR spam|good [--from spam|good] [--sent]
+                                           Bulk-train a directory, or correct each
+                                           message from the old class
+spamlite [-d DIR] counts | stats           Database statistics
+spamlite [-d DIR] cleanup [N] [D]          Remove tokens with count <= N or not seen in D days
+spamlite [-d DIR] export | import          CSV out / in (spamprobe-compatible)
 
-Usage:
-  spamlite [-d DIR] receive          Classify message (stdin → "SPAM 0.999976" / "GOOD 0.000232")
-  spamlite [-d DIR] spam             Train message from stdin as spam
-  spamlite [-d DIR] good             Train message from stdin as good/ham
-  spamlite [-d DIR] untrain spam|good
-                                       Remove stdin message from one class
-  spamlite [-d DIR] train-dir DIR spam|good [--from spam|good]
-                                       Bulk-train a directory, or atomically
-                                       correct each message from the old class
-  spamlite [-d DIR] counts           Show database statistics
-  spamlite [-d DIR] cleanup [N] [D]  Remove tokens with count <= N or not seen in D days
-  spamlite [-d DIR] export           Export database to CSV on stdout
-  spamlite [-d DIR] import           Import CSV from stdin (spamprobe-compatible format)
-
-Options:
-  -d DIR    Database directory (uses DIR/db.sqlite)
-
-Environment:
-  SPAMLITE_DB    Database file path (default: ~/.spamlite/db.sqlite)
+-d DIR         Database directory (uses DIR/db.sqlite)
+-t THRESHOLD   Spam threshold, default 0.5; <DIR>/params.toml sets it per user
 ```
+
+`score` is the delivery command: it never writes. `receive` also exists; it
+classifies and then trains on confident verdicts, which lets the filter's own
+mistakes reinforce themselves, so production delivery uses `score` and leaves
+training to user corrections and a nightly reconciler.
 
 ### Quick start
 
@@ -100,7 +99,7 @@ for msg in ~/Maildir/cur/*; do spamlite good < "$msg"; done
 for msg in ~/Maildir/.Junk/cur/*; do spamlite spam < "$msg"; done
 
 # Classify
-echo "Subject: Buy cheap pills now" | spamlite receive
+echo "Subject: Buy cheap pills now" | spamlite score
 # → SPAM 0.997832
 
 spamlite counts
@@ -149,18 +148,22 @@ require ["vnd.dovecot.execute", "fileinto", "envelope", "variables", "editheader
 if envelope :localpart :matches "to" "*" { set "lhs" "${1}"; }
 if envelope :domain :matches "to" "*" { set "rhs" "${1}"; }
 
-execute :pipe :output "SCORE" "spamlite"
-  ["-d", "/srv/${rhs}/msg/${lhs}/.spamlite", "receive"];
+# Never trust an X-Spam-Status the sender supplied.
+deleteheader "X-Spam-Status";
 
-set "verdict" "UNSURE";
-if string :matches "${SCORE}" "SPAM *" { set "verdict" "SPAM"; }
-elsif string :matches "${SCORE}" "GOOD *" { set "verdict" "GOOD"; }
+execute :pipe :output "SCORE" "spamlite"
+  ["-d", "/srv/${rhs}/msg/${lhs}/.spamlite", "score"];
 
 addheader :last "X-Spam-Status" "${SCORE} [spamlite]";
 
-if string :is "${verdict}" "SPAM" { fileinto "Junk"; stop; }
-if string :is "${verdict}" "UNSURE" { fileinto "Unsure"; stop; }
+# Decide on the classifier's output, not on the header.
+if string :matches "${SCORE}" "SPAM *" { fileinto "Junk"; stop; }
 ```
+
+The output is always `SPAM <score>` or `GOOD <score>`, with no trailing
+newline. If anything goes wrong (no database, a busy database, a parser
+failure) `score` fails open with `GOOD 0.500000` and exit 0, so a filter
+fault never loses or junks mail.
 
 ### Retrain on IMAP move
 
@@ -189,9 +192,9 @@ if environment :matches "imap.user" "*@*" {
 
 The nightly reconciler treats Junk and its child mailboxes as spam, in both
 Maildir and mdbox layouts. Similar-looking sibling mailboxes such as `Junkyard`
-are excluded. Its ham policy is unchanged: only messages in the ripened INBOX
-window are candidates, with the per-night class cap shared across all Junk
-sources. mdbox candidates are ordered by Dovecot's saved-time Unix epoch; if
+are excluded. Ham comes from the ripened INBOX window and from seen mail the
+user filed into a kept folder in the same window; the per-night class cap is
+shared across all Junk sources. mdbox candidates are ordered by Dovecot's saved-time Unix epoch; if
 Junk enumeration fails, the user is skipped for both classes that night.
 
 ## Algorithm
@@ -207,7 +210,8 @@ used by bogofilter and SpamAssassin:
    from dominating (s=1.0, x=0.5)
 4. **Select interesting** — top 150 tokens furthest from 0.5
 5. **Fisher's chi-squared** — two-tailed combining for final score
-6. **Verdict** — SPAM (>0.9), GOOD (<0.1), UNSURE (between)
+6. **Verdict** — SPAM at or above the threshold (default 0.5, per user via
+   `params.toml`), otherwise GOOD. There is no UNSURE verdict.
 
 This works well from the start: even with 50 trained messages, known tokens pull
 the score while unknown tokens contribute 0.5 (neutral), not noise.
