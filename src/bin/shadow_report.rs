@@ -118,7 +118,6 @@ fn lossy_lines(reader: impl BufRead) -> impl Iterator<Item = std::io::Result<Str
         .map(|line| line.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-
 fn main() {
     let args = parse_args();
     let mut per_user: BTreeMap<String, UserStats> = BTreeMap::new();

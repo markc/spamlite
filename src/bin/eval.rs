@@ -73,7 +73,6 @@ fn open_evaluation_db(path: &Path) -> Result<Database, String> {
     Database::open_existing(path)
 }
 
-
 fn numeric_value<T: std::str::FromStr>(value: &str) -> Result<T, String> {
     value
         .parse()
@@ -86,7 +85,6 @@ fn parse_number<T: std::str::FromStr>(value: &str, flag: &str) -> T {
         std::process::exit(2);
     })
 }
-
 
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();

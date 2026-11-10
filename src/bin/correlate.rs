@@ -96,7 +96,6 @@ fn extract_string(line: &str, key: &str) -> Option<String> {
     None
 }
 
-
 /// Extract a JSON numeric value by the same textual search.
 fn extract_number<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("\"{key}\":");

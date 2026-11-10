@@ -83,7 +83,6 @@ fn open_evaluation_db(path: &Path) -> Result<Database, String> {
     Database::open_existing(path)
 }
 
-
 fn numeric_value<T: std::str::FromStr>(value: &str) -> Result<T, String> {
     value
         .parse()

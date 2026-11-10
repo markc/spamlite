@@ -765,6 +765,19 @@ fn argument_error(message: &str) {
     process::exit(2);
 }
 
+fn delivery_command_first(args: &mut [String]) {
+    // Unknown options before a delivery verb must not turn it into an exit-1
+    // unknown command. A preceding maintenance verb still owns its arguments.
+    let command = args.iter().position(|a| matches!(a.as_str(),
+        "score" | "receive" | "good" | "spam" | "untrain" | "train-dir" |
+        "cleanup" | "counts" | "stats" | "export" | "import" | "msgids" | "explain"));
+    if let Some(i) = command {
+        if args[i] == "score" || args[i] == "receive" {
+            args[..=i].rotate_right(1);
+        }
+    }
+}
+
 /// train-dir = bulk-train every message file in a directory as ONE class, or
 /// correct it atomically from the class named by `--from` to the target class.
 /// Replaces the per-message exec loop (fork + db open + commit per message)
@@ -1162,7 +1175,8 @@ fn parse_args() -> Vec<String> {
 }
 
 fn main() {
-    let args = parse_args();
+    let mut args = parse_args();
+    delivery_command_first(&mut args);
 
     if args.is_empty() {
         usage();
@@ -1227,6 +1241,13 @@ mod tests {
         }
         assert_eq!(cleanup_args(&args(&[])), Some((1, 0)));
         assert_eq!(cleanup_args(&args(&["2", "30"])), Some((2, 30)));
+        let mut delivery = args(&["--bad", "score", "extra"]);
+        delivery_command_first(&mut delivery);
+        assert_eq!(delivery, args(&["score", "--bad", "extra"]));
+        let mut training = args(&["good", "score"]);
+        delivery_command_first(&mut training);
+        assert_eq!(training[0], "good");
+        assert!(!valid_command_args(&training));
     }
 
     #[test]
