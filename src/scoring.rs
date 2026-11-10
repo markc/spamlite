@@ -276,10 +276,7 @@ impl Params {
             // means this user is running on defaults without knowing it.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
-                eprintln!(
-                    "spamlite: {}: ignored, using defaults: {e}",
-                    path.display()
-                );
+                eprintln!("spamlite: {}: ignored, using defaults: {e}", path.display());
                 return;
             }
         };
