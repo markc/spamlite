@@ -11,13 +11,15 @@ use mail_parser::{Addr, HeaderName, HeaderValue, Host, MessageParser};
 const MIN_TOKEN_LEN: usize = 3;
 const MAX_TOKEN_LEN: usize = 40;
 
-/// Hard cap on tokens extracted from one message (pre-dedup). The 64 MiB
+/// Hard cap on distinct tokens extracted from one message. The 64 MiB
 /// stdin cap in main.rs bounds memory, but a huge text body could still cost
 /// millions of allocations plus thousands of chunked SQL lookups inside the
-/// sieve hot path with dovecot waiting. Real mail produces well under 10k raw
-/// tokens; the discriminating signal of any real message appears long before
-/// this cap. spamprobe has the same guard (max terms per message).
+/// sieve hot path with dovecot waiting. Real mail produces well under 10k
+/// distinct tokens; useful signal appears long before this cap.
 const MAX_RAW_TOKENS: usize = 50_000;
+const MAX_PART_WORDS: usize = 100_000;
+const MAX_SUBJECT_WORDS: usize = 4096;
+const MAX_HEADER_ADDRESSES: usize = 64;
 
 /// Tokenizer configuration. Controls which headers are tokenized and the token
 /// length bounds. `Default` preserves the historical behaviour; non-default
@@ -204,7 +206,10 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
 
     // Subject header — individual tokens + bigrams
     if let Some(subject) = message.subject() {
-        let words: Vec<String> = extract_words(subject).filter(|w| valid(w)).collect();
+        let words: Vec<String> = extract_words(subject)
+            .take(MAX_SUBJECT_WORDS)
+            .filter(|w| valid(w))
+            .collect();
 
         for w in &words {
             push_word(&mut tokens, "h:subject:", w, config);
@@ -225,8 +230,8 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         // credit five addresses for a single ham observation where the inbound
         // mail it is meant to imitate credits exactly one. Subject and body
         // still train for these messages; only the address tokens are withheld.
-        let to_count = message.to().map(|t| t.iter().count()).unwrap_or(0);
-        let cc_count = message.cc().map(|c| c.iter().count()).unwrap_or(0);
+        let to_count = message.to().map(|t| t.iter().take(2).count()).unwrap_or(0);
+        let cc_count = message.cc().map(|c| c.iter().take(1).count()).unwrap_or(0);
         if to_count == 1 && cc_count == 0 {
             // Self-addressed mail is the one recipient that must not train. The
             // user is not their own correspondent, the copy that lands in INBOX
@@ -239,13 +244,14 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
                 .from()
                 .map(|f| {
                     f.iter()
+                        .take(MAX_HEADER_ADDRESSES)
                         .filter_map(|a| a.address.as_deref())
                         .map(|a| a.to_lowercase())
                         .collect()
                 })
                 .unwrap_or_default();
             if let Some(to) = message.to() {
-                for addr in to.iter() {
+                for addr in to.iter().take(MAX_HEADER_ADDRESSES) {
                     let is_self = addr
                         .address
                         .as_deref()
@@ -267,7 +273,7 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
     } else {
         // From header
         if let Some(from) = message.from() {
-            for addr in from.iter() {
+            for addr in from.iter().take(MAX_HEADER_ADDRESSES) {
                 push_addr(&mut tokens, "h:from:", addr, &valid, config);
             }
         }
@@ -276,12 +282,12 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         // rewrites From into its own envelope domain. Decomposed to brand anchors
         // by push_addr, same as From. Default-on: additive per-sender signal.
         if let Some(reply_to) = message.reply_to() {
-            for addr in reply_to.iter() {
+            for addr in reply_to.iter().take(MAX_HEADER_ADDRESSES) {
                 push_addr(&mut tokens, "h:replyto:", addr, &valid, config);
             }
         }
         if let Some(sender) = message.sender() {
-            for addr in sender.iter() {
+            for addr in sender.iter().take(MAX_HEADER_ADDRESSES) {
                 push_addr(&mut tokens, "h:sender:", addr, &valid, config);
             }
         }
@@ -289,12 +295,12 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         // To / Cc headers (expanded coverage)
         if config.expanded_headers {
             if let Some(to) = message.to() {
-                for addr in to.iter() {
+                for addr in to.iter().take(MAX_HEADER_ADDRESSES) {
                     push_addr(&mut tokens, "h:to:", addr, &valid, config);
                 }
             }
             if let Some(cc) = message.cc() {
-                for addr in cc.iter() {
+                for addr in cc.iter().take(MAX_HEADER_ADDRESSES) {
                     push_addr(&mut tokens, "h:cc:", addr, &valid, config);
                 }
             }
@@ -386,8 +392,10 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         }
     }
 
-    // Body parts. Bodies are the only unbounded token source (headers are
-    // small), so the MAX_RAW_TOKENS cap is enforced here.
+    // Count distinct body tokens, with separate per-part scan budgets.
+    tokens.sort_unstable();
+    tokens.dedup();
+    let mut seen: std::collections::HashSet<String> = tokens.iter().cloned().collect();
     for part in message.text_bodies() {
         if tokens.len() >= MAX_RAW_TOKENS {
             break;
@@ -416,20 +424,30 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
 
         // URLs in plain-text bodies carry the same signal as HTML hrefs —
         // text-only spam was previously losing its `u:` tokens entirely.
-        let mut urls = extract_urls_from_text(text, config.max_len);
+        let mut urls = extract_urls_from_text(text, config.max_len).take(MAX_PART_WORDS);
         while tokens.len() < MAX_RAW_TOKENS {
             let Some(url) = urls.next() else { break };
             if valid(&url) {
-                tokens.push(format!("u:{url}"));
+                let token = format!("u:{url}");
+                if seen.insert(token.clone()) {
+                    tokens.push(token);
+                }
             }
         }
 
-        for w in extract_words(text) {
+        for w in extract_words(text).take(MAX_PART_WORDS) {
             if tokens.len() >= MAX_RAW_TOKENS {
                 break;
             }
             if valid(&w) {
+                let start = tokens.len();
                 push_word(&mut tokens, "b:", &w, config);
+                let added = tokens.split_off(start);
+                for token in added {
+                    if seen.len() < MAX_RAW_TOKENS && seen.insert(token.clone()) {
+                        tokens.push(token);
+                    }
+                }
             }
         }
     }
@@ -441,23 +459,33 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         let html = part.text_contents().unwrap_or_default();
 
         // Extract URLs from HTML before stripping
-        let mut urls = extract_urls(html, config.max_len);
+        let mut urls = extract_urls(html, config.max_len).take(MAX_PART_WORDS);
         while tokens.len() < MAX_RAW_TOKENS {
             let Some(url) = urls.next() else { break };
             if valid(&url) {
-                tokens.push(format!("u:{url}"));
+                let token = format!("u:{url}");
+                if seen.insert(token.clone()) {
+                    tokens.push(token);
+                }
             }
         }
 
         // Strip HTML and tokenize text. In-tree stripper: the upstream one can
         // be driven into a stack overflow or quadratic time (see `html.rs`).
         let text = crate::html::html_to_text(html);
-        for w in extract_words(&text) {
+        for w in extract_words(&text).take(MAX_PART_WORDS) {
             if tokens.len() >= MAX_RAW_TOKENS {
                 break;
             }
             if valid(&w) {
+                let start = tokens.len();
                 push_word(&mut tokens, "b:", &w, config);
+                let added = tokens.split_off(start);
+                for token in added {
+                    if seen.len() < MAX_RAW_TOKENS && seen.insert(token.clone()) {
+                        tokens.push(token);
+                    }
+                }
             }
         }
     }
@@ -546,7 +574,7 @@ fn push_addr<F: Fn(&str) -> bool>(
     // name is where `AppIe`/`AIdi` brand spoofs live; it was previously discarded.
     if config.brand_mismatch && prefix == "h:from:" {
         if let Some(name) = addr.name.as_deref() {
-            for w in extract_words(name) {
+            for w in extract_words(name).take(MAX_SUBJECT_WORDS) {
                 if valid(&w) {
                     push_word(tokens, "h:fromname:", &w, config);
                 }
@@ -803,9 +831,20 @@ fn emit_auth_tokens(tokens: &mut Vec<String>, ar: &str) {
 fn tokenize_fallback(raw: &[u8], config: &TokenizerConfig) -> Vec<String> {
     let text = String::from_utf8_lossy(raw);
     let mut tokens: Vec<String> = extract_words(&text)
+        .take(MAX_PART_WORDS)
         .filter(|w| w.len() >= config.min_len && w.len() <= config.max_len)
         .map(|w| format!("b:{w}"))
-        .take(MAX_RAW_TOKENS)
+        .scan(std::collections::HashSet::new(), |seen, token| {
+            if seen.len() >= MAX_RAW_TOKENS {
+                return None;
+            }
+            Some(if seen.insert(token.clone()) {
+                Some(token)
+            } else {
+                None
+            })
+        })
+        .flatten()
         .collect();
     tokens.sort_unstable();
     tokens.dedup();
@@ -930,6 +969,52 @@ fn normalize_url(url: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeated_plain_part_cannot_starve_html() {
+        let raw = format!("Subject: ordinary subject\r\nContent-Type: multipart/alternative; boundary=parts\r\n\r\n--parts\r\nContent-Type: text/plain\r\n\r\n{}\r\n--parts\r\nContent-Type: text/html\r\n\r\n<a href=\"https://example.org/visible\">visibleword</a>\r\n--parts--\r\n", "hidden ".repeat(MAX_PART_WORDS + 1));
+        let tokens = tokenize_with_config(raw.as_bytes(), &TokenizerConfig::default());
+        assert!(tokens.contains(&"b:hidden".into()));
+        assert!(tokens.contains(&"b:visibleword".into()));
+        assert!(tokens.contains(&"u:https://example.org/visible".into()));
+    }
+
+    #[test]
+    fn per_part_word_budget_and_header_limits() {
+        let subject = (0..5000)
+            .map(|i| format!("subject{i} "))
+            .collect::<String>();
+        let addrs = (0..100)
+            .map(|i| format!("user{i}@example.org"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let raw = format!("Subject: {subject}\r\nFrom: {addrs}\r\nReply-To: {addrs}\r\nSender: {addrs}\r\n\r\n{}beyondbudget", "repeated ".repeat(MAX_PART_WORDS));
+        let tokens = tokenize_with_config(raw.as_bytes(), &TokenizerConfig::default());
+        assert!(tokens.contains(&"h:subject:subject4095".into()));
+        assert!(!tokens.iter().any(|t| t.contains("subject4096")));
+        for prefix in ["h:from:", "h:replyto:", "h:sender:"] {
+            assert!(tokens.contains(&format!("{prefix}user63@example.org")));
+            assert!(!tokens.contains(&format!("{prefix}user64@example.org")));
+        }
+        assert!(!tokens.contains(&"b:beyondbudget".into()));
+    }
+
+    #[test]
+    fn ordinary_multipart_tokens_are_unchanged() {
+        let raw = b"Subject: Hello world\r\nFrom: user@example.org\r\nContent-Type: multipart/alternative; boundary=p\r\n\r\n--p\r\nContent-Type: text/plain\r\n\r\nHello hello meeting\r\n--p\r\nContent-Type: text/html\r\n\r\n<p>Hello meeting</p>\r\n--p--\r\n";
+        assert_eq!(
+            tokenize_with_config(raw, &TokenizerConfig::default()),
+            vec![
+                "b:hello",
+                "b:meeting",
+                "h:from:example",
+                "h:from:example.org",
+                "h:from:user@example.org",
+                "h:subject:hello",
+                "h:subject:hello_world",
+                "h:subject:world",
+            ]
+        );
+    }
     use super::*;
 
     #[test]
@@ -1029,7 +1114,7 @@ mod tests {
     #[test]
     fn test_token_cap_bounds_pathological_body() {
         // A synthetic body with far more unique words than the cap must be
-        // bounded (pre-dedup cap 50k, so post-dedup <= 50k + header tokens).
+        // bounded by the distinct-token cap.
         let mut body = String::with_capacity(1 << 20);
         for i in 0..(MAX_RAW_TOKENS + 10_000) {
             body.push_str(&format!("word{i:06} "));

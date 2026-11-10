@@ -538,18 +538,22 @@ fn cmd_cleanup(args: &[String]) {
 fn cmd_export() {
     let db = open_db_ro_or_exit();
     let mut stdout = io::stdout().lock();
-    if let Err(e) = db.export(&mut stdout) {
-        eprintln!("spamlite: export error: {e}");
-        process::exit(1);
+    match db.export_counted(&mut stdout) {
+        Ok(skipped) => eprintln!("spamlite: export skipped {skipped} tokens"),
+        Err(e) => {
+            eprintln!("spamlite: export error: {e}");
+            process::exit(1);
+        }
     }
 }
 
 fn cmd_import() {
     let db = open_db();
     let reader = BufReader::new(io::stdin());
-    match db.import(reader) {
-        Ok(count) => {
+    match db.import_counted(reader) {
+        Ok((count, skipped)) => {
             println!("Imported {count} tokens");
+            eprintln!("spamlite: import skipped {skipped} lines");
         }
         Err(e) => {
             eprintln!("spamlite: import error: {e}");
