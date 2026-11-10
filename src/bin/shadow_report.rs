@@ -113,15 +113,13 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 fn lossy_lines(reader: impl BufRead) -> impl Iterator<Item = std::io::Result<String>> {
-    reader
-        .split(b'\n')
-        .map(|line| {
-            line.map(|bytes| {
-                String::from_utf8_lossy(&bytes)
-                    .trim_end_matches('\r')
-                    .to_string()
-            })
+    reader.split(b'\n').map(|line| {
+        line.map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\r')
+                .to_string()
         })
+    })
 }
 
 fn main() {
