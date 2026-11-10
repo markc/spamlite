@@ -345,6 +345,8 @@ fn process_reader<R: BufRead, W: Write>(
     for line in reader.split(b'\n') {
         let bytes = line?;
         let line = String::from_utf8_lossy(&bytes);
+        // `BufRead::lines` dropped a CR before the LF; splitting on bytes does not.
+        let line = line.trim_end_matches('\r');
         stats.lines_read += 1;
 
         // Fast reject for lines that don't contain any of our markers.
@@ -353,7 +355,7 @@ fn process_reader<R: BufRead, W: Write>(
             continue;
         }
 
-        match parse_line(&line) {
+        match parse_line(line) {
             ParsedLine::Train(ev) => {
                 stats.record_train(&ev);
                 emit_train(out, &ev)?;

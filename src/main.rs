@@ -1128,7 +1128,10 @@ fn parse_args() -> Vec<String> {
     while i < args.len() {
         if args[i] == "-d" {
             if i + 1 < args.len() {
-                if args[i + 1] == "score" || args[i + 1] == "receive" {
+                // Only when the delivery verb is the LAST argument can it be the
+                // command with -d's value missing. `-d score score` is a
+                // directory named "score" and must keep working.
+                if i + 2 == args.len() && (args[i + 1] == "score" || args[i + 1] == "receive") {
                     argument_error("-d requires a directory argument");
                     i += 1;
                     continue;

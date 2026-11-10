@@ -17,9 +17,14 @@ const MAX_TOKEN_LEN: usize = 40;
 /// sieve hot path with dovecot waiting. Real mail produces well under 10k
 /// distinct tokens; useful signal appears long before this cap.
 const MAX_RAW_TOKENS: usize = 50_000;
+/// Per-part budget of VALID words (and of valid URLs). It is counted after the
+/// length filter on purpose: the old cap stopped at 50k valid raw tokens for
+/// the whole message, so any message the old code read in full has fewer
+/// valid words per part than this and tokenizes exactly as before. Counting
+/// raw words instead would drop the tail of a part padded with short words.
 const MAX_PART_WORDS: usize = 100_000;
 const MAX_SUBJECT_WORDS: usize = 4096;
-const MAX_HEADER_ADDRESSES: usize = 64;
+const MAX_HEADER_ADDRESSES: usize = 1024;
 
 /// Tokenizer configuration. Controls which headers are tokenized and the token
 /// length bounds. `Default` preserves the historical behaviour; non-default
@@ -424,7 +429,9 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
 
         // URLs in plain-text bodies carry the same signal as HTML hrefs —
         // text-only spam was previously losing its `u:` tokens entirely.
-        let mut urls = extract_urls_from_text(text, config.max_len).take(MAX_PART_WORDS);
+        let mut urls = extract_urls_from_text(text, config.max_len)
+            .filter(|u| valid(u))
+            .take(MAX_PART_WORDS);
         while tokens.len() < MAX_RAW_TOKENS {
             let Some(url) = urls.next() else { break };
             if valid(&url) {
@@ -435,7 +442,10 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
             }
         }
 
-        for w in extract_words(text).take(MAX_PART_WORDS) {
+        for w in extract_words(text)
+            .filter(|w| valid(w))
+            .take(MAX_PART_WORDS)
+        {
             if tokens.len() >= MAX_RAW_TOKENS {
                 break;
             }
@@ -459,7 +469,9 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         let html = part.text_contents().unwrap_or_default();
 
         // Extract URLs from HTML before stripping
-        let mut urls = extract_urls(html, config.max_len).take(MAX_PART_WORDS);
+        let mut urls = extract_urls(html, config.max_len)
+            .filter(|u| valid(u))
+            .take(MAX_PART_WORDS);
         while tokens.len() < MAX_RAW_TOKENS {
             let Some(url) = urls.next() else { break };
             if valid(&url) {
@@ -473,7 +485,10 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
         // Strip HTML and tokenize text. In-tree stripper: the upstream one can
         // be driven into a stack overflow or quadratic time (see `html.rs`).
         let text = crate::html::html_to_text(html);
-        for w in extract_words(&text).take(MAX_PART_WORDS) {
+        for w in extract_words(&text)
+            .filter(|w| valid(w))
+            .take(MAX_PART_WORDS)
+        {
             if tokens.len() >= MAX_RAW_TOKENS {
                 break;
             }
@@ -831,8 +846,8 @@ fn emit_auth_tokens(tokens: &mut Vec<String>, ar: &str) {
 fn tokenize_fallback(raw: &[u8], config: &TokenizerConfig) -> Vec<String> {
     let text = String::from_utf8_lossy(raw);
     let mut tokens: Vec<String> = extract_words(&text)
-        .take(MAX_PART_WORDS)
         .filter(|w| w.len() >= config.min_len && w.len() <= config.max_len)
+        .take(MAX_PART_WORDS)
         .map(|w| format!("b:{w}"))
         .scan(std::collections::HashSet::new(), |seen, token| {
             if seen.len() >= MAX_RAW_TOKENS {
@@ -978,12 +993,25 @@ mod tests {
         assert!(tokens.contains(&"u:https://example.org/visible".into()));
     }
 
+    /// The per-part budget counts valid words only: a part padded with words
+    /// too short to tokenize was read to its end by the old code and still is.
+    #[test]
+    fn short_word_padding_does_not_consume_the_part_budget() {
+        let raw = format!(
+            "Subject: ordinary subject\r\n\r\n{}meeting https://example.org/tail",
+            "a ".repeat(MAX_PART_WORDS + 10)
+        );
+        let tokens = tokenize_with_config(raw.as_bytes(), &TokenizerConfig::default());
+        assert!(tokens.contains(&"b:meeting".into()));
+        assert!(tokens.contains(&"u:https://example.org/tail".into()));
+    }
+
     #[test]
     fn per_part_word_budget_and_header_limits() {
         let subject = (0..5000)
             .map(|i| format!("subject{i} "))
             .collect::<String>();
-        let addrs = (0..100)
+        let addrs = (0..1100)
             .map(|i| format!("user{i}@example.org"))
             .collect::<Vec<_>>()
             .join(", ");
@@ -992,8 +1020,8 @@ mod tests {
         assert!(tokens.contains(&"h:subject:subject4095".into()));
         assert!(!tokens.iter().any(|t| t.contains("subject4096")));
         for prefix in ["h:from:", "h:replyto:", "h:sender:"] {
-            assert!(tokens.contains(&format!("{prefix}user63@example.org")));
-            assert!(!tokens.contains(&format!("{prefix}user64@example.org")));
+            assert!(tokens.contains(&format!("{prefix}user1023@example.org")));
+            assert!(!tokens.contains(&format!("{prefix}user1024@example.org")));
         }
         assert!(!tokens.contains(&"b:beyondbudget".into()));
     }
