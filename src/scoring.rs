@@ -17,10 +17,21 @@ fn read_params(path: &std::path::Path) -> std::io::Result<String> {
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    // O_NONBLOCK is 0o4000 on every Linux architecture; O_NOFOLLOW is not
+    // (0o400000 on x86_64, 0o100000 on aarch64, where 0o400000 is O_LARGEFILE).
+    // Both only narrow the race window: the identity check below is what
+    // rejects a swapped file on any platform.
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(0x800 | 0x20000); // O_NONBLOCK | O_NOFOLLOW
+        const O_NONBLOCK: i32 = 0o4000;
+        #[cfg(target_arch = "x86_64")]
+        const O_NOFOLLOW: i32 = 0o400000;
+        #[cfg(target_arch = "aarch64")]
+        const O_NOFOLLOW: i32 = 0o100000;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        const O_NOFOLLOW: i32 = 0;
+        options.custom_flags(O_NONBLOCK | O_NOFOLLOW);
     }
     let file = options.open(path)?;
     let after = file.metadata()?;
@@ -260,7 +271,17 @@ impl Params {
         let path = db_dir.join("params.toml");
         let body = match read_params(&path) {
             Ok(s) => s,
-            Err(_) => return,
+            // No file is the normal case and stays silent. A file that exists
+            // but is refused (symlink, special file, oversized, unreadable)
+            // means this user is running on defaults without knowing it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                eprintln!(
+                    "spamlite: {}: ignored, using defaults: {e}",
+                    path.display()
+                );
+                return;
+            }
         };
         for (lineno, raw) in body.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -342,10 +363,13 @@ impl Params {
                 }
                 "threshold" => {
                     if let Ok(x) = parse_f(v, k) {
-                        if x > 0.0 && x < 1.0 {
+                        // 1.0 stays valid: it means "junk only a saturated
+                        // score" and rejecting it would silently drop such a
+                        // user back to 0.5. Only 0 and below junk everything.
+                        if x > 0.0 && x <= 1.0 {
                             self.threshold = x;
                         } else {
-                            reject(k, v, ">0.0..<1.0");
+                            reject(k, v, ">0.0..=1.0");
                         }
                     }
                 }

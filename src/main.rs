@@ -539,7 +539,11 @@ fn cmd_export() {
     let db = open_db_ro_or_exit();
     let mut stdout = io::stdout().lock();
     match db.export_counted(&mut stdout) {
-        Ok(skipped) => eprintln!("spamlite: export skipped {skipped} tokens"),
+        Ok(0) => {}
+        Ok(skipped) => eprintln!(
+            "spamlite: export skipped {skipped} tokens that cannot be written as CSV \
+             (a double quote or control character in the word)"
+        ),
         Err(e) => {
             eprintln!("spamlite: export error: {e}");
             process::exit(1);
@@ -553,7 +557,11 @@ fn cmd_import() {
     match db.import_counted(reader) {
         Ok((count, skipped)) => {
             println!("Imported {count} tokens");
-            eprintln!("spamlite: import skipped {skipped} lines");
+            if skipped > 0 {
+                eprintln!(
+                    "spamlite: import skipped {skipped} lines (unreadable, malformed or out of range)"
+                );
+            }
         }
         Err(e) => {
             eprintln!("spamlite: import error: {e}");
