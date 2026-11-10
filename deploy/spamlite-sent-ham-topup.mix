@@ -33,7 +33,7 @@ end
 -- that expanded_headers leaves off by default. --sent emits the recipient
 -- under h:from: and drops the self-side headers. See TokenizerConfig::sent_swap.
 --
--- First use: owner@example.net 2026-08-23, 1368 msgs, 2386->3754 good —
+-- First use: zane@corp-n.example.com 2026-08-23, 1368 msgs, 2386->3754 good —
 -- run BEFORE --sent existed, so that db carries the own-domain ham counts and
 -- none of the correspondent tokens. Untrain those keys from the sidecar and
 -- re-run before treating his corpus as correct.

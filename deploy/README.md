@@ -119,9 +119,9 @@ regression: 361 real messages across 4 users on 3 hosts, zero divergence.
 `h:from:admin@client-g.example.com.au` 15 → 51 good without the flag, unchanged with
 it; sender tokens moved 4 → 59.
 
-owner@example.net's 2026-08-23 top-up (cohort `G 1787467991`) was undone and
+zane@corp-n.example.com's 2026-08-23 top-up (cohort `G 1787467991`) was undone and
 redone with `--sent`: 1367/1368 untrained (1 message deleted since, its counts
-stranded), 1379 retrained. `h:from:owner@example.net` 1649 → 404. On 150
+stranded), 1379 retrained. `h:from:zane@corp-n.example.com` 1649 → 404. On 150
 INBOX + 150 Junk messages, false positives fell 10 → 8 at his threshold of 0.6
 and 29 → 23 at 0.5, with false negatives unchanged. **His `threshold = 0.6`
 stays** — 0.5 is still far worse for him even after the fix.
@@ -133,14 +133,14 @@ all. 0.9.6 added `untrain --sent`, without which a `--sent` train had no
 inverse, plus `--was-sent` on the redo script and epoch-stamped backups.
 Both promoted on all three hosts after the same gate (80/80 identical on mbx).
 
-owner was restored from the pre-swap backup and redone under the guard, so the
+zane was restored from the pre-swap backup and redone under the guard, so the
 three corpus states are directly comparable:
 
 | `h:from:` token | raw top-up | swap, no guard | swap + guard |
 |---|---|---|---|
-| `owner@example.net` | 1649 | 404 | **282** |
-| `example.net` | 1667 | 561 | **439** |
-| `example` | 1369 | 263 | **141** |
+| `zane@corp-n.example.com` | 1649 | 404 | **282** |
+| `corp-n.example.com` | 1667 | 561 | **439** |
+| `corp-n` | 1369 | 263 | **141** |
 
 282 is exactly the pre-top-up value: Sent training now contributes nothing to
 his own address. The 439/141 residual is real correspondents at his own domain.
@@ -149,7 +149,7 @@ threshold of 0.6, so the guard cost nothing and removed 122 phantom ham counts
 from the address a phish would forge.
 
 Three attachment-only sends now fail with `no tokens`: without the swap they
-still emitted `h:from:<owner>`, and with it there is nothing left to train.
+still emitted `h:from:<zane>`, and with it there is nothing left to train.
 Correct, and excluded from the batch rather than counted.
 
 ## NS 1.0 hosts (2026-10-13, msi)

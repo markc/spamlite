@@ -28,7 +28,7 @@
 -- needed: bytes_to_string($b, {lossy:true}) — added in mix 0.17.2 — so a
 -- raw-8bit byte before the ASCII header doesn't reject the whole decode.
 -- The ionice/nice self-renice the python did is dropped: the cron wraps it.
--- Design rationale: the private ops journal.
+-- Design rationale: the private ops journal, 2026-04-11.
 
 $SPAMLITE_BIN = "/usr/local/bin/spamlite"
 $STATS_NAME = ".spamlite-stats.jsonl"
