@@ -633,7 +633,15 @@ fn read_existing_params(path: &Path) -> std::io::Result<String> {
         use std::os::unix::fs::OpenOptionsExt;
         // Linux O_NOFOLLOW | O_NONBLOCK: reject a symlink/FIFO swapped in
         // after lstat, including during the preservation read before writing.
-        options.custom_flags(0o400000 | 0o4000);
+        // O_NOFOLLOW differs by architecture (on aarch64 0o400000 is
+        // O_LARGEFILE); elsewhere the lstat in refuse_symlink is the guard.
+        #[cfg(target_arch = "x86_64")]
+        const O_NOFOLLOW: i32 = 0o400000;
+        #[cfg(target_arch = "aarch64")]
+        const O_NOFOLLOW: i32 = 0o100000;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        const O_NOFOLLOW: i32 = 0;
+        options.custom_flags(O_NOFOLLOW | 0o4000);
     }
     let mut file = match options.open(path) {
         Ok(file) => file,
@@ -898,7 +906,10 @@ mod tests {
         fs::remove_file(&path).unwrap();
         symlink(&target, &path).unwrap();
         assert!(write_params_toml(&dir, &Params::default()).is_err());
-        #[cfg(target_os = "linux")]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         assert!(read_existing_params(&path).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
         fs::remove_dir_all(dir).unwrap();
