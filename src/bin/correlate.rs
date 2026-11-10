@@ -96,17 +96,6 @@ fn extract_string(line: &str, key: &str) -> Option<String> {
     None
 }
 
-#[cfg(test)]
-mod encoding_tests {
-    use super::*;
-    #[test]
-    fn message_ids_keep_utf8() {
-        assert_eq!(
-            extract_string(r#"{"msgid":"<café@例.example>"}"#, "msgid").as_deref(),
-            Some("<café@例.example>")
-        );
-    }
-}
 
 /// Extract a JSON numeric value by the same textual search.
 fn extract_number<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -660,5 +649,17 @@ mod tests {
         fs::write(&tmp, "From: a@b.com\r\nSubject: x\r\n\r\nbody").unwrap();
         assert_eq!(read_msgid(&tmp), None);
         let _ = fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    #[test]
+    fn message_ids_keep_utf8() {
+        assert_eq!(
+            extract_string(r#"{"msgid":"<café@例.example>"}"#, "msgid").as_deref(),
+            Some("<café@例.example>")
+        );
     }
 }

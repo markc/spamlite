@@ -83,25 +83,6 @@ fn open_evaluation_db(path: &Path) -> Result<Database, String> {
     Database::open_existing(path)
 }
 
-#[cfg(test)]
-mod database_open_tests {
-    use super::*;
-    #[test]
-    fn missing_corpus_is_not_created() {
-        let dir = std::env::temp_dir().join(format!(
-            "spamlite-missing-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("db.sqlite");
-        assert!(open_evaluation_db(&path).is_err());
-        assert!(!path.exists());
-        assert!(!dir.exists());
-    }
-}
 
 fn numeric_value<T: std::str::FromStr>(value: &str) -> Result<T, String> {
     value
@@ -662,6 +643,11 @@ fn atomic_write_params(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let mut file = options.open(&temp)?;
     let result = (|| {
         file.write_all(body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
         file.sync_all()?;
         refuse_symlink(path)?;
         fs::rename(&temp, path)
@@ -970,5 +956,25 @@ mod tests {
         }
 
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod database_open_tests {
+    use super::*;
+    #[test]
+    fn missing_corpus_is_not_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "spamlite-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("db.sqlite");
+        assert!(open_evaluation_db(&path).is_err());
+        assert!(!path.exists());
+        assert!(!dir.exists());
     }
 }

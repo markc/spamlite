@@ -5,8 +5,8 @@
 //
 // Walks a maildir with user-supplied ham/spam folder labels, classifies every
 // message against an existing spamlite database under configurable parameters,
-// and reports a confusion matrix + score distribution. Read-only — never
-// writes to the database. Used to measure Phase 2 parameter changes against
+// and reports a confusion matrix + score distribution. Never trains or creates
+// a missing corpus; SQLite may initialise schema/WAL on open. Used to measure changes against
 // the `admin_maildir/` ground-truth corpus before committing.
 //
 // Usage:
@@ -73,25 +73,6 @@ fn open_evaluation_db(path: &Path) -> Result<Database, String> {
     Database::open_existing(path)
 }
 
-#[cfg(test)]
-mod database_open_tests {
-    use super::*;
-    #[test]
-    fn missing_corpus_is_not_created() {
-        let dir = std::env::temp_dir().join(format!(
-            "spamlite-missing-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("db.sqlite");
-        assert!(open_evaluation_db(&path).is_err());
-        assert!(!path.exists());
-        assert!(!dir.exists());
-    }
-}
 
 fn numeric_value<T: std::str::FromStr>(value: &str) -> Result<T, String> {
     value
@@ -106,16 +87,6 @@ fn parse_number<T: std::str::FromStr>(value: &str, flag: &str) -> T {
     })
 }
 
-#[cfg(test)]
-mod numeric_tests {
-    use super::*;
-    #[test]
-    fn invalid_numbers_are_usage_errors() {
-        assert!(numeric_value::<f64>("oops").is_err());
-        assert!(numeric_value::<u64>("-1").is_err());
-        assert_eq!(numeric_value::<usize>("12").unwrap(), 12);
-    }
-}
 
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
@@ -543,5 +514,36 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod database_open_tests {
+    use super::*;
+    #[test]
+    fn missing_corpus_is_not_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "spamlite-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("db.sqlite");
+        assert!(open_evaluation_db(&path).is_err());
+        assert!(!path.exists());
+        assert!(!dir.exists());
+    }
+}
+
+#[cfg(test)]
+mod numeric_tests {
+    use super::*;
+    #[test]
+    fn invalid_numbers_are_usage_errors() {
+        assert!(numeric_value::<f64>("oops").is_err());
+        assert!(numeric_value::<u64>("-1").is_err());
+        assert_eq!(numeric_value::<usize>("12").unwrap(), 12);
     }
 }

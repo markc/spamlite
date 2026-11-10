@@ -1283,12 +1283,19 @@ mod tests {
     fn message_reader_refuses_fifo_without_waiting_for_a_writer() {
         use std::os::unix::fs::OpenOptionsExt;
         let path = std::env::temp_dir().join(format!("spamlite-fifo-{}", process::id()));
-        assert!(process::Command::new("mkfifo").arg(&path).status().unwrap().success());
+        assert!(process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
         let writer_path = path.clone();
         // Release a blocking pre-fix reader so the regression fails without hanging.
         let writer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let _ = std::fs::OpenOptions::new().write(true).custom_flags(0o4000).open(writer_path);
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0o4000)
+                .open(writer_path);
         });
         let result = read_message_file(&path);
         writer.join().unwrap();
