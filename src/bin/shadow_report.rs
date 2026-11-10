@@ -113,7 +113,9 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 fn lossy_lines(reader: impl BufRead) -> impl Iterator<Item = std::io::Result<String>> {
-    reader.split(b'\n').map(|line| line.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+    reader
+        .split(b'\n')
+        .map(|line| line.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 #[cfg(test)]
@@ -121,7 +123,9 @@ mod encoding_tests {
     use super::*;
     #[test]
     fn invalid_utf8_does_not_stop_later_lines() {
-        let lines = lossy_lines(&b"bad\xff\nnext\n"[..]).collect::<Result<Vec<_>, _>>().unwrap();
+        let lines = lossy_lines(&b"bad\xff\nnext\n"[..])
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(lines, ["bad\u{fffd}", "next"]);
     }
 }
@@ -140,7 +144,10 @@ fn main() {
         for line in lossy_lines(BufReader::new(file)) {
             let line = match line {
                 Ok(line) => line,
-                Err(e) => { eprintln!("shadow-report: read error: {e}"); break; }
+                Err(e) => {
+                    eprintln!("shadow-report: read error: {e}");
+                    break;
+                }
             };
             total_lines += 1;
             let line = line.trim();

@@ -101,7 +101,10 @@ mod encoding_tests {
     use super::*;
     #[test]
     fn message_ids_keep_utf8() {
-        assert_eq!(extract_string(r#"{"msgid":"<café@例.example>"}"#, "msgid").as_deref(), Some("<café@例.example>"));
+        assert_eq!(
+            extract_string(r#"{"msgid":"<café@例.example>"}"#, "msgid").as_deref(),
+            Some("<café@例.example>")
+        );
     }
 }
 

@@ -64,10 +64,7 @@ fn read_stdin() -> Vec<u8> {
 
 fn read_input(reader: impl Read) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    reader
-        .take(MAX_STDIN_BYTES)
-        .read_to_end(&mut buf)
-        ?;
+    reader.take(MAX_STDIN_BYTES).read_to_end(&mut buf)?;
     if buf.len() as u64 == MAX_STDIN_BYTES {
         eprintln!("spamlite: stdin truncated at {MAX_STDIN_BYTES} bytes");
     }
@@ -75,9 +72,11 @@ fn read_input(reader: impl Read) -> io::Result<Vec<u8>> {
 }
 
 fn delivery_input(reader: impl Read) -> Option<Vec<u8>> {
-    read_input(reader).map_err(|e| {
-        eprintln!("spamlite: failed to read stdin (fail-open): {e}");
-    }).ok()
+    read_input(reader)
+        .map_err(|e| {
+            eprintln!("spamlite: failed to read stdin (fail-open): {e}");
+        })
+        .ok()
 }
 
 fn write_verdict(mut writer: impl Write, output: &str) {
@@ -612,7 +611,10 @@ fn read_message_file(path: &std::path::Path) -> io::Result<Vec<u8>> {
     }
     let f = options.open(path)?;
     if !f.metadata()?.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
     let mut buf = Vec::new();
     f.take(MAX_STDIN_BYTES + 1).read_to_end(&mut buf)?;
@@ -743,7 +745,9 @@ fn cleanup_args(args: &[String]) -> Option<(u64, u64)> {
 }
 
 fn valid_command_args(args: &[String]) -> bool {
-    let Some((command, rest)) = args.split_first() else { return false; };
+    let Some((command, rest)) = args.split_first() else {
+        return false;
+    };
     match command.as_str() {
         "untrain" => match_untrain_args(rest).is_some(),
         "train-dir" => match_train_dir_args(rest).is_some(),
@@ -1076,7 +1080,9 @@ Priority: -t flag > params.toml threshold > SPAMLITE_THRESHOLD env > 0.5
 
 /// Parse args, extracting -d and -t flags, returning remaining args
 fn parse_args() -> Vec<String> {
-    let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let mut remaining = Vec::new();
     let mut i = 1; // skip argv[0]
 
@@ -1105,7 +1111,11 @@ fn parse_args() -> Vec<String> {
                         argument_error("-t requires a number between 0.0 and 1.0");
                     }
                 }
-                i += if args[i + 1] == "score" || args[i + 1] == "receive" { 1 } else { 2 };
+                i += if args[i + 1] == "score" || args[i + 1] == "receive" {
+                    1
+                } else {
+                    2
+                };
                 continue;
             } else {
                 argument_error("-t requires a threshold argument");
@@ -1121,7 +1131,11 @@ fn parse_args() -> Vec<String> {
                         argument_error("-g requires a number between 0.0 and 0.5");
                     }
                 }
-                i += if args[i + 1] == "score" || args[i + 1] == "receive" { 1 } else { 2 };
+                i += if args[i + 1] == "score" || args[i + 1] == "receive" {
+                    1
+                } else {
+                    2
+                };
                 continue;
             } else {
                 argument_error("-g requires a gate argument");
@@ -1157,7 +1171,10 @@ fn main() {
     }
 
     if !valid_command_args(&args) {
-        eprintln!("spamlite: usage error: unexpected or invalid arguments for {}", args[0]);
+        eprintln!(
+            "spamlite: usage error: unexpected or invalid arguments for {}",
+            args[0]
+        );
         if args[0] != "score" && args[0] != "receive" {
             process::exit(2);
         }
@@ -1194,11 +1211,19 @@ mod tests {
     #[test]
     fn command_shapes_and_cleanup_numbers_are_strict() {
         let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        for cmd in ["good", "spam", "counts", "stats", "export", "import", "explain", "score", "receive"] {
+        for cmd in [
+            "good", "spam", "counts", "stats", "export", "import", "explain", "score", "receive",
+        ] {
             assert!(valid_command_args(&args(&[cmd])));
             assert!(!valid_command_args(&args(&[cmd, "--sent"])));
         }
-        for bad in [vec!["cleanup", "5O"], vec!["cleanup", "1", "oops"], vec!["cleanup", "1", "2", "3"], vec!["msgids", "dir", "extra"], vec!["untrain", "x", "y"]] {
+        for bad in [
+            vec!["cleanup", "5O"],
+            vec!["cleanup", "1", "oops"],
+            vec!["cleanup", "1", "2", "3"],
+            vec!["msgids", "dir", "extra"],
+            vec!["untrain", "x", "y"],
+        ] {
             assert!(!valid_command_args(&args(&bad)));
         }
         assert_eq!(cleanup_args(&args(&[])), Some((1, 0)));
@@ -1222,7 +1247,9 @@ mod tests {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
             Err(io::ErrorKind::BrokenPipe.into())
         }
-        fn flush(&mut self) -> io::Result<()> { Err(io::ErrorKind::BrokenPipe.into()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
     }
 
     #[test]
@@ -1236,12 +1263,15 @@ mod tests {
 
     #[test]
     fn bulk_preparation_strips_labels_and_contains_parser_panics() {
-        let raw = b"Message-ID: <id@example.org>\r\nX-Spam-Status: SPAM\r\nSubject: hello\r\n\r\nworld";
+        let raw =
+            b"Message-ID: <id@example.org>\r\nX-Spam-Status: SPAM\r\nSubject: hello\r\n\r\nworld";
         let config = tokenizer::TokenizerConfig::default();
         let (id, tokens) = prepare_training_message(raw, &config).unwrap();
         assert_eq!(id, "id@example.org");
         assert_eq!(tokens, tokenizer::tokenize_for_training(raw, &config));
-        assert!(prepare_training_message_with(raw, &config, |_| panic!("ID parser panic")).is_err());
+        assert!(
+            prepare_training_message_with(raw, &config, |_| panic!("ID parser panic")).is_err()
+        );
     }
 
     #[test]

@@ -69,8 +69,27 @@ fn usage_and_exit() -> ! {
     process::exit(2);
 }
 
+fn open_evaluation_db(path: &Path) -> Result<Database, String> {
+    Database::open_existing(path)
+}
+
+#[cfg(test)]
+mod database_open_tests {
+    use super::*;
+    #[test]
+    fn missing_corpus_is_not_created() {
+        let dir = std::env::temp_dir().join(format!("spamlite-missing-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = dir.join("db.sqlite");
+        assert!(open_evaluation_db(&path).is_err());
+        assert!(!path.exists());
+        assert!(!dir.exists());
+    }
+}
+
 fn numeric_value<T: std::str::FromStr>(value: &str) -> Result<T, String> {
-    value.parse().map_err(|_| format!("invalid number: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("invalid number: {value}"))
 }
 
 fn parse_number<T: std::str::FromStr>(value: &str, flag: &str) -> T {
@@ -316,7 +335,7 @@ fn main() {
     let args = parse_args();
 
     let db_path = args.db_dir.join("db.sqlite");
-    let db = Database::open_existing(&db_path).unwrap_or_else(|e| {
+    let db = open_evaluation_db(&db_path).unwrap_or_else(|e| {
         eprintln!("spamlite-eval: open {}: {e}", db_path.display());
         process::exit(1);
     });
