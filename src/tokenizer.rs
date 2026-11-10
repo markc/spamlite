@@ -1601,7 +1601,7 @@ mod sent_swap_tests {
         c
     }
 
-    const SENT: &[u8] = b"From: Mark Constable <owner@example.net>\r\n\
+    const SENT: &[u8] = b"From: Olive Owner <owner@example.net>\r\n\
 Reply-To: owner@example.net\r\n\
 To: Bob Smith <bob@partner.example.com>\r\n\
 Subject: quote for the job\r\n\
