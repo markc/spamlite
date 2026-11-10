@@ -1,12 +1,45 @@
 #!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
+
+-- Preflight BEFORE training; write with these non-root credentials.
+fn mail_identity($path)
+  $st = stat($path, {follow_symlinks: false})
+  if not $st.is_dir or $st.uid == 0 or $st.gid == 0 then
+    raise("MAIL_IDENTITY", $path .. " must be a real directory with non-root uid/gid")
+  end
+  return $st
+end
+
+fn mail_append($identity, $path, $text)
+  $w = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "tee", "-a", "--", $path], {stdin: $text, stdout: "null"})
+  if $w.exit_code != 0 then raise("SIDECAR_APPEND", $path .. ": " .. $w.stderr) end
+end
+
+-- Private scratch: never follow a pre-planted parent or recreate its parents.
+fn private_stage()
+  try
+    $st = stat("/run/spamlite", {follow_symlinks: false})
+  catch $e
+    $mk = run_argv(["mkdir", "-m", "0700", "--", "/run/spamlite"])
+    -- A concurrent creator is allowed only if the lstat below passes.
+    if $mk.exit_code != 0 and not is_dir("/run/spamlite") then raise("STAGE_PARENT", $mk.stderr) end
+  end
+  $st = stat("/run/spamlite", {follow_symlinks: false})
+  if not $st.is_dir or $st.uid != 0 or $st.gid != 0 or $st.perm % 64 != 0 then
+    raise("STAGE_PARENT", "/run/spamlite must be a real root-owned directory without group/other access")
+  end
+  $dir = "/run/spamlite/stage-" .. uuid()
+  mkdir($dir, {parents: false})
+  chmod($dir, 0o700)
+  return $dir
+end
 -- spamlite-rescued-sweep.mix — find (and optionally correct) messages the nightly
 -- reconciler trained as SPAM that the user has since rescued into a folder they
 -- keep mail in. 2026-09-17 (ns mrn _journal/2026-09-17.md).
 --
---   spamlite-rescued-sweep.mix dry   [substr]   -> /var/tmp/rescued-sweep/candidates.tsv
---   spamlite-rescued-sweep.mix apply [substr]   -> corrects every candidate in that TSV
+--   spamlite-rescued-sweep.mix dry [substr] -> printed private candidates.tsv path
+--   spamlite-rescued-sweep.mix apply <substr-or-empty> <candidates.tsv>
 --
 -- Candidate = sidecar key whose ONLY entry is S (a 2-entry key is frozen), not a
 -- f: fallback key, present in >= 1 "keep" mailbox and in NO junk-shaped mailbox.
@@ -17,14 +50,18 @@
 -- appends a G sidecar line per ok row (2nd entry freezes the key as good).
 
 $SL = "/usr/local/bin/spamlite"
-$W = "/var/tmp/rescued-sweep"
+$W = private_stage()
 $TSV = $W .. "/candidates.tsv"
 $a = args()
 $mode = "dry"
 if len($a) >= 1 then $mode = $a[0] end
 $filt = ""
 if len($a) >= 2 then $filt = $a[1] end
-run_argv(["mkdir", "-p", $W])
+-- apply consumes an explicitly reviewed dry-run TSV, never a shared scratch name.
+if $mode == "apply" then
+  if len($a) < 3 then raise("REVIEW_TSV", "apply requires: apply [substr] <dry-run candidates.tsv>") end
+  $TSV = $a[2]
+end
 
 function junky($mb)
   $l = lower($mb)
@@ -126,6 +163,8 @@ function dry()
     end
   end
   write_file($TSV, $rows)
+  chmod($TSV, 0o600)
+  remove($W .. "/mids.tmp")
   print("users with S keys: " .. $tot.users .. "  fetch failures: " .. $tot.failed)
   print("candidates: " .. $tot.cands .. "  skipped (also still in junk): " .. $tot.still_junk)
   print("by mailbox:")
@@ -149,15 +188,15 @@ function apply()
     $up = split($login, "@")
     $home = "/srv/" .. $up[1] .. "/msg/" .. $up[0]
     $db = $home .. "/.spamlite"
-    $owner = trim(run_argv(["stat", "-c", "%U", $db]).stdout)
-    $stage = $W .. "/stage/" .. $login
-    run_argv(["rm", "-rf", $stage])
-    run_argv(["mkdir", "-p", $stage])
+    $identity = mail_identity($db)
+    -- The validated numeric identity is used for both training and recording.
+    $stage = private_stage()
+
     $i = 0
     for $c in $by[$login]
       -- uid first (header search is a substring match; msgids check below
       -- rejects a wrong hit), then the raw text straight to a file so
-      -- non-UTF-8 mail is staged byte-exact; `sed 1d` drops the "text:" line.
+      -- non-UTF-8 mail is staged byte-exact; tail drops the "text:" line.
       $r = run_argv(["doveadm", "fetch", "-u", $login, "uid", "mailbox", $c[1], "header", "message-id", $c[0]], {timeout: 120})
       $uid = ""
       for $l in lines($r.stdout)
@@ -169,10 +208,10 @@ function apply()
         $raw = $stage .. "/raw"
         $f1 = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $c[1], "uid", $uid], {stdout: {file: $raw}, timeout: 120})
         if $f1.exit_code == 0 then
-          $f2 = run_argv(["sed", "1d", $raw], {stdout: {file: $stage .. "/" .. $i .. ".eml"}})
+          $f2 = run_argv(["tail", "-n", "+2", "--", $raw], {stdout: {file: $stage .. "/" .. $i .. ".eml"}})
           $ok = $f2.exit_code == 0
         end
-        run_argv(["rm", "-f", $raw])
+        $cleanup = run_argv(["rm", "-f", $raw])
       end
       if not $ok then
         eprint("  fetch miss " .. $login .. " " .. $c[0])
@@ -183,17 +222,18 @@ function apply()
     for $c in $by[$login]
       $wantk[$c[0]] = true
     end
-    for $l in lines(run_argv([$SL, "msgids", $stage]).stdout)
+    for $l in lines(run_argv_must([$SL, "msgids", $stage]))
       $f = split($l, "\t")
       if len($f) >= 3 and not $wantk[lower(trim($f[0], "<> "))] then
         eprint("  msgid mismatch, dropped: " .. $f[2])
-        run_argv(["rm", "-f", $f[2]])
+        $cleanup = run_argv(["rm", "-f", $f[2]])
       end
     end
-    run_argv(["chown", "-R", $owner .. ":" .. $owner, $stage])
-    run_argv(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-20260917-sweep"])
-    run_argv(["cp", "-a", $db .. "/reconciled.log", $db .. "/reconciled.log.bak-20260917-sweep"])
-    $r = run_argv(["runuser", "-u", $owner, "--", $SL, "-d", $db, "train-dir", $stage, "good", "--from", "spam"], {timeout: 900})
+    $owned = run_argv_must(["chown", "-hR", to_string($identity.uid) .. ":" .. to_string($identity.gid), $stage])
+    chmod($stage, 0o700)
+    $checked = run_argv_must(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-20260917-sweep"])
+    $checked = run_argv_must(["cp", "-a", $db .. "/reconciled.log", $db .. "/reconciled.log.bak-20260917-sweep"])
+    $r = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", $SL, "-d", $db, "train-dir", ".", "good", "--from", "spam"], {timeout: 900, cwd: $stage})
     if $r.exit_code != 0 then
       eprint("TRAIN FAILED " .. $login .. ": " .. trim($r.stderr))
     else
@@ -207,11 +247,13 @@ function apply()
           $ok = $ok + 1
         end
       end
-      if $add != "" then append_file($db .. "/reconciled.log", $add) end
+      if $add != "" then mail_append($identity, $db .. "/reconciled.log", $add) end
       $grand = $grand + $ok
       print($login .. "\tcorrected " .. $ok .. "/" .. len($by[$login]) .. "\t" .. trim($r.stderr))
     end
+    remove_dir($stage)
   end
+  remove_dir($W)
   print("TOTAL corrected: " .. $grand)
 end
 

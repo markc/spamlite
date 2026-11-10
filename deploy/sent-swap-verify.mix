@@ -39,7 +39,7 @@ mkdir($W .. "/msgs")
 
 -- ---------------------------------------------------------------- staging
 -- Stage the newest $n messages of one mailbox as individual files, using the
--- same doveadm fetch + `sed 1d` path the reconciler stages mdbox mail with.
+-- doveadm fetch, dropping its first "text:" line with tail.
 fn stage($login, $box, $n, $dir)
   mkdir($dir)
   $r = run_argv(["doveadm", "search", "-u", $login, "mailbox", $box, "all"], {timeout: 300})
@@ -63,14 +63,14 @@ fn stage($login, $box, $n, $dir)
     $raw = $dir .. "/.raw"
     $f = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $box, "uid", $uids[$i]], {stdout: {file: $raw}, timeout: 120})
     if $f.exit_code == 0 then
-      $s = run_argv(["sed", "1d", $raw], {stdout: {file: $dir .. "/m" .. $uids[$i]}})
+      $s = run_argv(["tail", "-n", "+2", "--", $raw], {stdout: {file: $dir .. "/m" .. $uids[$i]}})
       if $s.exit_code == 0 then
         $got = $got + 1
       end
     end
     $i = $i + 1
   end
-  run_argv(["rm", "-f", $dir .. "/.raw"])
+  $cleanup = run_argv(["rm", "-f", $dir .. "/.raw"])
   return $got
 end
 
@@ -126,7 +126,7 @@ print("staged " .. $ndel .. " delivery-path messages")
 if $ndel == 0 then print("FAIL: nothing staged"); exit(1) end
 
 mkdir($W .. "/regress")
-copy($live, $W .. "/regress/db.sqlite")
+$backup = run_argv_must(["sqlite3", $live, ".backup " .. $W .. "/regress/db.sqlite"], {timeout: 600})
 $files = concat(glob($W .. "/msgs/inbox/m*"), glob($W .. "/msgs/junk/m*"))
 $diverged = 0
 $scored = 0
@@ -154,8 +154,8 @@ if $nsent == 0 then print("FAIL: no Sent mail staged"); exit(1) end
 
 mkdir($W .. "/raw")
 mkdir($W .. "/swap")
-copy($live, $W .. "/raw/db.sqlite")
-copy($live, $W .. "/swap/db.sqlite")
+$backup = run_argv_must(["sqlite3", $live, ".backup " .. $W .. "/raw/db.sqlite"], {timeout: 600})
+$backup = run_argv_must(["sqlite3", $live, ".backup " .. $W .. "/swap/db.sqlite"], {timeout: 600})
 $base = counts($NEW, $W .. "/raw")
 
 $tr = run_argv([$NEW, "-d", $W .. "/raw", "train-dir", $W .. "/msgs/sent", "good"], {timeout: 1800})

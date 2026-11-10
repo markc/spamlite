@@ -179,3 +179,24 @@ afterwards, so rolling back the binary needs no database restore. Before
 arming the reconciler, run a dry run and rescue any known false positives
 still sitting in Junk (`spamlite-junk-rescue.mix`); otherwise the first real
 run trains them as spam.
+
+## Private maintenance staging
+
+Maintenance scratch now lives below root-owned mode-0700 `/run/spamlite`,
+with fresh random subdirectories. Unsafe existing parents abort the run.
+Mail-user training stages use that user's uid/gid, mode 0700 and an inherited
+working directory; `setpriv` must be installed on the mail host.
+
+`spamlite-fleet-audit.mix` prints its private report directory. Pass that
+directory to `spamlite-audit-annotate.mix <report-directory>`. Reports are
+mode 0600 and retained for review; temporary fetched mail is removed.
+
+`spamlite-rescued-sweep.mix dry [filter]` prints a private `candidates.tsv`.
+After reviewing it, use `spamlite-rescued-sweep.mix apply <filter-or-empty>
+<candidates.tsv>` (pass an empty string for no filter). The TSV is retained;
+apply removes its newly fetched message stages. `fp-validate.mix` likewise
+prints the new private location of its retained harness lists. These paths
+are under `/run` and do not survive reboot.
+
+The November audit changes were checked with Mix lint and local construct
+probes only. No production maintenance entrypoint was run or deployed.

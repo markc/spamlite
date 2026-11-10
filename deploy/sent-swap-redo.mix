@@ -1,6 +1,20 @@
 #!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
+
+-- Preflight BEFORE training; write with these non-root credentials.
+fn mail_identity($path)
+  $st = stat($path, {follow_symlinks: false})
+  if not $st.is_dir or $st.uid == 0 or $st.gid == 0 then
+    raise("MAIL_IDENTITY", $path .. " must be a real directory with non-root uid/gid")
+  end
+  return $st
+end
+
+fn mail_append($identity, $path, $text)
+  $w = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "tee", "-a", "--", $path], {stdin: $text, stdout: "null"})
+  if $w.exit_code != 0 then raise("SIDECAR_APPEND", $path .. ": " .. $w.stderr) end
+end
 -- sent-swap-redo.mix — undo a pre-`--sent` Sent-folder ham top-up and re-run it
 -- with the swap, for one Maildir user.
 --
@@ -49,6 +63,7 @@ $D = "/srv/" .. $up[1] .. "/msg/" .. $up[0]
 $dbdir = $D .. "/.spamlite"
 $db = $dbdir .. "/db.sqlite"
 $log = $dbdir .. "/reconciled.log"
+$identity = mail_identity($dbdir)
 $SL = "/usr/local/bin/spamlite"
 if is_file($db) == false then print("FAIL: no db at " .. $db); exit(1) end
 if is_file($log) == false then print("FAIL: no sidecar at " .. $log); exit(1) end
@@ -149,10 +164,12 @@ while $i < len($keep)
   $out = $out .. $keep[$i] .. "\n"
   $i = $i + 1
 end
-write_file($log .. ".tmp", $out)
-rename($log .. ".tmp", $log)
-$owner = strip(run_argv(["stat", "-c", "%U:%G", $db]).stdout)
-run_argv(["chown", "-R", $owner, $dbdir])
+$w = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "tee", "--", $log .. ".tmp"], {stdin: $out, stdout: "null"})
+if $w.exit_code != 0 then raise("SIDECAR_WRITE", $w.stderr) end
+$mv = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "mv", "-T", "--", $log .. ".tmp", $log])
+if $mv.exit_code != 0 then raise("SIDECAR_RENAME", $mv.stderr) end
+$owner = to_string($identity.uid) .. ":" .. to_string($identity.gid)
+$checked = run_argv_must(["chown", "-hR", $owner, $dbdir])
 print("sidecar rewritten (" .. len($keep) .. " lines), ownership restored to " .. $owner)
 print($SL .. " stats AFTER untrain:")
 print(run_argv([$SL, "-d", $dbdir, "stats"]).stdout)

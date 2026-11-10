@@ -1,6 +1,20 @@
 #!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
+
+-- Preflight BEFORE training; write with these non-root credentials.
+fn mail_identity($path)
+  $st = stat($path, {follow_symlinks: false})
+  if not $st.is_dir or $st.uid == 0 or $st.gid == 0 then
+    raise("MAIL_IDENTITY", $path .. " must be a real directory with non-root uid/gid")
+  end
+  return $st
+end
+
+fn mail_append($identity, $path, $text)
+  $w = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "tee", "-a", "--", $path], {stdin: $text, stdout: "null"})
+  if $w.exit_code != 0 then raise("SIDECAR_APPEND", $path .. ": " .. $w.stderr) end
+end
 -- spamlite-sent-ham-topup.mix — one-off ham top-up from a user's Sent folder.
 --
 --   spamlite-sent-ham-topup.mix <user@domain> [sentsince YYYY-MM-DD]   (default 2022-01-01)
@@ -35,6 +49,8 @@ $OWNER = strip($OWNER)
 $SL = "/usr/local/bin/spamlite"
 $db = $D .. "/.spamlite"
 $log = $db .. "/reconciled.log"
+$identity = mail_identity($db)
+$OWNER = to_string($identity.uid) .. ":" .. to_string($identity.gid)
 $STAGE = "/root/sent-ham-stage"
 $NOW = "" .. floor(time())
 
@@ -115,7 +131,9 @@ if len($paths) == 0 then print("nothing to do"); exit(0) end
 -- 4. stage (symlinks) + train-dir good + sidecar
 remove_dir($STAGE)
 mkdir($STAGE)
-run_argv(concat(["ln", "-s", "-t", $STAGE], $paths))
+for $path in $paths
+  symlink($path, $STAGE .. "/" .. basename($path))
+end
 $tr = run_argv([$SL, "-d", $db, "train-dir", $STAGE, "good", "--sent"], {timeout: 1800})
 $ok = 0
 $fail = 0
@@ -131,7 +149,7 @@ while $i < len($tl)
       if $fl > 0 then $bn = substr($bn, 0, $fl - 1) end
       $key = $key_bn[$bn]
       if $key != nil then
-        append_file($log, "G " .. $NOW .. " " .. $key .. "\n")
+        mail_append($identity, $log, "G " .. $NOW .. " " .. $key .. "\n")
         $ok = $ok + 1
       end
     else
@@ -143,5 +161,5 @@ end
 print("train-dir exit=" .. $tr.exit_code .. " ok=" .. $ok .. " fail=" .. $fail)
 if strip($tr.stderr) != "" then print("stderr: " .. strip($tr.stderr)) end
 remove_dir($STAGE)
-run_argv(["chown", "-R", $OWNER, $db])
+$checked = run_argv_must(["chown", "-hR", $OWNER, $db])
 print(run_argv([$SL, "-d", $db, "stats"]).stdout)

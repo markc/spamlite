@@ -49,7 +49,7 @@ fn score_list($dir, $paths, $outfile)
   $out = ""
   $i = 0
   while $i < len($paths)
-    $r = run($SL .. " -d " .. $dir .. " score < " .. shell_quote($paths[$i]) .. " 2>/dev/null || true")
+    $r = run_argv_must([$SL, "-d", $dir, "score"], {stdin: {file: $paths[$i]}})
     $f = split(strip($r), " ")
     if len($f) > 1 then $out = $out .. $f[1] .. "\t" .. $paths[$i] .. "\n" end
     $i = $i + 1
@@ -100,7 +100,7 @@ if $a[0] == "sweep" then
         $go = 0
       end
       if $go == 1 then
-        $ham_all = split(strip(run("find " .. shell_quote($d .. "/Maildir/cur") .. " -type f -newermt 2026-03-20 ! -newermt 2026-07-25 | sort")), "\n")
+        $ham_all = sort(split(strip(run_argv_must(["find", $d .. "/Maildir/cur", "-type", "f", "-newermt", "2026-03-20", "!", "-newermt", "2026-07-25"])), "\n"))
         $ham = []
         $i = 0
         while $i < len($ham_all)
@@ -112,21 +112,21 @@ if $a[0] == "sweep" then
         else
           $ham = every_nth($ham, $HAM_CAP)
           $W = $ROOT .. "/" .. $tag
-          run_argv(["rm", "-rf", $W])
+          $checked = run_argv_must(["rm", "-rf", $W])
           mkdir($W)
           mkdir($W .. "/live")
           mkdir($W .. "/tuned")
-          run_argv(["sqlite3", $d .. "/.spamlite/db.sqlite", ".backup " .. $W .. "/live/db.sqlite"])
-          run_argv(["cp", $W .. "/live/db.sqlite", $W .. "/tuned/db.sqlite"])
+          $checked = run_argv_must(["sqlite3", $d .. "/.spamlite/db.sqlite", ".backup " .. $W .. "/live/db.sqlite"])
+          $checked = run_argv_must(["cp", $W .. "/live/db.sqlite", $W .. "/tuned/db.sqlite"])
           $pt = $d .. "/.spamlite/params.toml"
-          if is_file($pt) then run_argv(["cp", $pt, $W .. "/live/params.toml"]) end
+          if is_file($pt) then $checked = run_argv_must(["cp", $pt, $W .. "/live/params.toml"]) end
           write_file($W .. "/tuned/params.toml", $TUNED)
           write_file($W .. "/live-threshold", "" .. live_threshold($pt) .. "\n")
           score_list($W .. "/live", $ham, $W .. "/live.ham.scores")
           score_list($W .. "/live", $spam_paths, $W .. "/live.spam.scores")
           score_list($W .. "/tuned", $ham, $W .. "/tuned.ham.scores")
           score_list($W .. "/tuned", $spam_paths, $W .. "/tuned.spam.scores")
-          run_argv(["rm", "-f", $W .. "/live/db.sqlite", $W .. "/tuned/db.sqlite", $W .. "/live/db.sqlite-wal", $W .. "/live/db.sqlite-shm", $W .. "/tuned/db.sqlite-wal", $W .. "/tuned/db.sqlite-shm"])
+          $cleanup = run_argv(["rm", "-f", $W .. "/live/db.sqlite", $W .. "/tuned/db.sqlite", $W .. "/live/db.sqlite-wal", $W .. "/live/db.sqlite-shm", $W .. "/tuned/db.sqlite-wal", $W .. "/tuned/db.sqlite-shm"])
           print($tag .. " ham=" .. len($ham) .. " spam=" .. len($spam_paths))
         end
       end

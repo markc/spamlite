@@ -1,6 +1,25 @@
 #!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
+
+-- Private scratch: never follow a pre-planted parent or recreate its parents.
+fn private_stage()
+  try
+    $st = stat("/run/spamlite", {follow_symlinks: false})
+  catch $e
+    $mk = run_argv(["mkdir", "-m", "0700", "--", "/run/spamlite"])
+    -- A concurrent creator is allowed only if the lstat below passes.
+    if $mk.exit_code != 0 and not is_dir("/run/spamlite") then raise("STAGE_PARENT", $mk.stderr) end
+  end
+  $st = stat("/run/spamlite", {follow_symlinks: false})
+  if not $st.is_dir or $st.uid != 0 or $st.gid != 0 or $st.perm % 64 != 0 then
+    raise("STAGE_PARENT", "/run/spamlite must be a real root-owned directory without group/other access")
+  end
+  $dir = "/run/spamlite/stage-" .. uuid()
+  mkdir($dir, {parents: false})
+  chmod($dir, 0o700)
+  return $dir
+end
 -- spamlite-reconcile.mix — nightly STATE-based trainer.
 --
 -- Folder state is the label source, not imapsieve events (events lose ~97% of
@@ -166,6 +185,8 @@ while $i < len($a)
     if $a[$i] == "--cap" then
       $i = $i + 1
       $CAP = to_number($a[$i])
+      if $CAP == nil then raise("BAD_CAP", "--cap requires a non-negative integer") end
+      if $CAP < 0 or $CAP != floor($CAP) then raise("BAD_CAP", "--cap requires a non-negative integer") end
     else
     if $a[$i] == "--root" then
       $i = $i + 1
@@ -198,7 +219,8 @@ end
 $NOW = floor(time())
 $HAM_HI = $NOW - $RIPEN
 $HAM_LO = $NOW - $WINDOW
-$STAGE = "/dev/shm/slrec." .. $NOW
+$STAGE_ROOT = private_stage()
+$STAGE = $STAGE_ROOT .. "/slrec"
 
 if $USERS_GLOB == "" then
   if $ROOT != "" then
@@ -430,7 +452,7 @@ while $u < len($users)
             -- by hand, a client's temp name) gives nil, and comparing nil
             -- raised and ended the run for every remaining user.
             $e = to_number(substr($b, 0, 10))
-            if $e != nil then
+            if $e != nil and not contains(after($b, ":2,") or "", "T") then
               if $e >= $HAM_LO then
                 if $e <= $HAM_HI then
                   push($inbox, $all[$ai])
@@ -501,9 +523,9 @@ while $u < len($users)
       -- is a subset of cur/, so it is staged as symlinks for its scan. A file
       -- expunged mid-run makes msgids exit non-zero; that closes this user for
       -- the night so a partial spam scan cannot permit ham-only training.
-      $scan = $STAGE .. ".scan"
+      $scan = $STAGE .. ".scan-" .. uuid()
       remove_dir($scan)
-      mkdir($scan)
+      mkdir($scan, {parents: false})
       if len($inbox) > 0 and $enumeration_failed == 0 then
         $link_r = run_argv(concat(["ln", "-s", "-t", $scan], $inbox))
         if $link_r.exit_code != 0 then
@@ -524,9 +546,9 @@ while $u < len($users)
           end
         end
       end
-      $scanf = $STAGE .. ".scanf"
+      $scanf = $STAGE .. ".scanf-" .. uuid()
       remove_dir($scanf)
-      mkdir($scanf)
+      mkdir($scanf, {parents: false})
       -- filed: one scan subdir per folder chunk (<= 1000 links) — basenames
       -- are unique only within a folder, and one giant argv can hit E2BIG.
       $filed_scan = {}
@@ -541,7 +563,7 @@ while $u < len($users)
           while $off < len($grp) and $stage_ok == 1
             $part = slice($grp, $off, $off + 1000)
             $cdir = $scanf .. "/" .. $chunk_no
-            mkdir($cdir)
+            mkdir($cdir, {parents: false})
             $link_r = run_argv(concat(["ln", "-s", "-t", $cdir], $part))
             if $link_r.exit_code != 0 then
               -- filed is additive: drop the source for tonight, keep the rest
@@ -729,7 +751,7 @@ while $u < len($users)
         end
       end
       if $enumeration_failed == 0 then
-        push($plans, ["G", "INBOX", ["mailbox", "INBOX", "savedsince", "" .. $HAM_LO, "savedbefore", "" .. $HAM_HI]])
+        push($plans, ["G", "INBOX", ["mailbox", "INBOX", "undeleted", "savedsince", "" .. $HAM_LO, "savedbefore", "" .. $HAM_HI]])
         -- filed ham: one plan per kept mailbox (a list failure only skips filed)
         $al = run_argv(["doveadm", "mailbox", "list", "-u", $login], {timeout: 300})
         if $al.exit_code != 0 then
@@ -1037,19 +1059,24 @@ while $u < len($users)
           $sel = $sets[$si][2]
           $from = $sets[$si][3]
           if len($sel) > 0 then
-            $sd = $STAGE .. "." .. $cmd
+            $sd = $STAGE .. "." .. $cmd .. "-" .. uuid()
             if $from != "" then
               $sd = $sd .. ".corr"
             end
             remove_dir($sd)
-            mkdir($sd)
+            mkdir($sd, {parents: false})
             $stage_fail = 0
             if $mode == "maildir" then
               $xi = 0
               while $xi < len($sel)
                 $source = $sel[$xi][0]
                 $bn = $sel[$xi][1]
-                $link_r = run_argv(["ln", "-s", $source, $sd .. "/" .. $bn])
+                $link_r = {exit_code: 0, stderr: ""}
+                try
+                  symlink($source, $sd .. "/" .. $bn)
+                catch $e
+                  $link_r = {exit_code: 1, stderr: $e}
+                end
                 if $link_r.exit_code != 0 then
                   $fail = $fail + 1
                   $stage_fail = $stage_fail + 1
@@ -1206,3 +1233,5 @@ while $u < len($users)
   end
   $u = $u + 1
 end
+
+remove_dir($STAGE_ROOT)

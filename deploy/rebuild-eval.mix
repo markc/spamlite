@@ -77,14 +77,14 @@ fn stage($login, $box, $n, $dir)
     $f = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $box, "uid", $uids[$i]], {stdout: {file: $raw}, timeout: 120})
     if $f.exit_code == 0 then
       $dst = $dir .. "/m" .. $uids[$i]
-      $s = run_argv(["sed", "1d", $raw], {stdout: {file: $dst}})
+      $s = run_argv(["tail", "-n", "+2", "--", $raw], {stdout: {file: $dst}})
       if $s.exit_code == 0 then
         push($out, $dst)
       end
     end
     $i = $i + 1
   end
-  run_argv(["rm", "-f", $dir .. "/.raw"])
+  $cleanup = run_argv(["rm", "-f", $dir .. "/.raw"])
   print("  staged " .. $box .. ": " .. len($out))
   return $out
 end
@@ -223,7 +223,7 @@ print("")
 print("building candidates")
 $A = $W .. "/A"
 mkdir($A)
-copy($live, $A .. "/db.sqlite")
+$backup = run_argv_must(["sqlite3", $live, ".backup " .. $A .. "/db.sqlite"], {timeout: 600})
 if is_file($liveparams) then copy($liveparams, $A .. "/params.toml") end
 print("  A = live db copy")
 
@@ -232,7 +232,7 @@ print("  A = live db copy")
 -- being quizzed on its own homework and wins by memorisation.
 $AS = $W .. "/As"
 mkdir($AS)
-copy($live, $AS .. "/db.sqlite")
+$backup = run_argv_must(["sqlite3", $live, ".backup " .. $AS .. "/db.sqlite"], {timeout: 600})
 if is_file($liveparams) then copy($liveparams, $AS .. "/params.toml") end
 $cls = sidecar_classes($D .. "/.spamlite/reconciled.log")
 $k1 = keymap($W .. "/msgs/inbox")
@@ -255,7 +255,7 @@ traindir($C, $d_inbox, "good", 0)
 -- every score hamward, which trades false positives for false negatives.
 $DD = $W .. "/D"
 mkdir($DD)
-copy($AS .. "/db.sqlite", $DD .. "/db.sqlite")
+$backup = run_argv_must(["sqlite3", $AS .. "/db.sqlite", ".backup " .. $DD .. "/db.sqlite"], {timeout: 600})
 if is_file($liveparams) then copy($liveparams, $DD .. "/params.toml") end
 traindir($DD, $d_sentc, "good", 1)
 

@@ -32,7 +32,7 @@ $TOP_N = 20
 $MATURE_GOOD = 5000
 $MATURE_SPAM = 5000
 $CAND_FN = 5
-$THRESHOLD = "0.6"
+$THRESHOLD = "0.5"
 
 -- --- Collect ---
 -- Phase 4: recursive glob replaces the 16-line two-level hand-walk.
