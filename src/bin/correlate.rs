@@ -72,28 +72,37 @@ fn extract_string(line: &str, key: &str) -> Option<String> {
     let start = idx + needle.len();
     let bytes = line.as_bytes();
     let mut i = start;
-    let mut out = String::new();
+    let mut out = Vec::new();
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'\\' && i + 1 < bytes.len() {
             match bytes[i + 1] {
-                b'"' => out.push('"'),
-                b'\\' => out.push('\\'),
-                b'n' => out.push('\n'),
-                b'r' => out.push('\r'),
-                b't' => out.push('\t'),
-                other => out.push(other as char),
+                b'"' => out.push(b'"'),
+                b'\\' => out.push(b'\\'),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                other => out.push(other),
             }
             i += 2;
             continue;
         }
         if b == b'"' {
-            return Some(out);
+            return String::from_utf8(out).ok();
         }
-        out.push(b as char);
+        out.push(b);
         i += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    #[test]
+    fn message_ids_keep_utf8() {
+        assert_eq!(extract_string(r#"{"msgid":"<café@例.example>"}"#, "msgid").as_deref(), Some("<café@例.example>"));
+    }
 }
 
 /// Extract a JSON numeric value by the same textual search.

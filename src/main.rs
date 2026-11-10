@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process;
 use std::sync::OnceLock;
@@ -26,7 +26,7 @@ static THRESHOLD: OnceLock<f64> = OnceLock::new();
 /// - `0.5` — trusted region covers `[0, 1]` → pure TOE, train on everything
 ///
 /// Default `0.2` is a reasonable starting point but should be revisited once
-/// the explain command exists and we can measure the actual score distribution
+/// using explain to measure the actual score distribution
 /// on `admin_maildir/` and the production cluster. The right gate width
 /// depends on how well-calibrated spamlite's scores are on this mail mix,
 /// which is an empirical question, not a guess.
@@ -56,18 +56,47 @@ fn db_path() -> PathBuf {
 const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
 
 fn read_stdin() -> Vec<u8> {
+    read_input(io::stdin()).unwrap_or_else(|e| {
+        eprintln!("spamlite: failed to read stdin: {e}");
+        process::exit(1);
+    })
+}
+
+fn read_input(reader: impl Read) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    io::stdin()
+    reader
         .take(MAX_STDIN_BYTES)
         .read_to_end(&mut buf)
-        .unwrap_or_else(|e| {
-            eprintln!("spamlite: failed to read stdin: {e}");
-            process::exit(1);
-        });
+        ?;
     if buf.len() as u64 == MAX_STDIN_BYTES {
         eprintln!("spamlite: stdin truncated at {MAX_STDIN_BYTES} bytes");
     }
-    buf
+    Ok(buf)
+}
+
+fn delivery_input(reader: impl Read) -> Option<Vec<u8>> {
+    read_input(reader).map_err(|e| {
+        eprintln!("spamlite: failed to read stdin (fail-open): {e}");
+    }).ok()
+}
+
+fn write_verdict(mut writer: impl Write, output: &str) {
+    // Sieve requires no trailing newline. Ignore closed stdout, including flush.
+    let _ = write!(writer, "{output}");
+    let _ = writer.flush();
+}
+
+fn emit_verdict(output: &str) {
+    write_verdict(io::stdout().lock(), output);
+}
+
+fn has_training_tokens(tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        eprintln!("spamlite: no tokens; nothing trained or untrained");
+        false
+    } else {
+        true
+    }
 }
 
 /// Neutral verdict emitted when the sieve hot path fails open. A panic
@@ -198,7 +227,10 @@ fn make_params() -> Params {
 }
 
 fn cmd_score() {
-    let raw = read_stdin();
+    let Some(raw) = delivery_input(io::stdin()) else {
+        emit_verdict(FAIL_OPEN_VERDICT);
+        return;
+    };
     let result = std::panic::catch_unwind(move || {
         let tokens = tokenizer::tokenize_env(&raw);
         // A missing db is now an error rather than an empty one conjured on the spot.
@@ -212,11 +244,11 @@ fn cmd_score() {
         scoring::classify(&db, &tokens, &params).map_err(|e| e.to_string())
     });
     match result {
-        Ok(Ok((verdict, score))) => print!("{verdict} {score:.6}"),
-        Ok(Err(_)) => print!("{FAIL_OPEN_VERDICT}"),
+        Ok(Ok((verdict, score))) => emit_verdict(&format!("{verdict} {score:.6}")),
+        Ok(Err(_)) => emit_verdict(FAIL_OPEN_VERDICT),
         Err(_) => {
             eprintln!("spamlite: internal panic (fail-open, message scored neutral)");
-            print!("{FAIL_OPEN_VERDICT}");
+            emit_verdict(FAIL_OPEN_VERDICT);
         }
     }
 }
@@ -280,7 +312,10 @@ fn receive_should_train(score: f64, is_spam: bool, gate: f64) -> bool {
 }
 
 fn cmd_receive() {
-    let raw = read_stdin();
+    let Some(raw) = delivery_input(io::stdin()) else {
+        emit_verdict(FAIL_OPEN_VERDICT);
+        return;
+    };
     let gate = TOE_GATE.get().copied().unwrap_or(TOE_GATE_DEFAULT);
 
     // Phase 1 — tokenize + classify, panic-isolated. Nothing is printed
@@ -303,16 +338,16 @@ fn cmd_receive() {
     let (output, score, is_spam, tokens, db) = match classified {
         Ok(parts) => parts,
         Err(output) => {
-            print!("{output}");
+            emit_verdict(output);
             return;
         }
     };
 
     // The SPAM/GOOD score is printed BEFORE training runs, so the sieve
     // contract is preserved even if the training write fails.
-    print!("{output}");
+    emit_verdict(&output);
 
-    if !receive_should_train(score, is_spam, gate) {
+    if tokens.is_empty() || !receive_should_train(score, is_spam, gate) {
         return;
     }
 
@@ -334,6 +369,9 @@ fn cmd_train(is_spam: bool) {
     let raw = read_stdin();
     let config = tokenizer::TokenizerConfig::from_env();
     let tokens = tokenizer::tokenize_for_training(&raw, &config);
+    if !has_training_tokens(&tokens) {
+        return;
+    }
     let db = open_db_for_correction();
     let params = make_params();
 
@@ -396,6 +434,9 @@ fn cmd_untrain(args: &[String]) {
     // inherited by the delivery path would invert live inbound mail.
     config.sent_swap = sent_swap;
     let tokens = tokenizer::tokenize_for_training(&raw, &config);
+    if !has_training_tokens(&tokens) {
+        return;
+    }
     let db = open_db_existing_for_correction();
     let result = db.untrain(&tokens, class == "spam").unwrap_or_else(|e| {
         eprintln!("spamlite: untrain error: {e}");
@@ -520,8 +561,7 @@ fn cmd_counts() {
 }
 
 fn cmd_cleanup(args: &[String]) {
-    let min_count: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
-    let days: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let (min_count, days) = cleanup_args(args).expect("validated cleanup arguments");
 
     let db = open_db();
     match db.cleanup(min_count, days) {
@@ -562,7 +602,18 @@ fn cmd_import() {
 /// cap is truncated with a warning (matching the stdin path) — the prefix
 /// still carries the discriminating tokens of any real message.
 fn read_message_file(path: &std::path::Path) -> io::Result<Vec<u8>> {
-    let f = std::fs::File::open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Linux O_NONBLOCK = 0o4000: a FIFO swapped in after scanning must not block.
+        options.custom_flags(0o4000);
+    }
+    let f = options.open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+    }
     let mut buf = Vec::new();
     f.take(MAX_STDIN_BYTES + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > MAX_STDIN_BYTES {
@@ -658,6 +709,57 @@ fn extract_msgid(raw: &[u8]) -> Option<String> {
     } else {
         Some(id)
     }
+}
+
+fn prepare_training_message(
+    raw: &[u8],
+    config: &tokenizer::TokenizerConfig,
+) -> std::thread::Result<(String, Vec<String>)> {
+    prepare_training_message_with(raw, config, extract_msgid)
+}
+
+fn prepare_training_message_with(
+    raw: &[u8],
+    config: &tokenizer::TokenizerConfig,
+    extract: impl FnOnce(&[u8]) -> Option<String> + std::panic::UnwindSafe,
+) -> std::thread::Result<(String, Vec<String>)> {
+    std::panic::catch_unwind(move || {
+        let stripped = tokenizer::strip_label_headers(raw);
+        let msgid = extract(&stripped).unwrap_or_else(|| "-".to_string());
+        // The public API accepts bytes, not a parsed message: ID extraction
+        // needs its own parse, but label stripping is shared.
+        let tokens = tokenizer::tokenize_with_config(&stripped, config);
+        (msgid, tokens)
+    })
+}
+
+fn cleanup_args(args: &[String]) -> Option<(u64, u64)> {
+    match args {
+        [] => Some((1, 0)),
+        [n] => Some((n.parse().ok()?, 0)),
+        [n, days] => Some((n.parse().ok()?, days.parse().ok()?)),
+        _ => None,
+    }
+}
+
+fn valid_command_args(args: &[String]) -> bool {
+    let Some((command, rest)) = args.split_first() else { return false; };
+    match command.as_str() {
+        "untrain" => match_untrain_args(rest).is_some(),
+        "train-dir" => match_train_dir_args(rest).is_some(),
+        "cleanup" => cleanup_args(rest).is_some(),
+        "msgids" => rest.len() == 1,
+        _ => rest.is_empty(),
+    }
+}
+
+fn argument_error(message: &str) {
+    eprintln!("spamlite: usage error: {message}");
+    if std::env::args_os().any(|a| a == "score" || a == "receive") {
+        // Invalid global options still leave the delivery command available.
+        return;
+    }
+    process::exit(2);
 }
 
 /// train-dir = bulk-train every message file in a directory as ONE class, or
@@ -797,14 +899,11 @@ fn cmd_train_dir(args: &[String]) {
                 continue;
             }
         };
-        let stripped = tokenizer::strip_label_headers(&raw);
-        let msgid = extract_msgid(&stripped).unwrap_or_else(|| "-".to_string());
         // Panic-isolated per message: one pathological file must not sink
         // the batch (the v0.2.0 tokenizer panic shipped that failure mode).
-        let toks =
-            std::panic::catch_unwind(|| tokenizer::tokenize_for_training(&raw, &tokenizer_config));
+        let toks = prepare_training_message(&raw, &tokenizer_config);
         match toks {
-            Ok(tokens) if !tokens.is_empty() => {
+            Ok((msgid, tokens)) if !tokens.is_empty() => {
                 batch_tokens += tokens.len();
                 batch.push(tokens);
                 report.push((true, msgid, safe_path));
@@ -885,7 +984,8 @@ fn cmd_msgids(args: &[String]) {
 /// The `counts` verb stays as the human-facing view; this one is for scripts
 /// (replaces ad-hoc `sqlite3` queries against the db). `seen_30d` counts
 /// tokens touched by supervised training in the last 30 days — train,
-/// untrain and relabel all refresh last_seen; score/receive never do — so it
+/// untrain and relabel all refresh last_seen, as does receive when it trains;
+/// score never does — so it
 /// marks recent corpus *modification*, not necessarily growth (an untrained
 /// token at count 0 still counts as recently seen until `cleanup` reaps it).
 fn cmd_stats() {
@@ -955,6 +1055,17 @@ Environment:
   SPAMLITE_DB               Database file path (default: ~/.spamlite/db.sqlite)
   SPAMLITE_THRESHOLD        Spam threshold (default: 0.5)
   SPAMLITE_TOE_GATE         TOE confidence gate for `receive` (default: 0.2)
+  SPAMLITE_RAIL             Enable abuse-TLD rail
+  SPAMLITE_RAIL_MIN_SPAM    Weak-tier minimum spam count
+  SPAMLITE_RAIL_STRONG_SPAM Strong-tier minimum spam count
+  SPAMLITE_RAIL_FLOOR       Rail score floor
+  SPAMLITE_RAIL_COFLAG      Require weak-tier co-flag
+  SPAMLITE_EXPANDED_HEADERS Expanded header tokens
+  SPAMLITE_TLD              TLD tokens
+  SPAMLITE_FOLD             Fold tokens
+  SPAMLITE_BRAND            Brand tokens
+  SPAMLITE_AUTH             Authentication tokens
+  HOME                     Default database parent directory
 
 Priority: -t flag > params.toml threshold > SPAMLITE_THRESHOLD env > 0.5
           -g flag > SPAMLITE_TOE_GATE env > 0.2
@@ -965,19 +1076,23 @@ Priority: -t flag > params.toml threshold > SPAMLITE_THRESHOLD env > 0.5
 
 /// Parse args, extracting -d and -t flags, returning remaining args
 fn parse_args() -> Vec<String> {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
     let mut remaining = Vec::new();
     let mut i = 1; // skip argv[0]
 
     while i < args.len() {
         if args[i] == "-d" {
             if i + 1 < args.len() {
+                if args[i + 1] == "score" || args[i + 1] == "receive" {
+                    argument_error("-d requires a directory argument");
+                    i += 1;
+                    continue;
+                }
                 let _ = DB_DIR.set(args[i + 1].clone());
                 i += 2;
                 continue;
             } else {
-                eprintln!("spamlite: -d requires a directory argument");
-                process::exit(1);
+                argument_error("-d requires a directory argument");
             }
         }
         if args[i] == "-t" {
@@ -987,15 +1102,13 @@ fn parse_args() -> Vec<String> {
                         let _ = THRESHOLD.set(t);
                     }
                     _ => {
-                        eprintln!("spamlite: -t requires a number between 0.0 and 1.0");
-                        process::exit(1);
+                        argument_error("-t requires a number between 0.0 and 1.0");
                     }
                 }
-                i += 2;
+                i += if args[i + 1] == "score" || args[i + 1] == "receive" { 1 } else { 2 };
                 continue;
             } else {
-                eprintln!("spamlite: -t requires a threshold argument");
-                process::exit(1);
+                argument_error("-t requires a threshold argument");
             }
         }
         if args[i] == "-g" {
@@ -1005,15 +1118,13 @@ fn parse_args() -> Vec<String> {
                         let _ = TOE_GATE.set(g);
                     }
                     _ => {
-                        eprintln!("spamlite: -g requires a number between 0.0 and 0.5");
-                        process::exit(1);
+                        argument_error("-g requires a number between 0.0 and 0.5");
                     }
                 }
-                i += 2;
+                i += if args[i + 1] == "score" || args[i + 1] == "receive" { 1 } else { 2 };
                 continue;
             } else {
-                eprintln!("spamlite: -g requires a gate argument");
-                process::exit(1);
+                argument_error("-g requires a gate argument");
             }
         }
         remaining.push(args[i].clone());
@@ -1045,6 +1156,13 @@ fn main() {
         process::exit(1);
     }
 
+    if !valid_command_args(&args) {
+        eprintln!("spamlite: usage error: unexpected or invalid arguments for {}", args[0]);
+        if args[0] != "score" && args[0] != "receive" {
+            process::exit(2);
+        }
+    }
+
     match args[0].as_str() {
         "receive" => cmd_receive(),
         "score" => cmd_score(),
@@ -1072,6 +1190,64 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_shapes_and_cleanup_numbers_are_strict() {
+        let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for cmd in ["good", "spam", "counts", "stats", "export", "import", "explain", "score", "receive"] {
+            assert!(valid_command_args(&args(&[cmd])));
+            assert!(!valid_command_args(&args(&[cmd, "--sent"])));
+        }
+        for bad in [vec!["cleanup", "5O"], vec!["cleanup", "1", "oops"], vec!["cleanup", "1", "2", "3"], vec!["msgids", "dir", "extra"], vec!["untrain", "x", "y"]] {
+            assert!(!valid_command_args(&args(&bad)));
+        }
+        assert_eq!(cleanup_args(&args(&[])), Some((1, 0)));
+        assert_eq!(cleanup_args(&args(&["2", "30"])), Some((2, 30)));
+    }
+
+    #[test]
+    fn empty_training_is_skipped() {
+        let tokens = tokenizer::tokenize_for_training(b"", &tokenizer::TokenizerConfig::default());
+        assert!(!has_training_tokens(&tokens));
+        assert!(has_training_tokens(&["b:hello".into()]));
+    }
+
+    struct FailedIo;
+    impl Read for FailedIo {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::Other.into())
+        }
+    }
+    impl Write for FailedIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> { Err(io::ErrorKind::BrokenPipe.into()) }
+    }
+
+    #[test]
+    fn delivery_io_errors_preserve_fail_open_and_ignore_broken_pipe() {
+        assert!(delivery_input(FailedIo).is_none());
+        write_verdict(FailedIo, FAIL_OPEN_VERDICT);
+        let mut out = Vec::new();
+        write_verdict(&mut out, FAIL_OPEN_VERDICT);
+        assert_eq!(out, b"GOOD 0.500000");
+    }
+
+    #[test]
+    fn bulk_preparation_strips_labels_and_contains_parser_panics() {
+        let raw = b"Message-ID: <id@example.org>\r\nX-Spam-Status: SPAM\r\nSubject: hello\r\n\r\nworld";
+        let config = tokenizer::TokenizerConfig::default();
+        let (id, tokens) = prepare_training_message(raw, &config).unwrap();
+        assert_eq!(id, "id@example.org");
+        assert_eq!(tokens, tokenizer::tokenize_for_training(raw, &config));
+        assert!(prepare_training_message_with(raw, &config, |_| panic!("ID parser panic")).is_err());
+    }
+
+    #[test]
+    fn message_reader_refuses_non_regular_open_handle() {
+        assert!(read_message_file(&std::env::temp_dir()).is_err());
+    }
 
     #[test]
     fn receive_tokenizer_panic_uses_neutral_fail_open_verdict() {

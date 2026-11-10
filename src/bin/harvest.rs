@@ -342,8 +342,9 @@ fn process_reader<R: BufRead, W: Write>(
     // sessions are short-lived.
     let mut pending: HashMap<String, PendingDelivery> = HashMap::new();
 
-    for line in reader.lines() {
-        let line = line?;
+    for line in reader.split(b'\n') {
+        let bytes = line?;
+        let line = String::from_utf8_lossy(&bytes);
         stats.lines_read += 1;
 
         // Fast reject for lines that don't contain any of our markers.
@@ -545,6 +546,17 @@ mod tests {
         assert!(lines[2].contains("\"verdict\":\"SPAM\""));
         // orphan delivery has no msgid field
         assert!(!lines[2].contains("\"msgid\":"));
+    }
+
+    #[test]
+    fn invalid_utf8_keeps_pending_and_later_deliveries() {
+        let input = b"2026-04-12T00:24:10+10:00 mail dovecot: lmtp(a@example.org)<1><sessA>: sieve: DEBUG: DELIVERY: a@example.org -> Inbox (GOOD 0.1)\ninvalid\xff\n2026-04-12T00:24:11+10:00 mail dovecot: lmtp(a@example.org)<1><sessA>: sieve: msgid=<caf\xc3\xa9@example.org>: stored mail into mailbox 'INBOX'\n";
+        let mut out = Vec::new();
+        let mut stats = Stats::default();
+        process_reader(&input[..], &mut out, &mut stats).unwrap();
+        assert_eq!(stats.lines_read, 3);
+        assert_eq!(stats.delivery_with_msgid, 1);
+        assert!(String::from_utf8(out).unwrap().contains("café@example.org"));
     }
 
     #[test]
