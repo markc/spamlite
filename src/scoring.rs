@@ -4,6 +4,37 @@
 use crate::storage::Database;
 use std::collections::HashMap;
 
+/// Refuse special files before open, then verify the opened identity. Nonblocking
+/// and no-follow flags also close the Linux FIFO/symlink replacement race.
+#[cfg(feature = "cli")]
+fn read_params(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let before = std::fs::symlink_metadata(path)?;
+    let invalid = || std::io::Error::other("params must be a regular file of at most 64 KiB");
+    if !before.is_file() || before.len() > 65_536 {
+        return Err(invalid());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0x800 | 0x20000); // O_NONBLOCK | O_NOFOLLOW
+    }
+    let file = options.open(path)?;
+    let after = file.metadata()?;
+    if !after.is_file() || before.dev() != after.dev() || before.ino() != after.ino() {
+        return Err(invalid());
+    }
+    let mut body = String::new();
+    file.take(65_537).read_to_string(&mut body)?;
+    if body.len() > 65_536 {
+        return Err(invalid());
+    }
+    Ok(body)
+}
+
 /// Classification result
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Verdict {
@@ -201,7 +232,7 @@ impl Default for Params {
 impl Params {
     /// Load per-user overrides from `<db_dir>/params.toml`. Unknown keys are
     /// ignored. Missing file is silently treated as defaults. Parse errors
-    /// emit a warning but fall back to defaults — never break delivery.
+    /// emit a warning but fall back per key — never break delivery.
     ///
     /// File format is intentionally simple key=value:
     ///
@@ -227,7 +258,7 @@ impl Params {
     #[cfg(feature = "cli")]
     pub fn load_overrides(&mut self, db_dir: &std::path::Path) {
         let path = db_dir.join("params.toml");
-        let body = match std::fs::read_to_string(&path) {
+        let body = match read_params(&path) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -238,7 +269,7 @@ impl Params {
             }
             let Some((k, v)) = line.split_once('=') else {
                 eprintln!(
-                    "spamlite: {}:{}: expected key = value, got {raw:?}",
+                    "spamlite: {}:{}: expected key = value",
                     path.display(),
                     lineno + 1
                 );
@@ -246,19 +277,22 @@ impl Params {
             };
             let k = k.trim();
             let v = v.trim();
+            let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(v);
             let parse_f = |v: &str, field: &str| {
-                v.parse::<f64>().map_err(|e| {
+                v.parse::<f64>().map_err(|_| {
                     eprintln!(
-                        "spamlite: {}:{}: {field}: bad number {v:?}: {e}",
+                        "spamlite: {}:{}: {field}: bad number",
                         path.display(),
                         lineno + 1
                     );
                 })
             };
             let parse_u = |v: &str, field: &str| {
-                v.parse::<u64>().map_err(|e| {
+                v.parse::<u64>().map_err(|_| {
                     eprintln!(
-                        "spamlite: {}:{}: {field}: bad integer {v:?}: {e}",
+                        "spamlite: {}:{}: {field}: bad integer",
                         path.display(),
                         lineno + 1
                     );
@@ -269,9 +303,9 @@ impl Params {
             // problem. Out-of-range params don't crash the classifier but they
             // produce nonsense scores that fail open, which is worse than
             // ignoring the file.
-            let reject = |field: &str, v: &str, range: &str| {
+            let reject = |field: &str, _v: &str, range: &str| {
                 eprintln!(
-                    "spamlite: {}:{}: {field} = {v} out of range ({range}); keeping default",
+                    "spamlite: {}:{}: {field}: out of range ({range}); keeping default",
                     path.display(),
                     lineno + 1
                 );
@@ -279,19 +313,19 @@ impl Params {
             match k {
                 "strength" => {
                     if let Ok(x) = parse_f(v, k) {
-                        if (0.0..=100.0).contains(&x) {
+                        if x > 0.0 && x <= 100.0 {
                             self.strength = x;
                         } else {
-                            reject(k, v, "0.0..=100.0");
+                            reject(k, v, ">0.0..=100.0");
                         }
                     }
                 }
                 "unknown_prob" => {
                     if let Ok(x) = parse_f(v, k) {
-                        if (0.0..=1.0).contains(&x) {
+                        if x > 0.0 && x < 1.0 {
                             self.unknown_prob = x;
                         } else {
-                            reject(k, v, "0.0..=1.0");
+                            reject(k, v, ">0.0..<1.0");
                         }
                     }
                 }
@@ -306,10 +340,10 @@ impl Params {
                 }
                 "threshold" => {
                     if let Ok(x) = parse_f(v, k) {
-                        if (0.0..=1.0).contains(&x) {
+                        if x > 0.0 && x < 1.0 {
                             self.threshold = x;
                         } else {
-                            reject(k, v, "0.0..=1.0");
+                            reject(k, v, ">0.0..<1.0");
                         }
                     }
                 }
@@ -338,10 +372,10 @@ impl Params {
                 },
                 "new_word_score" => {
                     if let Ok(x) = parse_f(v, k) {
-                        if (0.0..=1.0).contains(&x) {
+                        if x > 0.0 && x < 1.0 {
                             self.new_word_score = x;
                         } else {
-                            reject(k, v, "0.0..=1.0");
+                            reject(k, v, ">0.0..<1.0");
                         }
                     }
                 }
@@ -552,6 +586,10 @@ pub struct Scored {
 /// makes agreement between the three entry points structural rather than a
 /// convention enforced by comments.
 pub fn score_fws(fws: &[f64], params: &Params) -> Option<Scored> {
+    // Library callers can construct invalid Params without using the CLI validator.
+    if fws.iter().any(|f| !f.is_finite()) {
+        return None;
+    }
     let selected = select_interesting_indices(fws, params);
     if selected.is_empty() {
         return None;
@@ -946,6 +984,19 @@ pub fn chi2_survival(x: f64, df: usize) -> f64 {
     }
     let m = x / 2.0;
     let mut sum = (-m).exp();
+    if sum == 0.0 {
+        if !m.is_finite() {
+            return 0.0;
+        }
+        let mut log_term = -m;
+        let mut log_sum = log_term;
+        for i in 1..=(df / 2 - 1) {
+            log_term += m.ln() - (i as f64).ln();
+            let hi = log_sum.max(log_term);
+            log_sum = hi + ((log_sum - hi).exp() + (log_term - hi).exp()).ln();
+        }
+        return log_sum.exp().min(1.0);
+    }
     let mut term = sum;
     for i in 1..=(df / 2 - 1) {
         term *= m / i as f64;
@@ -957,6 +1008,77 @@ pub fn chi2_survival(x: f64, df: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonfinite_probabilities_never_reach_combiner() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(score_fws(&[0.9, bad], &Params::default()).is_none());
+        }
+        let invalid = Params { strength: 0.0, ..Params::default() };
+        assert!(score_fws(&[score_token(0, 0, 1.0, 1.0, &invalid)], &invalid).is_none());
+    }
+
+    #[test]
+    fn chi_square_log_space_recovers_large_neutral_tail() {
+        assert!(chi2_survival(1600.0, 2000) > 0.999);
+        assert!(chi2_survival(2400.0, 2000) < 0.001);
+        assert!((chi2_survival(2000.0, 2000) - 0.4957947558).abs() < 1e-8);
+        for x in [0.1, 10.0, 100.0, 1000.0] {
+            let m: f64 = x / 2.0;
+            let mut sum = (-m).exp();
+            let mut term = sum;
+            for i in 1..150 {
+                term *= m / i as f64;
+                sum += term;
+            }
+            assert_eq!(chi2_survival(x, 300).to_bits(), sum.min(1.0).to_bits());
+        }
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn params_quotes_ranges_and_safe_files() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("spamlite-safe-params-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("params.toml");
+        std::fs::write(&path, "threshold = 0\nstrength = 0\nunknown_prob = 1\nnew_word_score = 1\ncombine_mode = \"geometric\"\nrail = 'true'\ngood_bias = 2\n").unwrap();
+        let mut p = Params::default();
+        p.load_overrides(&dir);
+        assert_eq!(p.threshold, 0.5);
+        assert_eq!(p.strength, 1.0);
+        assert_eq!(p.unknown_prob, 0.5);
+        assert_eq!(p.new_word_score, 0.5);
+        assert_eq!(p.combine_mode, CombineMode::Geometric);
+        assert!(p.rail);
+        assert_eq!(p.good_bias, 2.0);
+        for threshold in [0.5, 0.9] {
+            for max in [27, 150] {
+                std::fs::write(&path, format!("threshold = {threshold}\nstrength = 0.3\nunknown_prob = 0.4\nmax_interesting = {max}\n")).unwrap();
+                let mut p = Params::default();
+                p.load_overrides(&dir);
+                assert_eq!(p.threshold, threshold);
+                assert_eq!(p.strength, 0.3);
+                assert_eq!(p.unknown_prob, 0.4);
+                assert_eq!(p.max_interesting, max);
+            }
+        }
+        std::fs::write(&path, "rail = true\n".to_owned() + &" ".repeat(65_536)).unwrap();
+        let mut p = Params::default();
+        p.load_overrides(&dir);
+        assert!(!p.rail);
+        std::fs::remove_file(&path).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, "rail = true\n").unwrap();
+        symlink(&target, &path).unwrap();
+        p.load_overrides(&dir);
+        assert!(!p.rail);
+        assert!(read_params(std::path::Path::new("/dev/zero")).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_params(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn saturated_fisher_tie_is_good_like_every_other_no_evidence_path() {

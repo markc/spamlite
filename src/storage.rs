@@ -73,7 +73,8 @@ pub mod schema {
             "PRAGMA busy_timeout = {busy_timeout_ms};
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = 500;"
+             PRAGMA cache_size = 500;
+             PRAGMA trusted_schema = OFF;"
         ))?;
 
         conn.execute_batch(
@@ -276,7 +277,7 @@ pub mod ops {
 
         Ok(Untrained {
             decremented,
-            stranded: words.len() as u64 - decremented,
+            stranded: (words.len() as u64).saturating_sub(decremented),
         })
     }
 
@@ -391,6 +392,12 @@ pub mod ops {
     }
 
     pub fn export<W: Write>(conn: &Connection, writer: &mut W) -> Result<(), ExportError> {
+        export_counted(conn, writer).map(|_| ())
+    }
+
+    /// Export representable rows, returning the number skipped.
+    pub fn export_counted<W: Write>(conn: &Connection, writer: &mut W) -> Result<u64, ExportError> {
+        let mut skipped = 0;
         let (total_good, total_spam) = totals(conn)?;
         writeln!(writer, "{total_good},{total_spam},0,\"__total__\"")?;
         let mut stmt = conn.prepare("SELECT word, good, spam FROM tokens ORDER BY word")?;
@@ -404,22 +411,29 @@ pub mod ops {
         for row in rows {
             let (word, good, spam) = row?;
             if word.contains('"') || word.chars().any(|c| c.is_control()) {
+                skipped += 1;
                 continue;
             }
             writeln!(writer, "{good},{spam},0,\"{word}\"")?;
         }
-        Ok(())
+        Ok(skipped)
     }
 
     /// Largest per-line count `import` accepts; see the check in `import`.
     const MAX_IMPORT_COUNT: u64 = 1_000_000_000_000;
 
     pub fn import<R: BufRead>(tx: &Transaction<'_>, reader: R) -> SqlResult<u64> {
+        import_counted(tx, reader).map(|(count, _)| count)
+    }
+
+    /// Return (imported token rows, rejected input lines). Blank lines are ignored.
+    pub fn import_counted<R: BufRead>(tx: &Transaction<'_>, reader: R) -> SqlResult<(u64, u64)> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         let mut count = 0u64;
+        let mut skipped = 0u64;
         let mut stmt = tx.prepare(
             "INSERT INTO tokens (word, good, spam, last_seen) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(word) DO UPDATE SET good = good + ?2, spam = spam + ?3, last_seen = ?4",
@@ -427,7 +441,10 @@ pub mod ops {
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
-                Err(_) => continue,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
             };
             let line = line.trim();
             if line.is_empty() {
@@ -441,6 +458,7 @@ pub mod ops {
                 // decode. No real corpus is within orders of magnitude of the
                 // cap, so such a line is malformed and is skipped like one.
                 if good > MAX_IMPORT_COUNT || spam > MAX_IMPORT_COUNT {
+                    skipped += 1;
                     continue;
                 }
                 if word == "__total__" {
@@ -458,9 +476,11 @@ pub mod ops {
                     stmt.execute(params![word, good as i64, spam as i64, now])?;
                     count += 1;
                 }
+            } else {
+                skipped += 1;
             }
         }
-        Ok(count)
+        Ok((count, skipped))
     }
 }
 
@@ -659,11 +679,19 @@ impl Database {
         ops::export(&self.conn, writer)
     }
 
+    pub fn export_counted<W: Write>(&self, writer: &mut W) -> Result<u64, ExportError> {
+        ops::export_counted(&self.conn, writer)
+    }
+
     /// Import from spamprobe-compatible CSV format:
     /// goodCount,spamCount,flags,"word"
     pub fn import<R: BufRead>(&self, reader: R) -> SqlResult<u64> {
+        self.import_counted(reader).map(|(count, _)| count)
+    }
+
+    pub fn import_counted<R: BufRead>(&self, reader: R) -> SqlResult<(u64, u64)> {
         let tx = ops::begin_immediate(&self.conn)?;
-        let count = ops::import(&tx, reader)?;
+        let count = ops::import_counted(&tx, reader)?;
         tx.commit()?;
         Ok(count)
     }
@@ -689,6 +717,30 @@ fn parse_csv_line(line: &str) -> Option<(u64, u64, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn counted_transfers_report_rejected_data() {
+        let db = test_db();
+        let csv = b"2,3,0,\"b:okay\"\ninvalid\n18446744073709551615,0,0,\"b:bad\"\n\xff\n\n";
+        assert_eq!(db.import_counted(Cursor::new(csv)).unwrap(), (1, 3));
+        db.conn.execute("INSERT INTO tokens (word) VALUES (?1)", ["bad\"word"]).unwrap();
+        db.conn.execute("INSERT INTO tokens (word) VALUES (?1)", ["bad\nword"]).unwrap();
+        let mut csv = Vec::new();
+        assert_eq!(db.export_counted(&mut csv).unwrap(), 2);
+        assert!(String::from_utf8(csv).unwrap().contains("2,3,0,\"b:okay\""));
+    }
+
+    #[test]
+    fn schema_is_untrusted_and_duplicate_rows_cannot_underflow_untrain() {
+        let db = test_db();
+        let trusted: i64 = db.conn.query_row("PRAGMA trusted_schema", [], |r| r.get(0)).unwrap();
+        assert_eq!(trusted, 0);
+        db.conn.execute_batch("DROP TABLE tokens;
+            CREATE TABLE tokens (word TEXT, good INTEGER, spam INTEGER, last_seen INTEGER);
+            INSERT INTO tokens VALUES ('b:duplicate', 0, 1, 0), ('b:duplicate', 0, 1, 0);").unwrap();
+        let outcome = db.untrain(&["b:duplicate".into()], true).unwrap();
+        assert_eq!(outcome.decremented, 2);
+        assert_eq!(outcome.stranded, 0);
+    }
     use super::*;
     use std::io::Cursor;
 
