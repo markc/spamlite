@@ -58,25 +58,28 @@ for each $dbfile in $dbs
         continue
     end
 
-    $cmd = "ionice -c3 nice -n19 " .. $TUNE .. " -d " .. shell_quote($sl_dir)
-    $cmd = $cmd .. " --ham " .. shell_quote($ham) .. " --spam " .. shell_quote($spam)
+    $identity = stat($sl_dir, {follow_symlinks: false})
+    if not $identity.is_dir or $identity.uid == 0 or $identity.gid == 0 then
+      print($uid .. ": SKIP invalid mail identity")
+      $skipped = $skipped + 1
+      continue
+    end
     -- 0.5 is what the spamfilter wrapper passes (-t 0.5) to every user without
     -- a params.toml; a user who has one is baselined on their own file. The
     -- baseline was 0.6, a threshold no user ran, so the "improves on baseline"
     -- gate compared candidates against a config that was not in production.
-    $cmd = $cmd .. " --baseline-threshold 0.5 --limit 4000 --json --write"
-    $r = run_rc($cmd)
+    $r = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "ionice", "-c3", "nice", "-n19", $TUNE, "-d", $sl_dir, "--ham", $ham, "--spam", $spam, "--baseline-threshold", "0.5", "--limit", "4000", "--json", "--write"], {timeout: 1800, max_output: 64 * 1024 * 1024})
     $done = $done + 1
 
-    if $r.rc == 0 and contains($r.stdout, "\"generalised\":true") then
+    if $r.ok and not $r.stdout_truncated and not $r.stderr_truncated and contains($r.stdout, "\"generalised\":true") then
         print($uid .. ": WROTE params.toml — " .. trim($r.stdout))
         $written = $written + 1
     else
-        if $r.rc == 2 then
+        if not $r.timed_out and not $r.stdout_truncated and not $r.stderr_truncated and $r.exit_code == 2 then
             print($uid .. ": refused (no generalising gain)")
             $refused = $refused + 1
         else
-            print($uid .. ": FAILED rc=" .. $r.rc .. " " .. trim($r.stderr))
+            print($uid .. ": FAILED rc=" .. $r.exit_code .. " timed_out=" .. $r.timed_out .. " stdout_truncated=" .. $r.stdout_truncated .. " stderr_truncated=" .. $r.stderr_truncated .. " " .. trim($r.stderr))
             $failed = $failed + 1
         end
     end

@@ -1,9 +1,34 @@
 #!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
+
+-- Private scratch: never follow a pre-planted parent or recreate its parents.
+fn private_stage()
+  try
+    $st = stat("/run/spamlite", {follow_symlinks: false})
+  catch $e
+    $mk = run_argv(["mkdir", "-m", "0700", "--", "/run/spamlite"])
+    -- A concurrent creator is allowed only if the lstat below passes.
+    if $mk.exit_code != 0 and not is_dir("/run/spamlite") then raise("STAGE_PARENT", $mk.stderr) end
+  end
+  $st = stat("/run/spamlite", {follow_symlinks: false})
+  if not $st.is_dir or $st.uid != 0 or $st.gid != 0 or $st.perm % 64 != 0 then
+    raise("STAGE_PARENT", "/run/spamlite must be a real root-owned directory without group/other access")
+  end
+  $dir = "/run/spamlite/stage-" .. uuid()
+  mkdir($dir, {parents: false})
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
+end
 -- spamlite-fleet-audit.mix — READ-ONLY per-user health audit (2026-09-17).
 --
---   spamlite-fleet-audit.mix [path-substring]  -> /var/tmp/spamlite-audit/*.tsv + summary
+--   spamlite-fleet-audit.mix [path-substring] -> printed private report path + summary
 --
 -- For every <root>/<domain>/msg/<user> with a .spamlite/db.sqlite:
 --   loop.tsv   senders the user READ and KEPT (INBOX or a kept folder, not
@@ -20,15 +45,17 @@
 -- Nothing is written to any mailbox or corpus. Every spamlite/sqlite3 call
 -- runs as the mailbox owner so no root-owned -wal/-shm can appear.
 
-$W = "/var/tmp/spamlite-audit"
+$W = private_stage()
+$keep_report = false
+try
 $SL = "/usr/local/bin/spamlite"
 $NOW = floor(time())
 $D30 = $NOW - 30 * 86400
 $a = args()
 $filt = ""
 if len($a) >= 1 then $filt = $a[0] end
-run_argv(["mkdir", "-p", $W .. "/msg"])
-run_argv(["chmod", "0755", $W, $W .. "/msg"])
+mkdir($W .. "/msg", {parents: false})
+chmod($W .. "/msg", 0o700)
 
 fn kept_box($box)
   $l = lower(strip($box))
@@ -201,11 +228,11 @@ for $dom in ls("/srv")
                 $raw = $W .. "/msg/raw"
                 $t1 = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $mb, "uid", $rec["uid"]], {stdout: {file: $raw}, timeout: 60})
                 if $t1.exit_code == 0 then
-                  run_argv(["sed", "1d", $raw], {stdout: {file: $mf, mode: 420}})
+                  $checked = run_argv_must(["tail", "-n", "+2", "--", $raw], {timeout: 120, stdout: {file: $mf, mode: 384}})
                   $s = as_owner($owner, [$SL, "-d", $db, "score"], {stdin: {file: $mf}, timeout: 60})
                   if $s.exit_code == 0 then $sc = strip($s.stdout) end
                 end
-                run_argv(["rm", "-f", $raw, $mf])
+                $cleanup = run_argv(["rm", "-f", $raw, $mf])
                 $subj = replace(replace(rfc2047_decode($rec["hdr.subject"] or ""), "\t", " "), "\n", " ")
                 $junk_rows = $junk_rows .. $login .. "\t" .. $sc .. "\t" .. $ad .. "\t" .. $kept[$ad] .. "\t" .. ($rec["date.received"] or "") .. "\t" .. left($subj, 90) .. "\t" .. lower(trim($rec["hdr.message-id"] or "", "<> ")) .. "\t" .. $mb .. "\n"
                 $tot.junk = $tot.junk + 1
@@ -269,8 +296,19 @@ for $dom in ls("/srv")
 end
 
 write_file($W .. "/loop.tsv", $loop_rows)
+chmod($W .. "/loop.tsv", 0o600)
 write_file($W .. "/junk.tsv", $junk_rows)
+chmod($W .. "/junk.tsv", 0o600)
 write_file($W .. "/stall.tsv", $stall_rows)
-run_argv(["rm", "-f", $W .. "/all.tmp", $W .. "/junk.tmp"])
+chmod($W .. "/stall.tsv", 0o600)
+$cleanup = run_argv(["rm", "-f", $W .. "/all.tmp", $W .. "/junk.tmp"])
 print("users=" .. $tot.users .. " fetch_failed=" .. $tot.fail .. " loop_senders=" .. $tot.loop .. " junk_candidates=" .. $tot.junk .. " stalled(G30=0,S30>=5)=" .. $tot.stalled)
+
+$keep_report = true
+finally
+  remove_dir($W .. "/msg")
+  remove($W .. "/all.tmp")
+  remove($W .. "/junk.tmp")
+  if not $keep_report then remove_dir($W) end
+end
 print("reports: " .. $W .. "/{loop,junk,stall}.tsv")

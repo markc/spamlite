@@ -1,6 +1,36 @@
 #!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
+
+fn journal_literal($text)
+  for $c in ["\\", ".", "^", "$", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]
+    $text = replace($text, $c, "\\" .. $c)
+  end
+  return $text
+end
+fn private_stage()
+  try
+    $st = stat("/run/spamlite", {follow_symlinks: false})
+  catch $e
+    $mk = run_argv(["mkdir", "-m", "0700", "--", "/run/spamlite"])
+    -- A concurrent creator is allowed only if the lstat below passes.
+    if $mk.exit_code != 0 and not is_dir("/run/spamlite") then raise("STAGE_PARENT", $mk.stderr) end
+  end
+  $st = stat("/run/spamlite", {follow_symlinks: false})
+  if not $st.is_dir or $st.uid != 0 or $st.gid != 0 or $st.perm % 64 != 0 then
+    raise("STAGE_PARENT", "/run/spamlite must be a real root-owned directory without group/other access")
+  end
+  $dir = "/run/spamlite/stage-" .. uuid()
+  mkdir($dir, {parents: false})
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
+end
 -- spamlite-trend.mix — per-day spamlite trend for one user from the sieve
 -- DELIVERY / TRAIN lines in /var/log/mail.log*. Answers "is it getting better"
 -- without touching the db: the actionable column is junk.6-.85 (junk scored
@@ -36,18 +66,28 @@ $SINCE = env("SPAMLITE_SINCE", if len($a) > 1 then; $a[1]; else; date_format(tim
 
 -- File hosts (mrn/mbc) keep /var/log/mail.log*; journald-only hosts (mbx) fall
 -- back to journalctl. short-iso puts the date/time at the same offsets.
-$logs = run("ls -r /var/log/mail.log* 2>/dev/null | tr '\\n' ' ' || true")
-if strip($logs) != "" then
-  $raw = run("zcat -f " .. $logs .. " | grep -a '" .. $U .. "' | grep -aE 'DELIVERY:|TRAIN:' || true")
+$logs = reverse(sort(glob("/var/log/mail.log*")))
+if len($logs) > 0 then
+  $scratch = private_stage()
+  try
+    $expanded = $scratch .. "/logs"
+    $z = run_argv_must(concat(["zcat", "-f", "--"], $logs), {stdout: {file: $expanded}, timeout: 900})
+    $g = run_argv(["grep", "-a", "-F", "--", $U, $expanded], {timeout: 600, max_output: 256 * 1024 * 1024})
+    if $g.timed_out or (not $g.ok and $g.exit_code != 1) then raise("LOG_READ", $g.stderr) end
+    if $g.stdout_truncated then raise("LOG_LIMIT", "user log output truncated") end
+    $raw = $g.stdout
+  finally
+    remove_dir($scratch)
+  end
 else
-  $raw = run("journalctl --since '" .. $SINCE .. "' --no-pager -o short-iso -g '" .. $U .. "' 2>/dev/null | grep -aE 'DELIVERY:|TRAIN:' || true")
+  $raw = run_argv_must(["journalctl", "--since", $SINCE, "--no-pager", "-o", "short-iso", "-g", journal_literal($U)], {timeout: 600, max_output: 256 * 1024 * 1024})
 end
 
 $days = {}
 $lastgood = ""
 $lastspam = ""
 for each $l in split($raw, "\n")
-  if $l == "" then; continue; end
+  if $l == "" or not contains($l, $U) or (not contains($l, "DELIVERY:") and not contains($l, "TRAIN:")) then; continue; end
   $d = substr($l, 0, 10)
   if $d < $SINCE then; continue; end
   $rec = $days[$d] ?? {inbox: 0, junk: 0, hi: 0, band: 0, lo: 0, near: 0, tgood: 0, tspam: 0}

@@ -1,6 +1,31 @@
 #!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
+
+-- Private scratch: never follow a pre-planted parent or recreate its parents.
+fn private_stage()
+  try
+    $st = stat("/run/spamlite", {follow_symlinks: false})
+  catch $e
+    $mk = run_argv(["mkdir", "-m", "0700", "--", "/run/spamlite"])
+    -- A concurrent creator is allowed only if the lstat below passes.
+    if $mk.exit_code != 0 and not is_dir("/run/spamlite") then raise("STAGE_PARENT", $mk.stderr) end
+  end
+  $st = stat("/run/spamlite", {follow_symlinks: false})
+  if not $st.is_dir or $st.uid != 0 or $st.gid != 0 or $st.perm % 64 != 0 then
+    raise("STAGE_PARENT", "/run/spamlite must be a real root-owned directory without group/other access")
+  end
+  $dir = "/run/spamlite/stage-" .. uuid()
+  mkdir($dir, {parents: false})
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
+end
 -- spamlite-user-review.mix — daily 24h review of one user's spamlite filtering,
 -- emailed to markc@renta.net. Fleet-generic (mbc/mrn/mbx): mailbox access is
 -- doveadm-based so Maildir and mdbox hosts work identically.
@@ -66,7 +91,8 @@ if is_file($DB .. "/params.toml") then
     if pos("threshold", $l) == 1 then
       $eq = split($l, "=")
       if len($eq) >= 2 then
-        $T = to_number(strip($eq[1]))
+        $parsed = to_number(strip(split($eq[1], "#")[0]))
+        if $parsed != nil and $parsed > 0 and $parsed < 1 then $T = $parsed end
       end
     end
     $pi = $pi + 1
@@ -334,7 +360,10 @@ if $DRY == 1 then
   print("=== DRY RUN (no email, baseline untouched) ===")
   print($r)
 else
-  $eml = "/dev/shm/spamlite-review." .. $up[0] .. ".eml"
+  $stage = private_stage()
+
+try
+  $eml = $stage .. "/review.eml"
   $cc = ""
   if $TO != "markc@renta.net" then
     $cc = "Cc: markc@renta.net\n"
@@ -343,8 +372,10 @@ else
   -- Trash BEFORE scoring, so this spam-subject-laden report never pollutes
   -- the corpus. Recipients check Trash for it (same as bounces). 2026-08-23.
   write_file($eml, "To: " .. $TO .. "\n" .. $cc .. "From: root@" .. $fqdn .. "\nSubject: spamlite daily review " .. $U .. "\n\n" .. $r)
-  run_argv(["/usr/sbin/sendmail", "-t"], {stdin: {file: $eml}})
-  run_argv(["rm", "-f", $eml])
+  $sent = run_argv_must(["/usr/sbin/sendmail", "-oi", "-t"], {stdin: {file: $eml}, timeout: 300})
+finally
+  remove_dir($stage)
+end
   write_file($BASE, strip($st.stdout) .. "\n")
   print("emailed + baseline refreshed " .. $ts)
 end

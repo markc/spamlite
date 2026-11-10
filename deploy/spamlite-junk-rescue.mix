@@ -1,6 +1,45 @@
 #!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
+
+-- Preflight BEFORE training; write with these non-root credentials.
+fn mail_identity($path)
+  $st = stat($path, {follow_symlinks: false})
+  if not $st.is_dir or $st.uid == 0 or $st.gid == 0 then
+    raise("MAIL_IDENTITY", $path .. " must be a real directory with non-root uid/gid")
+  end
+  return $st
+end
+
+fn mail_append($identity, $path, $text)
+  $w = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "tee", "-a", "--", $path], {stdin: $text, stdout: "null"})
+  if $w.exit_code != 0 then raise("SIDECAR_APPEND", $path .. ": " .. $w.stderr) end
+end
+
+-- Private scratch: never follow a pre-planted parent or recreate its parents.
+fn private_stage()
+  try
+    $st = stat("/run/spamlite", {follow_symlinks: false})
+  catch $e
+    $mk = run_argv(["mkdir", "-m", "0700", "--", "/run/spamlite"])
+    -- A concurrent creator is allowed only if the lstat below passes.
+    if $mk.exit_code != 0 and not is_dir("/run/spamlite") then raise("STAGE_PARENT", $mk.stderr) end
+  end
+  $st = stat("/run/spamlite", {follow_symlinks: false})
+  if not $st.is_dir or $st.uid != 0 or $st.gid != 0 or $st.perm % 64 != 0 then
+    raise("STAGE_PARENT", "/run/spamlite must be a real root-owned directory without group/other access")
+  end
+  $dir = "/run/spamlite/stage-" .. uuid()
+  mkdir($dir, {parents: false})
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
+end
 -- spamlite-junk-rescue.mix — retrain a REVIEWED list of Junk false positives
 -- as good and (optionally) move recent ones back to INBOX. 2026-09-17.
 --
@@ -26,8 +65,9 @@ if len($a) < 3 then
 end
 $mode = $a[0]
 $CUT = $a[2]
-$W = "/var/tmp/junk-rescue"
-run_argv(["mkdir", "-p", $W])
+$W = private_stage()
+
+try
 $by = {}
 for $l in lines(read_file($a[1]))
   $c = split($l, "\t")
@@ -46,7 +86,8 @@ for $login in sort(keys($by))
     $db = "/home/u/" .. $up[1] .. "/home/" .. $up[0] .. "/.spamlite"
   end
   $log = $db .. "/reconciled.log"
-  $owner = strip(run_argv(["stat", "-c", "%U", $db .. "/db.sqlite"]).stdout)
+  $identity = mail_identity($db)
+  -- The validated numeric identity is used for both training and recording.
   $last = {}
   $cnt = {}
   if is_file($log) then
@@ -58,9 +99,13 @@ for $login in sort(keys($by))
       end
     end
   end
-  $stage = $W .. "/" .. $login
-  run_argv(["rm", "-rf", $stage])
-  run_argv(["mkdir", "-p", $stage .. "/corr", $stage .. "/plain"])
+  $stage = private_stage()
+
+try
+  mkdir($stage .. "/corr", {parents: false})
+  mkdir($stage .. "/plain", {parents: false})
+  chmod($stage .. "/corr", 0o700)
+  chmod($stage .. "/plain", 0o700)
   $uidof = {}
   $boxof = {}
   $moveit = {}
@@ -102,8 +147,9 @@ for $login in sort(keys($by))
       $T.failed = $T.failed + 1
       continue
     end
-    $f2 = run_argv(["sed", "1d", $raw], {stdout: {file: $stage .. "/" .. $kind .. "/" .. $i .. ".eml", mode: 420}})
-    run_argv(["rm", "-f", $raw])
+    $f2 = run_argv(["tail", "-n", "+2", "--", $raw], {timeout: 120, stdout: {file: $stage .. "/" .. $kind .. "/" .. $i .. ".eml", mode: 384}})
+    $cleanup = run_argv(["rm", "-f", $raw])
+    if $f2.exit_code != 0 then raise("STAGE_WRITE", $f2.stderr) end
     $uidof[$k] = $uid
     $boxof[$k] = $c[2]
     if $recent or $kind == "plain" then $moveit[$k] = true end
@@ -115,15 +161,16 @@ for $login in sort(keys($by))
     $want[$c[1]] = true
   end
   for $sub in ["corr", "plain"]
-    for $l in lines(run_argv([$SL, "msgids", $stage .. "/" .. $sub]).stdout)
+    for $l in lines(run_argv_must([$SL, "msgids", $stage .. "/" .. $sub], {timeout: 900, max_output: 256 * 1024 * 1024}))
       $f = split($l, "\t")
       if len($f) >= 3 and not $want[lower(trim($f[0], "<> "))] then
         eprint("  msgid mismatch dropped: " .. $f[2])
-        run_argv(["rm", "-f", $f[2]])
+        $cleanup = run_argv(["rm", "-f", $f[2]])
       end
     end
   end
-  run_argv(["chmod", "-R", "a+rX", $stage])
+  $owned = run_argv_must(["chown", "-hR", to_string($identity.uid) .. ":" .. to_string($identity.gid), $stage], {timeout: 600})
+  chmod($stage, 0o700)
   $nm = 0
   for $k in keys($moveit)
     $nm = $nm + 1
@@ -131,32 +178,33 @@ for $login in sort(keys($by))
   print($login .. ": retrain corr=" .. $nc .. " plain=" .. $np .. "  not-retrained=" .. $ns .. "  to-move=" .. $nm)
   if $mode != "apply" then continue end
 
-  run_argv(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-" .. $STAMP .. "-rescue"])
-  if is_file($log) then run_argv(["cp", "-a", $log, $log .. ".bak-" .. $STAMP .. "-rescue"]) end
+  $checked = run_argv_must(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-" .. $STAMP .. "-rescue"], {timeout: 600})
+  if is_file($log) then $checked = run_argv_must(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "cp", "-a", $log, $log .. ".bak-" .. $STAMP .. "-rescue"], {timeout: 600}) end
   $trained = {}
   for $sub in ["corr", "plain"]
-    $argv = [$SL, "-d", $db, "train-dir", $stage .. "/" .. $sub, "good"]
+    $argv = [$SL, "-d", $db, "train-dir", "./" .. $sub, "good"]
     if $sub == "corr" then
       $argv = concat($argv, ["--from", "spam"])
     end
     if len(ls($stage .. "/" .. $sub)) > 0 then
-      $tr = run_argv(concat(["runuser", "-u", $owner, "--"], $argv), {timeout: 900})
-      if $tr.exit_code != 0 then
-        eprint("  TRAIN FAILED " .. $login .. " " .. $sub .. ": " .. strip($tr.stderr))
+      $tr = run_argv(concat(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups"], $argv), {timeout: 900, cwd: $stage, max_output: 256 * 1024 * 1024})
+      if not $tr.ok or $tr.stdout_truncated or $tr.stderr_truncated then
+        eprint("  TRAIN FAILED " .. $login .. " " .. $sub .. " timed_out=" .. $tr.timed_out .. " stdout_truncated=" .. $tr.stdout_truncated .. ": " .. strip($tr.stderr))
         $T.failed = $T.failed + 1
       end
       $now = "" .. floor(time())
       $add = ""
-      for $l in lines($tr.stdout)
+      -- Ignore a partial final row if the process timed out or capture filled.
+      for $l in slice(split($tr.stdout, "\n"), 0, -1)
         $f = split($l, "\t")
-        if $f[0] == "ok" then
+        if len($f) >= 3 and $f[0] == "ok" then
           $kk = lower(trim($f[1], "<> "))
           $add = $add .. "G " .. $now .. " " .. $kk .. "\n"
           $trained[$kk] = true
           if $sub == "corr" then $T.corr = $T.corr + 1 else $T.plain = $T.plain + 1 end
         end
       end
-      if $add != "" then append_file($log, $add) end
+      if $add != "" then mail_append($identity, $log, $add) end
     end
   end
   -- move: only what was trained now, or was already G
@@ -171,6 +219,12 @@ for $login in sort(keys($by))
       end
     end
   end
+finally
+  remove_dir($stage)
+end
   $T.skipped = $T.skipped + $ns
+end
+finally
+  remove_dir($W)
 end
 print("TOTAL mode=" .. $mode .. " corr=" .. $T.corr .. " plain=" .. $T.plain .. " not-retrained=" .. $T.skipped .. " moved=" .. $T.moved .. " missing=" .. $T.missing .. " failed=" .. $T.failed)

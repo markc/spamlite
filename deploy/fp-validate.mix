@@ -1,6 +1,38 @@
 #!/opt/mixos/bin/mix
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
+
+fn journal_literal($text)
+  for $c in ["\\", ".", "^", "$", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]
+    $text = replace($text, $c, "\\" .. $c)
+  end
+  return $text
+end
+
+-- Private scratch: never follow a pre-planted parent or recreate its parents.
+fn private_stage()
+  try
+    $st = stat("/run/spamlite", {follow_symlinks: false})
+  catch $e
+    $mk = run_argv(["mkdir", "-m", "0700", "--", "/run/spamlite"])
+    -- A concurrent creator is allowed only if the lstat below passes.
+    if $mk.exit_code != 0 and not is_dir("/run/spamlite") then raise("STAGE_PARENT", $mk.stderr) end
+  end
+  $st = stat("/run/spamlite", {follow_symlinks: false})
+  if not $st.is_dir or $st.uid != 0 or $st.gid != 0 or $st.perm % 64 != 0 then
+    raise("STAGE_PARENT", "/run/spamlite must be a real root-owned directory without group/other access")
+  end
+  $dir = "/run/spamlite/stage-" .. uuid()
+  mkdir($dir, {parents: false})
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
+end
 -- fp-validate.mix <days> <addr> [<addr>...] — is each "confirmed false positive"
 -- actually ham?
 --
@@ -49,8 +81,9 @@ fn cap1($pat, $s)
 end
 
 fn hdr($file, $name)
-  $c = "grep -m1 -i " .. shell_quote("^" .. $name .. ":") .. " " .. shell_quote($file) .. " 2>/dev/null || true"
-  $v = trim(run_rc($c).stdout)
+  $r = run_argv(["grep", "-m1", "-i", "--", "^" .. $name .. ":", $file], {timeout: 120, max_output: 64 * 1024 * 1024})
+  if $r.timed_out or (not $r.ok and $r.exit_code != 1) or $r.stdout_truncated then raise("HEADER_READ", $r.stderr) end
+  $v = trim($r.stdout)
   if $v == "" then return "" end
   return trim(split($v, ":")[1] ?? "")
 end
@@ -61,19 +94,20 @@ for each $addr in $addrs
   $home = "/srv/" .. $d .. "/msg/" .. $u
   -- Key scratch paths on the FULL address. Keying on the local part silently collided
   -- two different domains' `admin@` mailboxes and one clobbered the other's lists.
-  $slug = $u .. "_at_" .. $d
+  -- Scratch names are independent of operator input.
 
   -- 1. deduped rescue msgids from the journal
   -- `grep -F '-> good'` looks like a FLAG to grep (the pattern starts with `-`) and
   -- silently matches nothing. Anchor the extraction on the msgid instead, so every
   -- pattern begins with a harmless character.
-  $cmd = "/usr/bin/journalctl --since '" .. ("" .. $DAYS) .. " days ago' --no-pager 2>/dev/null"
-  $cmd = $cmd .. " | grep -F 'TRAIN: " .. $addr .. " '"
-  $cmd = $cmd .. " | grep -oE '<[^>]*> [-]> good' || true"
+  $journal = run_argv_must(["/usr/bin/journalctl", "--since", to_string($DAYS) .. " days ago", "--no-pager", "-g", journal_literal("TRAIN: " .. $addr .. " ")], {timeout: 600, max_output: 256 * 1024 * 1024})
   $mids = []
   $seen = {}
-  for each $l in split(trim(run_rc($cmd).stdout), "\n")
-    $m = trim(split(trim($l), ">")[0] ?? "")
+  for each $l in lines($journal)
+    if not contains($l, "TRAIN: " .. $addr .. " ") then continue end
+    $hits = re_find($l, "<[^>]*> [-]> good")
+    if len($hits) == 0 then continue end
+    $m = trim(split($hits[0].match, ">")[0])
     if $m != "" then
       $m = substr($m, 1, length($m) - 1)
       if $seen[$m] == nil then
@@ -90,13 +124,16 @@ for each $addr in $addrs
   end
   if length($mids) > 0 then
     -- 2. ONE grep pass over the Maildir with every msgid as a fixed pattern.
-    $pf = "/var/tmp/fp-audit/.mids." .. $slug
+    $scratch = private_stage()
+    $keep_lists = false
+try
+    $pf = $scratch .. "/mids"
     write_file($pf, join($mids, "\n") .. "\n")
-    $find = "find " .. shell_quote($home .. "/Maildir") .. " -type d \\( -name cur -o -name new \\)"
-    $find = $find .. " -exec find {} -maxdepth 1 -type f \\; 2>/dev/null"
-    $find = $find .. " | tr '\\n' '\\0' | xargs -0 -r grep -l -F -f " .. shell_quote($pf) .. " 2>/dev/null || true"
+    chmod($pf, 0o600)
+    $found = run_argv(["find", $home .. "/Maildir", "-type", "d", "(", "-name", "cur", "-o", "-name", "new", ")", "-exec", "grep", "-r", "-l", "-F", "-f", $pf, "--", "{}", ";"], {timeout: 900, max_output: 256 * 1024 * 1024})
+    if not $found.ok or $found.stdout_truncated then raise("FIND_FAILED", $found.stderr) end
     $hits = []
-    for each $p in split(trim(run_rc($find).stdout), "\n")
+    for each $p in split(trim($found.stdout), "\n")
       if trim($p) != "" then push($hits, trim($p)) end
     end
 
@@ -106,7 +143,7 @@ for each $addr in $addrs
     for each $p in $hits
       -- A hit can be a DIFFERENT message quoting the msgid in References/In-Reply-To.
       -- Only count files whose OWN Message-ID is in the rescued set.
-      $own = cap1("(?i)<([^>]*)>", trim(run_rc("grep -m1 -i '^Message-ID:' " .. shell_quote($p) .. " 2>/dev/null || true").stdout))
+      $own = cap1("(?i)<([^>]*)>", hdr($p, "Message-ID"))
       if $own != nil then
         if $seen[$own] == true then
           $from = hdr($p, "From")
@@ -141,9 +178,9 @@ for each $addr in $addrs
     -- Emit the harness inputs, but ONLY the validated-ham rescues. Feeding a flagged
     -- rescue into watch.list would tell htmlfix-eval.mix to "fix" a message that the
     -- filter got RIGHT, and the fix would score as a regression for doing its job.
-    $od = "/var/tmp/fp-audit/v-" .. $slug
-    $mk = run_rc("mkdir -p " .. shell_quote($od))
-    if $mk.rc != 0 then
+    $od = $scratch .. "/lists"
+    $mk = run_argv(["mkdir", "-m", "0700", "--", $od])
+    if $mk.exit_code != 0 then
       eprint "ERROR: cannot create " .. $od .. " — skipping list output for " .. $addr
       eprint $mk.stderr
     end
@@ -154,10 +191,12 @@ for each $addr in $addrs
       end
     end
     write_file($od .. "/watch.list", join($wl, "\n") .. "\n")
+    chmod($od .. "/watch.list", 0o600)
 
     -- Regression set: INBOX mail that was NOT rescued, i.e. the filter already got it
     -- right. The fix must not push any of these over the line. Newest first, capped.
-    $inb = "find " .. shell_quote($home .. "/Maildir/cur") .. " -maxdepth 1 -type f -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -150 | cut -d' ' -f2- || true"
+    $inb = run_argv_must(["find", $home .. "/Maildir/cur", "-maxdepth", "1", "-type", "f", "-printf", "%T@ %p\n"], {timeout: 600, max_output: 256 * 1024 * 1024})
+    $newest = reverse(sort_by(lines($inb), fn($l) = to_number(split($l, " ")[0])))
     -- Exclude the rescued messages themselves: a rescue LANDS in INBOX, so leaving them
     -- in would double-count the very messages watch.list is measuring and mask a real
     -- regression behind an intended improvement.
@@ -166,12 +205,20 @@ for each $addr in $addrs
       $isresc[$r["p"]] = true
     end
     $hl = []
-    for each $p in split(trim(run_rc($inb).stdout), "\n")
+    for each $entry in take($newest, 150)
+      $p = after($entry, " ")
       if trim($p) != "" then
         if $isresc[trim($p)] == nil then push($hl, trim($p)) end
       end
     end
     write_file($od .. "/ham-regress.list", join($hl, "\n") .. "\n")
+    chmod($od .. "/ham-regress.list", 0o600)
+    remove($pf)
+
+    $keep_lists = true
+finally
+    if not $keep_lists then remove_dir($scratch) end
+end
     print "     lists: " .. $od .. " (watch " .. ("" .. length($wl)) .. ", ham-regress " .. ("" .. length($hl)) .. ")"
     print ""
   end
