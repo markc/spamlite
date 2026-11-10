@@ -32,12 +32,13 @@ if address :localpart :is "to" ["root", "daemon", "postmaster"] {
 # Spamlite scoring — `score` is read-only; delivery never trains (0.9.x
 # `receive` would train on confident verdicts). Training comes from imapsieve
 # rescues and the nightly spamlite-reconcile.mix state reconciler.
-execute :pipe :output "SCORE" "spamlite" ["-d", "/home/u/${rhs}/home/${lhs}/.spamlite", "score"];
-# Drop any X-Spam-Status the sender supplied before adding ours, and decide on
-# the classifier's own output rather than on the header: otherwise a sender's
-# "X-Spam-Status: SPAM" forced Junk, and the stats collector (which reads the
-# first instance) counted the sender's claim instead of our verdict.
+# Drop any X-Spam-Status the sender supplied (before scoring, so the classifier
+# never sees it either), and decide below on the classifier's own output
+# rather than on the header: otherwise a sender's "X-Spam-Status: SPAM" forced
+# Junk, and the stats collector (which reads the first instance) counted the
+# sender's claim instead of our verdict.
 deleteheader "X-Spam-Status";
+execute :pipe :output "SCORE" "spamlite" ["-d", "/home/u/${rhs}/home/${lhs}/.spamlite", "score"];
 addheader :last "X-Spam-Status" "${SCORE}";
 
 # Spam → Junk

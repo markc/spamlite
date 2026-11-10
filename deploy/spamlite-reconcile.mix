@@ -247,6 +247,26 @@ while $u < len($users)
   if $go == 1 then
     $db = $d .. "/.spamlite"
     $log = $db .. "/reconciled.log"
+    -- Ownership preflight, before anything is trained: the sidecar is written
+    -- as the owner of db.sqlite (see the append below), so a database with no
+    -- usable non-root owner would be trained but never recorded.
+    $own_uid = 0
+    $own_gid = 0
+    try
+      $dbst = stat($db .. "/db.sqlite", {follow_symlinks: false})
+      if $dbst.is_file then
+        $own_uid = $dbst.uid
+        $own_gid = $dbst.gid
+      end
+    catch $e
+      $own_uid = 0
+    end
+    if $own_uid == 0 or $own_gid == 0 then
+      print($d .. ": SKIP — " .. $db .. "/db.sqlite is missing, a symlink, or owned by root/group root (fix the ownership)")
+      $go = 0
+    end
+  end
+  if $go == 1 then
     $hamonly = 0
     if is_file($db .. "/reconcile-ham-only") then
       $hamonly = 1
@@ -1140,17 +1160,12 @@ while $u < len($users)
             -- reconciled.log can be a planted symlink, and root appending
             -- through it wrote sender-influenced keys into any file on the
             -- system. Every row here is already committed by train-dir.
-            -- The owner is read without following a link (a link the user
-            -- planted is owned by the user), and root is refused outright.
+            -- The owner comes from the preflight above: read without following
+            -- a link, and never root or group root.
             if $logbuf != "" then
-              $dbst = stat($db .. "/db.sqlite", {follow_symlinks: false})
-              if $dbst.uid == 0 then
-                print("WARN: " .. $db .. "/db.sqlite is root-owned; sidecar NOT written for " .. $d .. " (rows trained but not recorded; fix the ownership)")
-              else
-                $lw = run_argv(["setpriv", "--reuid", to_string($dbst.uid), "--regid", to_string($dbst.gid), "--clear-groups", "tee", "-a", "--", $log], {stdin: $logbuf, stdout: "null"})
-                if $lw.exit_code != 0 then
-                  print("WARN: sidecar append failed for " .. $d .. " (rows trained but not recorded): " .. first_line($lw.stderr))
-                end
+              $lw = run_argv(["setpriv", "--reuid", to_string($own_uid), "--regid", to_string($own_gid), "--clear-groups", "tee", "-a", "--", $log], {stdin: $logbuf, stdout: "null"})
+              if $lw.exit_code != 0 then
+                print("WARN: sidecar append failed for " .. $d .. " (rows trained but not recorded): " .. first_line($lw.stderr))
               end
             end
             $fail = $fail + (len($sel) - $stage_fail - len($tl))

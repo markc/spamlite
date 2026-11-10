@@ -21,8 +21,9 @@
 //! `</a>`, so none can be present), and a failed `>` search is remembered.
 //! Entity decoding is still upstream's, reached through tag-free segments.
 
-/// Anchors nested deeper than this are treated as ordinary tags: the tag is
-/// dropped and its content kept, without the ` (href)` suffix. Nested anchors
+/// At most this many anchors are rendered inside one another. An anchor with
+/// this many enclosing anchors already is treated as an ordinary tag: the tag
+/// is dropped and its content kept, without the ` (href)` suffix. Nested anchors
 /// are invalid HTML, so only malformed or hostile input reaches the cap.
 const MAX_ANCHOR_DEPTH: usize = 8;
 

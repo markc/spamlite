@@ -275,8 +275,8 @@ function mail_identity($sp)
   if not $st["is_dir"] then
     raise("STATS_IDENTITY", $sp .. " is not a real directory (symlink or other)")
   end
-  if $st["uid"] == 0 then
-    raise("STATS_IDENTITY", $sp .. " is owned by root")
+  if $st["uid"] == 0 or $st["gid"] == 0 then
+    raise("STATS_IDENTITY", $sp .. " is owned by root or group root")
   end
   return $st
 end
