@@ -1640,10 +1640,7 @@ Thanks for the quote.\r\n";
     #[test]
     fn swap_drops_own_domain_and_self_headers() {
         let raw = tokenize_with_config(SENT, &TokenizerConfig::default());
-        assert!(
-            raw.contains(&"h:from:example.net".to_string()),
-            "{raw:?}"
-        );
+        assert!(raw.contains(&"h:from:example.net".to_string()), "{raw:?}");
 
         let swapped = tokenize_with_config(SENT, &cfg(|c| c.sent_swap = true));
         assert!(
