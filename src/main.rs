@@ -768,9 +768,24 @@ fn argument_error(message: &str) {
 fn delivery_command_first(args: &mut [String]) {
     // Unknown options before a delivery verb must not turn it into an exit-1
     // unknown command. A preceding maintenance verb still owns its arguments.
-    let command = args.iter().position(|a| matches!(a.as_str(),
-        "score" | "receive" | "good" | "spam" | "untrain" | "train-dir" |
-        "cleanup" | "counts" | "stats" | "export" | "import" | "msgids" | "explain"));
+    let command = args.iter().position(|a| {
+        matches!(
+            a.as_str(),
+            "score"
+                | "receive"
+                | "good"
+                | "spam"
+                | "untrain"
+                | "train-dir"
+                | "cleanup"
+                | "counts"
+                | "stats"
+                | "export"
+                | "import"
+                | "msgids"
+                | "explain"
+        )
+    });
     if let Some(i) = command {
         if args[i] == "score" || args[i] == "receive" {
             args[..=i].rotate_right(1);
