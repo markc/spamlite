@@ -266,24 +266,39 @@ $today = date_format(time(), "%Y-%m-%d")
 $started = time()
 print("[" .. date_format($started, "%Y-%m-%dT%H:%M:%S") .. "] spamlite-stats-collect today=" .. $today .. " force=" .. ("" .. $force) .. " dry_run=" .. ("" .. $dry_run))
 
+-- The identity the stats line is written under comes from .spamlite itself,
+-- read WITHOUT following a link: the home is writable by the mail user, and a
+-- .spamlite swapped for a link to a root-owned directory would otherwise make
+-- the append run as uid 0. Only a real directory not owned by root qualifies.
+function mail_identity($sp)
+  $st = stat($sp, {follow_symlinks: false})
+  if not $st["is_dir"] then
+    raise("STATS_IDENTITY", $sp .. " is not a real directory (symlink or other)")
+  end
+  if $st["uid"] == 0 then
+    raise("STATS_IDENTITY", $sp .. " is owned by root")
+  end
+  return $st
+end
+
 $users = []
 if $single then
   $sp = $single .. "/.spamlite"
   $st = nil
   try
-    $st = stat($sp)
+    $st = mail_identity($sp)
   catch $e
-    print("no .spamlite/ at " .. $single .. ": " .. ("" .. $e))
+    print("no usable .spamlite/ at " .. $single .. ": " .. ("" .. $e))
     exit(1)
   end
   push($users, {"home": $single, "uid": $st["uid"], "gid": $st["gid"]})
 else
   for each $d in sort(glob("/srv/*/msg/*/.spamlite"))
     try
-      $st = stat($d)
+      $st = mail_identity($d)
       push($users, {"home": dirname($d), "uid": $st["uid"], "gid": $st["gid"]})
     catch $e
-      warn("stat " .. $d .. ": " .. ("" .. $e))
+      warn("skip " .. $d .. ": " .. ("" .. $e))
     end
   end
 end
