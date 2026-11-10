@@ -277,7 +277,9 @@ impl Params {
             };
             let k = k.trim();
             let v = v.trim();
-            let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+            let v = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
                 .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
                 .unwrap_or(v);
             let parse_f = |v: &str, field: &str| {
@@ -1014,7 +1016,10 @@ mod tests {
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(score_fws(&[0.9, bad], &Params::default()).is_none());
         }
-        let invalid = Params { strength: 0.0, ..Params::default() };
+        let invalid = Params {
+            strength: 0.0,
+            ..Params::default()
+        };
         assert!(score_fws(&[score_token(0, 0, 1.0, 1.0, &invalid)], &invalid).is_none());
     }
 

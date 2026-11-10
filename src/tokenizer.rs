@@ -11,12 +11,11 @@ use mail_parser::{Addr, HeaderName, HeaderValue, Host, MessageParser};
 const MIN_TOKEN_LEN: usize = 3;
 const MAX_TOKEN_LEN: usize = 40;
 
-/// Hard cap on tokens extracted from one message (pre-dedup). The 64 MiB
+/// Hard cap on distinct tokens extracted from one message. The 64 MiB
 /// stdin cap in main.rs bounds memory, but a huge text body could still cost
 /// millions of allocations plus thousands of chunked SQL lookups inside the
-/// sieve hot path with dovecot waiting. Real mail produces well under 10k raw
-/// distinct tokens; the discriminating signal of any real message appears long before
-/// this cap. spamprobe has the same guard (max terms per message).
+/// sieve hot path with dovecot waiting. Real mail produces well under 10k
+/// distinct tokens; useful signal appears long before this cap.
 const MAX_RAW_TOKENS: usize = 50_000;
 const MAX_PART_WORDS: usize = 100_000;
 const MAX_SUBJECT_WORDS: usize = 4096;
@@ -207,7 +206,10 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
 
     // Subject header — individual tokens + bigrams
     if let Some(subject) = message.subject() {
-        let words: Vec<String> = extract_words(subject).take(MAX_SUBJECT_WORDS).filter(|w| valid(w)).collect();
+        let words: Vec<String> = extract_words(subject)
+            .take(MAX_SUBJECT_WORDS)
+            .filter(|w| valid(w))
+            .collect();
 
         for w in &words {
             push_word(&mut tokens, "h:subject:", w, config);
@@ -427,7 +429,9 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
             let Some(url) = urls.next() else { break };
             if valid(&url) {
                 let token = format!("u:{url}");
-                if seen.insert(token.clone()) { tokens.push(token); }
+                if seen.insert(token.clone()) {
+                    tokens.push(token);
+                }
             }
         }
 
@@ -460,7 +464,9 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
             let Some(url) = urls.next() else { break };
             if valid(&url) {
                 let token = format!("u:{url}");
-                if seen.insert(token.clone()) { tokens.push(token); }
+                if seen.insert(token.clone()) {
+                    tokens.push(token);
+                }
             }
         }
 
@@ -829,8 +835,14 @@ fn tokenize_fallback(raw: &[u8], config: &TokenizerConfig) -> Vec<String> {
         .filter(|w| w.len() >= config.min_len && w.len() <= config.max_len)
         .map(|w| format!("b:{w}"))
         .scan(std::collections::HashSet::new(), |seen, token| {
-            if seen.len() >= MAX_RAW_TOKENS { return None; }
-            Some(if seen.insert(token.clone()) { Some(token) } else { None })
+            if seen.len() >= MAX_RAW_TOKENS {
+                return None;
+            }
+            Some(if seen.insert(token.clone()) {
+                Some(token)
+            } else {
+                None
+            })
         })
         .flatten()
         .collect();
@@ -968,8 +980,13 @@ mod tests {
 
     #[test]
     fn per_part_word_budget_and_header_limits() {
-        let subject = (0..5000).map(|i| format!("subject{i} ")).collect::<String>();
-        let addrs = (0..100).map(|i| format!("user{i}@example.org")).collect::<Vec<_>>().join(", ");
+        let subject = (0..5000)
+            .map(|i| format!("subject{i} "))
+            .collect::<String>();
+        let addrs = (0..100)
+            .map(|i| format!("user{i}@example.org"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let raw = format!("Subject: {subject}\r\nFrom: {addrs}\r\nReply-To: {addrs}\r\nSender: {addrs}\r\n\r\n{}beyondbudget", "repeated ".repeat(MAX_PART_WORDS));
         let tokens = tokenize_with_config(raw.as_bytes(), &TokenizerConfig::default());
         assert!(tokens.contains(&"h:subject:subject4095".into()));
@@ -984,10 +1001,19 @@ mod tests {
     #[test]
     fn ordinary_multipart_tokens_are_unchanged() {
         let raw = b"Subject: Hello world\r\nFrom: user@example.org\r\nContent-Type: multipart/alternative; boundary=p\r\n\r\n--p\r\nContent-Type: text/plain\r\n\r\nHello hello meeting\r\n--p\r\nContent-Type: text/html\r\n\r\n<p>Hello meeting</p>\r\n--p--\r\n";
-        assert_eq!(tokenize_with_config(raw, &TokenizerConfig::default()), vec![
-            "b:hello", "b:meeting", "h:from:example", "h:from:example.org",
-            "h:from:user@example.org", "h:subject:hello", "h:subject:hello_world", "h:subject:world",
-        ]);
+        assert_eq!(
+            tokenize_with_config(raw, &TokenizerConfig::default()),
+            vec![
+                "b:hello",
+                "b:meeting",
+                "h:from:example",
+                "h:from:example.org",
+                "h:from:user@example.org",
+                "h:subject:hello",
+                "h:subject:hello_world",
+                "h:subject:world",
+            ]
+        );
     }
     use super::*;
 
@@ -1088,7 +1114,7 @@ mod tests {
     #[test]
     fn test_token_cap_bounds_pathological_body() {
         // A synthetic body with far more unique words than the cap must be
-        // bounded (pre-dedup cap 50k, so post-dedup <= 50k + header tokens).
+        // bounded by the distinct-token cap.
         let mut body = String::with_capacity(1 << 20);
         for i in 0..(MAX_RAW_TOKENS + 10_000) {
             body.push_str(&format!("word{i:06} "));

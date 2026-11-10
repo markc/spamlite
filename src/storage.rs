@@ -722,8 +722,12 @@ mod tests {
         let db = test_db();
         let csv = b"2,3,0,\"b:okay\"\ninvalid\n18446744073709551615,0,0,\"b:bad\"\n\xff\n\n";
         assert_eq!(db.import_counted(Cursor::new(csv)).unwrap(), (1, 3));
-        db.conn.execute("INSERT INTO tokens (word) VALUES (?1)", ["bad\"word"]).unwrap();
-        db.conn.execute("INSERT INTO tokens (word) VALUES (?1)", ["bad\nword"]).unwrap();
+        db.conn
+            .execute("INSERT INTO tokens (word) VALUES (?1)", ["bad\"word"])
+            .unwrap();
+        db.conn
+            .execute("INSERT INTO tokens (word) VALUES (?1)", ["bad\nword"])
+            .unwrap();
         let mut csv = Vec::new();
         assert_eq!(db.export_counted(&mut csv).unwrap(), 2);
         assert!(String::from_utf8(csv).unwrap().contains("2,3,0,\"b:okay\""));
@@ -732,11 +736,18 @@ mod tests {
     #[test]
     fn schema_is_untrusted_and_duplicate_rows_cannot_underflow_untrain() {
         let db = test_db();
-        let trusted: i64 = db.conn.query_row("PRAGMA trusted_schema", [], |r| r.get(0)).unwrap();
+        let trusted: i64 = db
+            .conn
+            .query_row("PRAGMA trusted_schema", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(trusted, 0);
-        db.conn.execute_batch("DROP TABLE tokens;
+        db.conn
+            .execute_batch(
+                "DROP TABLE tokens;
             CREATE TABLE tokens (word TEXT, good INTEGER, spam INTEGER, last_seen INTEGER);
-            INSERT INTO tokens VALUES ('b:duplicate', 0, 1, 0), ('b:duplicate', 0, 1, 0);").unwrap();
+            INSERT INTO tokens VALUES ('b:duplicate', 0, 1, 0), ('b:duplicate', 0, 1, 0);",
+            )
+            .unwrap();
         let outcome = db.untrain(&["b:duplicate".into()], true).unwrap();
         assert_eq!(outcome.decremented, 2);
         assert_eq!(outcome.stranded, 0);
