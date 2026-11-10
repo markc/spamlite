@@ -654,8 +654,18 @@ fn read_existing_params(path: &Path) -> std::io::Result<String> {
             "params.toml is not a regular file",
         ));
     }
+    // Same 64 KiB cap as the classifier (`scoring::read_params`): a larger
+    // file is ignored at delivery, so rewriting it would install a tuned
+    // config that never takes effect, and reading it unbounded as root is a
+    // memory hazard in itself.
     let mut body = String::new();
-    file.read_to_string(&mut body)?;
+    (&mut file).take(65_537).read_to_string(&mut body)?;
+    if body.len() > 65_536 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "params.toml exceeds the 64 KiB limit",
+        ));
+    }
     Ok(body)
 }
 
