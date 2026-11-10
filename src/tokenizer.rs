@@ -449,8 +449,9 @@ pub fn tokenize_with_config(raw: &[u8], config: &TokenizerConfig) -> Vec<String>
             }
         }
 
-        // Strip HTML and tokenize text
-        let text = nanohtml2text::html2text(html);
+        // Strip HTML and tokenize text. In-tree stripper: the upstream one can
+        // be driven into a stack overflow or quadratic time (see `html.rs`).
+        let text = crate::html::html_to_text(html);
         for w in extract_words(&text) {
             if tokens.len() >= MAX_RAW_TOKENS {
                 break;

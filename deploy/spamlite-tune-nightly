@@ -60,7 +60,11 @@ for each $dbfile in $dbs
 
     $cmd = "ionice -c3 nice -n19 " .. $TUNE .. " -d " .. shell_quote($sl_dir)
     $cmd = $cmd .. " --ham " .. shell_quote($ham) .. " --spam " .. shell_quote($spam)
-    $cmd = $cmd .. " --baseline-threshold 0.6 --limit 4000 --json --write"
+    -- 0.5 is what the spamfilter wrapper passes (-t 0.5) to every user without
+    -- a params.toml; a user who has one is baselined on their own file. The
+    -- baseline was 0.6, a threshold no user ran, so the "improves on baseline"
+    -- gate compared candidates against a config that was not in production.
+    $cmd = $cmd .. " --baseline-threshold 0.5 --limit 4000 --json --write"
     $r = run_rc($cmd)
     $done = $done + 1
 

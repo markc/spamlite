@@ -255,6 +255,30 @@ where
     }
 }
 
+/// Whether `receive` may auto-train a message it has just classified.
+///
+/// The score must be confident (outside the open band `(gate, 1.0 - gate)`)
+/// AND on the same side as the verdict being trained. The verdict comes from
+/// the per-user threshold, which need not sit inside the band: at threshold
+/// 0.9 with the default gate, a message scoring 0.85 is GOOD yet confidently
+/// spam-leaning, and training it as ham would reinforce the very mail a raised
+/// threshold is letting through.
+///
+/// `gate <= 0.0` means the trusted region is empty and training is disabled.
+/// It is checked explicitly because a Fisher-saturated score of exactly 0.0 or
+/// 1.0 would otherwise still qualify, and saturated verdicts are precisely the
+/// ones a read-only gate must not auto-train on.
+fn receive_should_train(score: f64, is_spam: bool, gate: f64) -> bool {
+    if gate <= 0.0 {
+        return false;
+    }
+    if is_spam {
+        score >= 1.0 - gate
+    } else {
+        score <= gate
+    }
+}
+
 fn cmd_receive() {
     let raw = read_stdin();
     let gate = TOE_GATE.get().copied().unwrap_or(TOE_GATE_DEFAULT);
@@ -264,7 +288,10 @@ fn cmd_receive() {
     let classified = receive_phase1(
         move || tokenizer::tokenize_env(&raw),
         |tokens| {
-            let db = open_db();
+            // Opened through `?`, not `open_db()`: that helper calls
+            // `process::exit`, which `catch_unwind` cannot intercept, so a busy
+            // or unopenable database left sieve with an empty verdict and rc 1.
+            let db = Database::open(&db_path())?;
             let params = make_params();
             scoring::classify(&db, &tokens, &params).map(|(verdict, score)| {
                 let is_spam = matches!(verdict, scoring::Verdict::Spam);
@@ -285,12 +312,7 @@ fn cmd_receive() {
     // contract is preserved even if the training write fails.
     print!("{output}");
 
-    // gate <= 0.0 means the trusted region is empty — training fully
-    // disabled. Checked explicitly because a Fisher-saturated score of
-    // exactly 0.0 or 1.0 falls OUTSIDE the open band below and would
-    // otherwise still train, and saturated verdicts are precisely the ones
-    // a read-only gate must not auto-train on.
-    if gate <= 0.0 || (score > gate && score < (1.0 - gate)) {
+    if !receive_should_train(score, is_spam, gate) {
         return;
     }
 
@@ -1058,6 +1080,47 @@ mod tests {
             |_tokens| -> Result<(), &'static str> { Ok(()) },
         );
         assert_eq!(guarded, Err(FAIL_OPEN_VERDICT));
+    }
+
+    #[test]
+    fn receive_database_open_failure_uses_neutral_fail_open_verdict() {
+        // A regular file where the database's parent directory should be: the
+        // open cannot succeed, and must surface as an error, not an exit.
+        let blocker = std::env::temp_dir().join(format!(
+            "spamlite-receive-open-fail-{}-{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("db.sqlite");
+        let guarded = receive_phase1(Vec::new, move |_tokens: Vec<String>| {
+            Database::open(&path).map(|_| ())
+        });
+        let _ = std::fs::remove_file(&blocker);
+        assert_eq!(guarded, Err(FAIL_OPEN_VERDICT));
+    }
+
+    #[test]
+    fn receive_trains_only_when_confidence_agrees_with_the_verdict() {
+        let gate = 0.2;
+        // Confident and on the verdict's side: train.
+        assert!(receive_should_train(0.95, true, gate));
+        assert!(receive_should_train(0.05, false, gate));
+        assert!(receive_should_train(0.8, true, gate));
+        assert!(receive_should_train(0.2, false, gate));
+        // Inside the unsure band: never.
+        assert!(!receive_should_train(0.5, true, gate));
+        assert!(!receive_should_train(0.5, false, gate));
+        // Raised threshold: GOOD by verdict but confidently spam-leaning.
+        assert!(!receive_should_train(0.85, false, gate));
+        // Lowered threshold: SPAM by verdict but confidently ham-leaning.
+        assert!(!receive_should_train(0.15, true, gate));
+        // A closed gate disables training, saturated scores included.
+        assert!(!receive_should_train(1.0, true, 0.0));
+        assert!(!receive_should_train(0.0, false, 0.0));
     }
 
     #[test]

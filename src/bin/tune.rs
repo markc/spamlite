@@ -70,7 +70,8 @@ fn usage_and_exit() -> ! {
          spamlite-tune -d DB_DIR --ham PATH[,PATH...] --spam PATH[,PATH...] [options]\n\
          \n\
          Options:\n  \
-         --baseline-threshold T   threshold to compare against (production = 0.6)\n  \
+         --baseline-threshold T   threshold to compare against when the user has no\n                           \
+         params.toml (default 0.5, the delivery default)\n  \
          --write                  write best params to <db_dir>/params.toml\n  \
          --json                   single-line JSON output\n  \
          --limit N                stop after N messages per folder"
@@ -83,7 +84,7 @@ fn parse_args() -> Args {
     let mut db_dir: Option<PathBuf> = None;
     let mut ham_paths: Vec<PathBuf> = Vec::new();
     let mut spam_paths: Vec<PathBuf> = Vec::new();
-    let mut baseline_threshold = 0.6;
+    let mut baseline_threshold = 0.5;
     let mut holdout = 0.20;
     let mut write = false;
     let mut json = false;

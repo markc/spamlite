@@ -406,10 +406,15 @@ while $u < len($users)
           while $ai < len($all)
             $ps = split($all[$ai], "/")
             $b = $ps[len($ps) - 1]
+            -- A basename that does not start with an epoch (a file dropped in
+            -- by hand, a client's temp name) gives nil, and comparing nil
+            -- raised and ended the run for every remaining user.
             $e = to_number(substr($b, 0, 10))
-            if $e >= $HAM_LO then
-              if $e <= $HAM_HI then
-                push($inbox, $all[$ai])
+            if $e != nil then
+              if $e >= $HAM_LO then
+                if $e <= $HAM_HI then
+                  push($inbox, $all[$ai])
+                end
               end
             end
             $ai = $ai + 1
@@ -1077,6 +1082,7 @@ while $u < len($users)
               $tl = split(strip($tr.stdout), "\n")
             end
             $warned_corr = 0
+            $logbuf = ""
             $tli = 0
             while $tli < len($tl)
               $p = split($tl[$tli], "\t")
@@ -1102,7 +1108,7 @@ while $u < len($users)
                     end
                     $key = $key_bn[$bn]
                     if $key != nil then
-                      append_file($log, $cls .. " " .. $NOW .. " " .. $key .. "\n")
+                      $logbuf = $logbuf .. $cls .. " " .. $NOW .. " " .. $key .. "\n"
                       if $cls == "S" then
                         $ns = $ns + 1
                       else
@@ -1129,6 +1135,24 @@ while $u < len($users)
               end
               $tli = $tli + 1
             end
+            -- Sidecar rows for this chunk, written AS THE DATABASE OWNER and
+            -- never as root: .spamlite/ is writable by the mail user, so
+            -- reconciled.log can be a planted symlink, and root appending
+            -- through it wrote sender-influenced keys into any file on the
+            -- system. Every row here is already committed by train-dir.
+            -- The owner is read without following a link (a link the user
+            -- planted is owned by the user), and root is refused outright.
+            if $logbuf != "" then
+              $dbst = stat($db .. "/db.sqlite", {follow_symlinks: false})
+              if $dbst.uid == 0 then
+                print("WARN: " .. $db .. "/db.sqlite is root-owned; sidecar NOT written for " .. $d .. " (rows trained but not recorded; fix the ownership)")
+              else
+                $lw = run_argv(["setpriv", "--reuid", to_string($dbst.uid), "--regid", to_string($dbst.gid), "--clear-groups", "tee", "-a", "--", $log], {stdin: $logbuf, stdout: "null"})
+                if $lw.exit_code != 0 then
+                  print("WARN: sidecar append failed for " .. $d .. " (rows trained but not recorded): " .. first_line($lw.stderr))
+                end
+              end
+            end
             $fail = $fail + (len($sel) - $stage_fail - len($tl))
             remove_dir($sd)
           end
@@ -1146,7 +1170,11 @@ while $u < len($users)
       end
       print($d .. " [" .. $modetag .. "]: junk=" .. $njunk .. " inbox-window=" .. $nham .. " filed-window=" .. $nfiled .. " | " .. $verb .. " spam=" .. $ns .. " good=" .. $ng .. " (corrective=" .. $ncorr .. " decremented=" .. $ndec .. " stranded=" .. $nstrand .. ") | already=" .. $skip_done .. " frozen=" .. $skip_frozen .. " conflict=" .. $skip_conflict .. " dup=" .. $skip_dup .. " own-from=" .. $skip_own .. " deferred=" .. $defer .. " failed=" .. $fail .. $skipped_junk_summary .. $filed_note)
 
-      -- root-run hygiene: give WAL/shm/log back to the mail user
+      -- root-run hygiene: give WAL/shm back to the mail user. -h changes a
+      -- symlink itself, never its target: these names live in a directory the
+      -- mail user can write, and without it a planted db.sqlite-wal link gave
+      -- that user ownership of whatever it pointed at. The sidecar log is no
+      -- longer listed; it is written as the owner above.
       if $DRY == 0 then
         $own = []
         if is_file($db .. "/db.sqlite-wal") then
@@ -1155,11 +1183,8 @@ while $u < len($users)
         if is_file($db .. "/db.sqlite-shm") then
           push($own, $db .. "/db.sqlite-shm")
         end
-        if is_file($log) then
-          push($own, $log)
-        end
         if len($own) > 0 then
-          run_argv(concat(["chown", "--reference=" .. $db .. "/db.sqlite"], $own))
+          $chown_r = run_argv(concat(["chown", "-h", "--reference=" .. $db .. "/db.sqlite"], $own))
         end
       end
     end

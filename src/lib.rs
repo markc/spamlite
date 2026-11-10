@@ -11,6 +11,7 @@
 //! configuration-file reads; its only filesystem access is the SQLite
 //! database itself and its parent directory.
 
+mod html;
 pub mod scoring;
 pub mod storage;
 pub mod tokenizer;

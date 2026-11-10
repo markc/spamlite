@@ -96,6 +96,20 @@ pub mod schema {
             ) WITHOUT ROWID;",
         )?;
 
+        // Seed the meta rows only when one is missing. `INSERT OR IGNORE` takes
+        // the write lock even when it inserts nothing, so running it on every
+        // open made each read-only `score` queue behind a training transaction
+        // and fail open once its busy timeout expired. On an initialised
+        // database everything above and this probe are reads, which WAL lets
+        // through while a writer holds the lock.
+        let seeded: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM meta WHERE key IN ('total_good', 'total_spam', 'version')",
+            [],
+            |row| row.get(0),
+        )?;
+        if seeded == 3 {
+            return Ok(());
+        }
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('total_good', '0')",
             [],
@@ -397,6 +411,9 @@ pub mod ops {
         Ok(())
     }
 
+    /// Largest per-line count `import` accepts; see the check in `import`.
+    const MAX_IMPORT_COUNT: u64 = 1_000_000_000_000;
+
     pub fn import<R: BufRead>(tx: &Transaction<'_>, reader: R) -> SqlResult<u64> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -417,6 +434,15 @@ pub mod ops {
                 continue;
             }
             if let Some((good, spam, word)) = super::parse_csv_line(line) {
+                // Counts are stored as SQLite INTEGER (i64). A value above
+                // i64::MAX used to wrap negative through `as i64`, and lookup
+                // then read it back as a count near 1.8e19; a merely huge one
+                // overflowed `good + ?` into a REAL that no later read could
+                // decode. No real corpus is within orders of magnitude of the
+                // cap, so such a line is malformed and is skipped like one.
+                if good > MAX_IMPORT_COUNT || spam > MAX_IMPORT_COUNT {
+                    continue;
+                }
                 if word == "__total__" {
                     tx.execute(
                         "INSERT INTO meta (key, value) VALUES ('total_good', ?1)
@@ -1107,6 +1133,81 @@ mod tests {
     }
 
     #[test]
+    fn open_does_not_wait_for_a_writer_on_an_initialised_database() {
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        struct TempDirGuard(std::path::PathBuf);
+
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "spamlite-open-no-write-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _guard = TempDirGuard(root.clone());
+        let path = root.join("db.sqlite");
+        let holder = Database::open(&path).unwrap();
+        holder.train_message(&["b:word".to_string()], true).unwrap();
+
+        // A long training transaction (a reconciler chunk) holds the write
+        // lock. Delivery-path opens must read straight through it: before
+        // this, each open ran three meta upserts and so waited out its whole
+        // busy timeout and failed open as GOOD.
+        let holder_tx = ops::begin_immediate(&holder.conn).unwrap();
+
+        let started = Instant::now();
+        let reader = Database::open_existing_with_busy_timeout(&path, 3_000)
+            .expect("open_existing must not need the write lock");
+        assert_eq!(reader.total_spam().unwrap(), 1);
+        let creating = Database::open_with_busy_timeout(&path, 3_000)
+            .expect("open must not need the write lock once initialised");
+        assert_eq!(creating.total_spam().unwrap(), 1);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "opens waited on the held write lock: {elapsed:?}"
+        );
+
+        holder_tx.commit().unwrap();
+    }
+
+    #[test]
+    fn import_rejects_counts_that_cannot_be_stored() {
+        let db = test_db();
+        let csv = "5,7,0,\"__total__\"\n\
+                   18446744073709551615,0,0,\"b:wrapped\"\n\
+                   0,9223372036854775808,0,\"b:overflow\"\n\
+                   18446744073709551615,1,0,\"__total__\"\n\
+                   3,4,0,\"b:fine\"\n";
+        let count = db.import(Cursor::new(csv)).unwrap();
+        assert_eq!(count, 1, "only the well-formed token line is imported");
+        assert_eq!(db.total_good().unwrap(), 5);
+        assert_eq!(db.total_spam().unwrap(), 7);
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM tokens", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        let negative: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tokens WHERE good < 0 OR spam < 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(negative, 0);
+    }
+
+    #[test]
     fn configured_busy_timeout_applies_during_schema_init() {
         use std::sync::mpsc;
         use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1129,11 +1230,19 @@ mod tests {
         ));
         let _guard = TempDirGuard(root.clone());
         let path = root.join("db.sqlite");
-        let holder = Database::open(&path).unwrap();
+        // The holder is a bare WAL connection on a database with no schema
+        // yet: only then does init have anything to write. An initialised
+        // database is opened without taking the write lock at all (see
+        // `open_does_not_wait_for_a_writer_on_an_initialised_database`).
+        std::fs::create_dir_all(&root).unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("PRAGMA journal_mode = WAL;")
+            .unwrap();
 
-        // A short configured timeout must apply before init's idempotent
-        // schema/meta writes, rather than inheriting schema::init's 5 seconds.
-        let short_holder_tx = ops::begin_immediate(&holder.conn).unwrap();
+        // A short configured timeout must apply before init's schema/meta
+        // writes, rather than inheriting schema::init's 5 seconds.
+        let short_holder_tx = ops::begin_immediate(&holder).unwrap();
         let short_started = Instant::now();
         let short_result = Database::open_with_busy_timeout(&path, 500);
         let short_elapsed = short_started.elapsed();
@@ -1157,7 +1266,7 @@ mod tests {
 
         // Conversely, a 3-second constructor must keep waiting through init
         // until a 1.5-second holder releases the reserved lock.
-        let long_holder_tx = ops::begin_immediate(&holder.conn).unwrap();
+        let long_holder_tx = ops::begin_immediate(&holder).unwrap();
         let path_for_thread = path.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();

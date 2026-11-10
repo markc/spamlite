@@ -3,7 +3,7 @@
 
 [package]
 name = "spamlite"
-version = "0.9.7"
+version = "0.9.8"
 edition = "2021"
 description = "Per-user Bayesian spam filter — drop-in spamprobe replacement"
 license = "MIT OR Apache-2.0"

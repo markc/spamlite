@@ -16,13 +16,14 @@ if not exists ["Subject"] {
   stop;
 }
 
-# System addresses → Trash
-if header :contains "from" ["root@", "daemon@", "postmaster@"] {
+# System addresses → Trash. Matched on the parsed local part: a substring
+# test on the raw header ("root@") also caught beetroot@ and taproot@.
+if address :localpart :is "from" ["root", "daemon", "postmaster"] {
   debug_log "DELIVERY: ${lhs}@${rhs} -> Trash (system sender)";
   fileinto "Trash";
   stop;
 }
-if header :contains "to" ["root@", "daemon@", "postmaster@"] {
+if address :localpart :is "to" ["root", "daemon", "postmaster"] {
   debug_log "DELIVERY: ${lhs}@${rhs} -> Trash (system recipient)";
   fileinto "Trash";
   stop;
@@ -32,10 +33,15 @@ if header :contains "to" ["root@", "daemon@", "postmaster@"] {
 # `receive` would train on confident verdicts). Training comes from imapsieve
 # rescues and the nightly spamlite-reconcile.mix state reconciler.
 execute :pipe :output "SCORE" "spamlite" ["-d", "/home/u/${rhs}/home/${lhs}/.spamlite", "score"];
+# Drop any X-Spam-Status the sender supplied before adding ours, and decide on
+# the classifier's own output rather than on the header: otherwise a sender's
+# "X-Spam-Status: SPAM" forced Junk, and the stats collector (which reads the
+# first instance) counted the sender's claim instead of our verdict.
+deleteheader "X-Spam-Status";
 addheader :last "X-Spam-Status" "${SCORE}";
 
 # Spam → Junk
-if header :matches "X-Spam-Status" "SPAM*" {
+if string :matches "${SCORE}" "SPAM*" {
   debug_log "DELIVERY: ${lhs}@${rhs} -> Junk (${SCORE})";
   fileinto "Junk";
   stop;

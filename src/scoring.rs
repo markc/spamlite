@@ -558,7 +558,14 @@ pub fn score_fws(fws: &[f64], params: &Params) -> Option<Scored> {
     }
     let chosen: Vec<f64> = selected.iter().map(|&i| fws[i]).collect();
     let combined = combine(&chosen, params);
-    let verdict = if combined.score >= params.threshold {
+    // At or above the threshold is spam, with one exception: a combined score
+    // of exactly 0.5 is the combiner saying it has no net evidence (both
+    // Fisher tails saturated, or every token neutral), and every other
+    // no-evidence path (empty selection, classification error, panic) reports
+    // GOOD 0.5. Without this, the stock threshold of 0.5 turned that one
+    // no-evidence case into SPAM.
+    let no_evidence = combined.score == 0.5 && params.threshold == 0.5;
+    let verdict = if combined.score >= params.threshold && !no_evidence {
         Verdict::Spam
     } else {
         Verdict::Good
@@ -950,6 +957,36 @@ pub fn chi2_survival(x: f64, df: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saturated_fisher_tie_is_good_like_every_other_no_evidence_path() {
+        // 75 tokens pinned spam and 75 pinned ham: both chi-square tails
+        // underflow, the indicator is exactly 0.5, and at the stock threshold
+        // that used to read as SPAM while the empty-selection and fail-open
+        // paths reported GOOD 0.5.
+        let mut fws = vec![0.9995; 75];
+        fws.extend(vec![0.0005; 75]);
+        let params = Params::default();
+        let scored = score_fws(&fws, &params).expect("150 tokens are selected");
+        assert_eq!(scored.combined.score, 0.5);
+        assert_eq!(scored.verdict, Verdict::Good);
+
+        // The exception is the neutral point only: a threshold below it still
+        // classifies 0.5 as spam, and a real score at the threshold is spam.
+        let lowered = Params {
+            threshold: 0.4,
+            ..Params::default()
+        };
+        assert_eq!(score_fws(&fws, &lowered).unwrap().verdict, Verdict::Spam);
+        let spammy = vec![0.9995; 20];
+        let at_one = Params {
+            threshold: 1.0,
+            ..Params::default()
+        };
+        let scored = score_fws(&spammy, &at_one).unwrap();
+        assert_eq!(scored.combined.score, 1.0);
+        assert_eq!(scored.verdict, Verdict::Spam);
+    }
     use std::path::Path;
 
     fn setup_db() -> Database {

@@ -242,12 +242,15 @@ function process_user($home, $uid, $gid, $today, $force, $dry_run)
     return $summary
   end
 
-  append_file($stats_path, $encoded .. "\n")
-  try
-    chown($stats_path, $uid, $gid)
-    chmod($stats_path, 0o644)
-  catch $e
-    warn("chown " .. $stats_path .. ": " .. ("" .. $e))
+  -- Append AS THE MAIL USER, never as root. The home is writable by that user,
+  -- so the stats file can be swapped for a symlink at any moment; root used to
+  -- append through it and then chown/chmod the target, which handed any file
+  -- on the system (/etc/shadow) to the mail user. With the user's own
+  -- credentials a planted link reaches nothing the user could not already
+  -- write, and a new file is created user-owned 0644 without a chown.
+  $w = run_argv(["setpriv", "--reuid", to_string($uid), "--regid", to_string($gid), "--clear-groups", "tee", "-a", "--", $stats_path], {stdin: $encoded .. "\n", stdout: "null"})
+  if $w.exit_code != 0 then
+    raise("STATS_APPEND", "append " .. $stats_path .. " as uid " .. to_string($uid) .. " failed: " .. trim($w.stderr))
   end
   return $summary .. " db=" .. ("" .. $db[0]) .. "/" .. ("" .. $db[1]) .. "/" .. ("" .. $db[2])
 end
