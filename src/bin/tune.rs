@@ -575,7 +575,7 @@ fn write_params_toml(db_dir: &Path, params: &Params) -> std::io::Result<()> {
         }
     };
 
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let existing = read_existing_params(&path)?;
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
 
@@ -622,6 +622,33 @@ fn refuse_symlink(path: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+fn read_existing_params(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Linux O_NOFOLLOW | O_NONBLOCK: reject a symlink/FIFO swapped in
+        // after lstat, including during the preservation read before writing.
+        options.custom_flags(0o400000 | 0o4000);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "params.toml is not a regular file",
+        ));
+    }
+    let mut body = String::new();
+    file.read_to_string(&mut body)?;
+    Ok(body)
 }
 
 fn atomic_write_params(path: &Path, body: &[u8]) -> std::io::Result<()> {
@@ -871,6 +898,8 @@ mod tests {
         fs::remove_file(&path).unwrap();
         symlink(&target, &path).unwrap();
         assert!(write_params_toml(&dir, &Params::default()).is_err());
+        #[cfg(target_os = "linux")]
+        assert!(read_existing_params(&path).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
         fs::remove_dir_all(dir).unwrap();
     }
