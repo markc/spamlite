@@ -49,7 +49,7 @@ fn score_list($dir, $paths, $outfile)
   $out = ""
   $i = 0
   while $i < len($paths)
-    $r = run_argv_must([$SL, "-d", $dir, "score"], {stdin: {file: $paths[$i]}})
+    $r = run_argv_must([$SL, "-d", $dir, "score"], {stdin: {file: $paths[$i]}, timeout: 900})
     $f = split(strip($r), " ")
     if len($f) > 1 then $out = $out .. $f[1] .. "\t" .. $paths[$i] .. "\n" end
     $i = $i + 1
@@ -100,7 +100,7 @@ if $a[0] == "sweep" then
         $go = 0
       end
       if $go == 1 then
-        $ham_all = sort(split(strip(run_argv_must(["find", $d .. "/Maildir/cur", "-type", "f", "-newermt", "2026-03-20", "!", "-newermt", "2026-07-25"])), "\n"))
+        $ham_all = sort(split(strip(run_argv_must(["find", $d .. "/Maildir/cur", "-type", "f", "-newermt", "2026-03-20", "!", "-newermt", "2026-07-25"], {timeout: 600, max_output: 256 * 1024 * 1024})), "\n"))
         $ham = []
         $i = 0
         while $i < len($ham_all)
@@ -112,14 +112,14 @@ if $a[0] == "sweep" then
         else
           $ham = every_nth($ham, $HAM_CAP)
           $W = $ROOT .. "/" .. $tag
-          $checked = run_argv_must(["rm", "-rf", $W])
+          $checked = run_argv_must(["rm", "-rf", $W], {timeout: 600})
           mkdir($W)
           mkdir($W .. "/live")
           mkdir($W .. "/tuned")
-          $checked = run_argv_must(["sqlite3", $d .. "/.spamlite/db.sqlite", ".backup " .. $W .. "/live/db.sqlite"])
-          $checked = run_argv_must(["cp", $W .. "/live/db.sqlite", $W .. "/tuned/db.sqlite"])
+          $checked = run_argv_must(["sqlite3", $d .. "/.spamlite/db.sqlite", ".backup " .. $W .. "/live/db.sqlite"], {timeout: 600})
+          $checked = run_argv_must(["cp", $W .. "/live/db.sqlite", $W .. "/tuned/db.sqlite"], {timeout: 600})
           $pt = $d .. "/.spamlite/params.toml"
-          if is_file($pt) then $checked = run_argv_must(["cp", $pt, $W .. "/live/params.toml"]) end
+          if is_file($pt) then $checked = run_argv_must(["cp", $pt, $W .. "/live/params.toml"], {timeout: 300}) end
           write_file($W .. "/tuned/params.toml", $TUNED)
           write_file($W .. "/live-threshold", "" .. live_threshold($pt) .. "\n")
           score_list($W .. "/live", $ham, $W .. "/live.ham.scores")

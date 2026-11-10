@@ -137,7 +137,7 @@ for $login in sort(keys($by))
       $T.failed = $T.failed + 1
       continue
     end
-    $f2 = run_argv(["tail", "-n", "+2", "--", $raw], {stdout: {file: $stage .. "/" .. $kind .. "/" .. $i .. ".eml", mode: 384}})
+    $f2 = run_argv(["tail", "-n", "+2", "--", $raw], {timeout: 120, stdout: {file: $stage .. "/" .. $kind .. "/" .. $i .. ".eml", mode: 384}})
     $cleanup = run_argv(["rm", "-f", $raw])
     if $f2.exit_code != 0 then raise("STAGE_WRITE", $f2.stderr) end
     $uidof[$k] = $uid
@@ -151,7 +151,7 @@ for $login in sort(keys($by))
     $want[$c[1]] = true
   end
   for $sub in ["corr", "plain"]
-    for $l in lines(run_argv_must([$SL, "msgids", $stage .. "/" .. $sub]))
+    for $l in lines(run_argv_must([$SL, "msgids", $stage .. "/" .. $sub], {timeout: 900, max_output: 256 * 1024 * 1024}))
       $f = split($l, "\t")
       if len($f) >= 3 and not $want[lower(trim($f[0], "<> "))] then
         eprint("  msgid mismatch dropped: " .. $f[2])
@@ -159,7 +159,7 @@ for $login in sort(keys($by))
       end
     end
   end
-  $owned = run_argv_must(["chown", "-hR", to_string($identity.uid) .. ":" .. to_string($identity.gid), $stage])
+  $owned = run_argv_must(["chown", "-hR", to_string($identity.uid) .. ":" .. to_string($identity.gid), $stage], {timeout: 600})
   chmod($stage, 0o700)
   $nm = 0
   for $k in keys($moveit)
@@ -168,8 +168,8 @@ for $login in sort(keys($by))
   print($login .. ": retrain corr=" .. $nc .. " plain=" .. $np .. "  not-retrained=" .. $ns .. "  to-move=" .. $nm)
   if $mode != "apply" then remove_dir($stage); continue end
 
-  $checked = run_argv_must(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-" .. $STAMP .. "-rescue"])
-  if is_file($log) then $checked = run_argv_must(["cp", "-a", $log, $log .. ".bak-" .. $STAMP .. "-rescue"]) end
+  $checked = run_argv_must(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-" .. $STAMP .. "-rescue"], {timeout: 600})
+  if is_file($log) then $checked = run_argv_must(["cp", "-a", $log, $log .. ".bak-" .. $STAMP .. "-rescue"], {timeout: 600}) end
   $trained = {}
   for $sub in ["corr", "plain"]
     $argv = [$SL, "-d", $db, "train-dir", "./" .. $sub, "good"]
@@ -177,16 +177,17 @@ for $login in sort(keys($by))
       $argv = concat($argv, ["--from", "spam"])
     end
     if len(ls($stage .. "/" .. $sub)) > 0 then
-      $tr = run_argv(concat(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups"], $argv), {timeout: 900, cwd: $stage})
-      if $tr.exit_code != 0 then
-        eprint("  TRAIN FAILED " .. $login .. " " .. $sub .. ": " .. strip($tr.stderr))
+      $tr = run_argv(concat(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups"], $argv), {timeout: 900, cwd: $stage, max_output: 256 * 1024 * 1024})
+      if not $tr.ok or $tr.stdout_truncated or $tr.stderr_truncated then
+        eprint("  TRAIN FAILED " .. $login .. " " .. $sub .. " timed_out=" .. $tr.timed_out .. " stdout_truncated=" .. $tr.stdout_truncated .. ": " .. strip($tr.stderr))
         $T.failed = $T.failed + 1
       end
       $now = "" .. floor(time())
       $add = ""
-      for $l in lines($tr.stdout)
+      -- Ignore a partial final row if the process timed out or capture filled.
+      for $l in slice(split($tr.stdout, "\n"), 0, -1)
         $f = split($l, "\t")
-        if $f[0] == "ok" then
+        if len($f) >= 3 and $f[0] == "ok" then
           $kk = lower(trim($f[1], "<> "))
           $add = $add .. "G " .. $now .. " " .. $kk .. "\n"
           $trained[$kk] = true

@@ -77,7 +77,7 @@ fn stage($login, $box, $n, $dir)
     $f = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $box, "uid", $uids[$i]], {stdout: {file: $raw}, timeout: 120})
     if $f.exit_code == 0 then
       $dst = $dir .. "/m" .. $uids[$i]
-      $s = run_argv(["tail", "-n", "+2", "--", $raw], {stdout: {file: $dst}})
+      $s = run_argv(["tail", "-n", "+2", "--", $raw], {timeout: 120, stdout: {file: $dst}})
       if $s.exit_code == 0 then
         push($out, $dst)
       end

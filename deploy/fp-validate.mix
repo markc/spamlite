@@ -68,8 +68,8 @@ fn cap1($pat, $s)
 end
 
 fn hdr($file, $name)
-  $r = run_argv(["grep", "-m1", "-i", "--", "^" .. $name .. ":", $file])
-  if $r.exit_code > 1 then raise("HEADER_READ", $r.stderr) end
+  $r = run_argv(["grep", "-m1", "-i", "--", "^" .. $name .. ":", $file], {timeout: 120, max_output: 64 * 1024 * 1024})
+  if $r.timed_out or (not $r.ok and $r.exit_code != 1) or $r.stdout_truncated then raise("HEADER_READ", $r.stderr) end
   $v = trim($r.stdout)
   if $v == "" then return "" end
   return trim(split($v, ":")[1] ?? "")
@@ -87,7 +87,7 @@ for each $addr in $addrs
   -- `grep -F '-> good'` looks like a FLAG to grep (the pattern starts with `-`) and
   -- silently matches nothing. Anchor the extraction on the msgid instead, so every
   -- pattern begins with a harmless character.
-  $journal = run_argv_must(["/usr/bin/journalctl", "--since", to_string($DAYS) .. " days ago", "--no-pager", "-g", "TRAIN: " .. $addr .. " "])
+  $journal = run_argv_must(["/usr/bin/journalctl", "--since", to_string($DAYS) .. " days ago", "--no-pager", "-g", "TRAIN: " .. $addr .. " "], {timeout: 600, max_output: 256 * 1024 * 1024})
   $mids = []
   $seen = {}
   for each $l in lines($journal)
@@ -115,8 +115,8 @@ for each $addr in $addrs
     $pf = $scratch .. "/mids"
     write_file($pf, join($mids, "\n") .. "\n")
     chmod($pf, 0o600)
-    $found = run_argv(["find", $home .. "/Maildir", "-type", "d", "(", "-name", "cur", "-o", "-name", "new", ")", "-exec", "grep", "-r", "-l", "-F", "-f", $pf, "--", "{}", ";"])
-    if $found.exit_code != 0 then raise("FIND_FAILED", $found.stderr) end
+    $found = run_argv(["find", $home .. "/Maildir", "-type", "d", "(", "-name", "cur", "-o", "-name", "new", ")", "-exec", "grep", "-r", "-l", "-F", "-f", $pf, "--", "{}", ";"], {timeout: 900, max_output: 256 * 1024 * 1024})
+    if not $found.ok or $found.stdout_truncated then raise("FIND_FAILED", $found.stderr) end
     $hits = []
     for each $p in split(trim($found.stdout), "\n")
       if trim($p) != "" then push($hits, trim($p)) end
@@ -180,7 +180,7 @@ for each $addr in $addrs
 
     -- Regression set: INBOX mail that was NOT rescued, i.e. the filter already got it
     -- right. The fix must not push any of these over the line. Newest first, capped.
-    $inb = run_argv_must(["find", $home .. "/Maildir/cur", "-maxdepth", "1", "-type", "f", "-printf", "%T@ %p\n"])
+    $inb = run_argv_must(["find", $home .. "/Maildir/cur", "-maxdepth", "1", "-type", "f", "-printf", "%T@ %p\n"], {timeout: 600, max_output: 256 * 1024 * 1024})
     $newest = reverse(sort_by(lines($inb), fn($l) = to_number(split($l, " ")[0])))
     -- Exclude the rescued messages themselves: a rescue LANDS in INBOX, so leaving them
     -- in would double-count the very messages watch.list is measuring and mask a real

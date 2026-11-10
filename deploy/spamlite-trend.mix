@@ -58,16 +58,16 @@ if len($logs) > 0 then
   $scratch = private_stage()
   try
     $expanded = $scratch .. "/logs"
-    $z = run_argv_must(concat(["zcat", "-f", "--"], $logs), {stdout: {file: $expanded}})
-    $g = run_argv(["grep", "-a", "-F", "--", $U, $expanded])
-    if $g.exit_code != 0 and $g.exit_code != 1 then raise("LOG_READ", $g.stderr) end
+    $z = run_argv_must(concat(["zcat", "-f", "--"], $logs), {stdout: {file: $expanded}, timeout: 900})
+    $g = run_argv(["grep", "-a", "-F", "--", $U, $expanded], {timeout: 600, max_output: 256 * 1024 * 1024})
+    if $g.timed_out or (not $g.ok and $g.exit_code != 1) then raise("LOG_READ", $g.stderr) end
     if $g.stdout_truncated then raise("LOG_LIMIT", "user log output truncated") end
     $raw = $g.stdout
   finally
     remove_dir($scratch)
   end
 else
-  $raw = run_argv_must(["journalctl", "--since", $SINCE, "--no-pager", "-o", "short-iso", "-g", $U])
+  $raw = run_argv_must(["journalctl", "--since", $SINCE, "--no-pager", "-o", "short-iso", "-g", $U], {timeout: 600, max_output: 256 * 1024 * 1024})
 end
 
 $days = {}

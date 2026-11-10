@@ -220,7 +220,7 @@ for $dom in ls("/srv")
                 $raw = $W .. "/msg/raw"
                 $t1 = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $mb, "uid", $rec["uid"]], {stdout: {file: $raw}, timeout: 60})
                 if $t1.exit_code == 0 then
-                  $checked = run_argv_must(["tail", "-n", "+2", "--", $raw], {stdout: {file: $mf, mode: 384}})
+                  $checked = run_argv_must(["tail", "-n", "+2", "--", $raw], {timeout: 120, stdout: {file: $mf, mode: 384}})
                   $s = as_owner($owner, [$SL, "-d", $db, "score"], {stdin: {file: $mf}, timeout: 60})
                   if $s.exit_code == 0 then $sc = strip($s.stdout) end
                 end

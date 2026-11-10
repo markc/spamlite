@@ -364,7 +364,7 @@ else
   -- Trash BEFORE scoring, so this spam-subject-laden report never pollutes
   -- the corpus. Recipients check Trash for it (same as bounces). 2026-08-23.
   write_file($eml, "To: " .. $TO .. "\n" .. $cc .. "From: root@" .. $fqdn .. "\nSubject: spamlite daily review " .. $U .. "\n\n" .. $r)
-  $sent = run_argv_must(["/usr/sbin/sendmail", "-oi", "-t"], {stdin: {file: $eml}})
+  $sent = run_argv_must(["/usr/sbin/sendmail", "-oi", "-t"], {stdin: {file: $eml}, timeout: 300})
   remove_dir($stage)
   write_file($BASE, strip($st.stdout) .. "\n")
   print("emailed + baseline refreshed " .. $ts)

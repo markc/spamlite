@@ -208,7 +208,7 @@ function apply()
         $raw = $stage .. "/raw"
         $f1 = run_argv(["doveadm", "fetch", "-u", $login, "text", "mailbox", $c[1], "uid", $uid], {stdout: {file: $raw}, timeout: 120})
         if $f1.exit_code == 0 then
-          $f2 = run_argv(["tail", "-n", "+2", "--", $raw], {stdout: {file: $stage .. "/" .. $i .. ".eml"}})
+          $f2 = run_argv(["tail", "-n", "+2", "--", $raw], {timeout: 120, stdout: {file: $stage .. "/" .. $i .. ".eml"}})
           $ok = $f2.exit_code == 0
         end
         $cleanup = run_argv(["rm", "-f", $raw])
@@ -222,27 +222,28 @@ function apply()
     for $c in $by[$login]
       $wantk[$c[0]] = true
     end
-    for $l in lines(run_argv_must([$SL, "msgids", $stage]))
+    for $l in lines(run_argv_must([$SL, "msgids", $stage], {timeout: 900, max_output: 256 * 1024 * 1024}))
       $f = split($l, "\t")
       if len($f) >= 3 and not $wantk[lower(trim($f[0], "<> "))] then
         eprint("  msgid mismatch, dropped: " .. $f[2])
         $cleanup = run_argv(["rm", "-f", $f[2]])
       end
     end
-    $owned = run_argv_must(["chown", "-hR", to_string($identity.uid) .. ":" .. to_string($identity.gid), $stage])
+    $owned = run_argv_must(["chown", "-hR", to_string($identity.uid) .. ":" .. to_string($identity.gid), $stage], {timeout: 600})
     chmod($stage, 0o700)
-    $checked = run_argv_must(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-20260917-sweep"])
-    $checked = run_argv_must(["cp", "-a", $db .. "/reconciled.log", $db .. "/reconciled.log.bak-20260917-sweep"])
-    $r = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", $SL, "-d", $db, "train-dir", ".", "good", "--from", "spam"], {timeout: 900, cwd: $stage})
-    if $r.exit_code != 0 then
-      eprint("TRAIN FAILED " .. $login .. ": " .. trim($r.stderr))
+    $checked = run_argv_must(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-20260917-sweep"], {timeout: 600})
+    $checked = run_argv_must(["cp", "-a", $db .. "/reconciled.log", $db .. "/reconciled.log.bak-20260917-sweep"], {timeout: 600})
+    $r = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", $SL, "-d", $db, "train-dir", ".", "good", "--from", "spam"], {timeout: 900, cwd: $stage, max_output: 256 * 1024 * 1024})
+    if not $r.ok or $r.stdout_truncated or $r.stderr_truncated then
+      eprint("TRAIN FAILED " .. $login .. " timed_out=" .. $r.timed_out .. " stdout_truncated=" .. $r.stdout_truncated .. ": " .. trim($r.stderr))
     else
       $now = "" .. floor(time())
       $add = ""
       $ok = 0
-      for $l in lines($r.stdout)
+      -- Ignore a partial final row if the process timed out or capture filled.
+      for $l in slice(split($r.stdout, "\n"), 0, -1)
         $f = split($l, "\t")
-        if $f[0] == "ok" then
+        if len($f) >= 3 and $f[0] == "ok" then
           $add = $add .. "G " .. $now .. " " .. lower(trim($f[1], "<> ")) .. "\n"
           $ok = $ok + 1
         end

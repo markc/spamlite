@@ -134,10 +134,11 @@ mkdir($STAGE)
 for $path in $paths
   symlink($path, $STAGE .. "/" .. basename($path))
 end
-$tr = run_argv([$SL, "-d", $db, "train-dir", $STAGE, "good", "--sent"], {timeout: 1800})
+$tr = run_argv([$SL, "-d", $db, "train-dir", $STAGE, "good", "--sent"], {timeout: 1800, max_output: 256 * 1024 * 1024})
 $ok = 0
 $fail = 0
-$tl = split(strip($tr.stdout), "\n")
+-- Process complete reported rows only, including on a timeout.
+$tl = slice(split($tr.stdout, "\n"), 0, -1)
 $i = 0
 while $i < len($tl)
   $p = split($tl[$i], "\t")
@@ -158,8 +159,9 @@ while $i < len($tl)
   end
   $i = $i + 1
 end
-print("train-dir exit=" .. $tr.exit_code .. " ok=" .. $ok .. " fail=" .. $fail)
+print("train-dir timed_out=" .. $tr.timed_out .. " stdout_truncated=" .. $tr.stdout_truncated .. " exit=" .. $tr.exit_code .. " ok=" .. $ok .. " fail=" .. $fail)
 if strip($tr.stderr) != "" then print("stderr: " .. strip($tr.stderr)) end
 remove_dir($STAGE)
-$checked = run_argv_must(["chown", "-hR", $OWNER, $db])
+$checked = run_argv_must(["chown", "-hR", $OWNER, $db], {timeout: 600})
+if not $tr.ok or $tr.stdout_truncated or $tr.stderr_truncated then raise("TRAIN_FAILED", "Sent training incomplete; only complete reported ok rows recorded") end
 print(run_argv([$SL, "-d", $db, "stats"]).stdout)

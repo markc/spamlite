@@ -96,15 +96,15 @@ $hamlist = $a[5]
 $spamlist = $a[6]
 $dir = $W .. "/" .. $arm
 
-$checked = run_argv_must(["rm", "-rf", $dir])
+$checked = run_argv_must(["rm", "-rf", $dir], {timeout: 600})
 if $base == "live" then
-  $checked = run_argv_must(["cp", "-a", $W .. "/base", $dir])
+  $checked = run_argv_must(["cp", "-a", $W .. "/base", $dir], {timeout: 600})
   $checked = run_argv_must(["rm", "-f", $dir .. "/params.toml", $dir .. "/reconciled.log", $dir .. "/db.sqlite-wal", $dir .. "/db.sqlite-shm"])
 else
   mkdir($dir)
-  $imported = run_argv_must([$SL, "-d", $dir, "import"], {stdin: {null: true}})
+  $imported = run_argv_must([$SL, "-d", $dir, "import"], {stdin: {null: true}, timeout: 1800})
 end
-if $params != "-" then $checked = run_argv_must(["cp", $params, $dir .. "/params.toml"]) end
+if $params != "-" then $checked = run_argv_must(["cp", $params, $dir .. "/params.toml"], {timeout: 300}) end
 
 fn train($dir, $list, $cls)
   $paths = readlist($list)
@@ -121,10 +121,10 @@ fn train($dir, $list, $cls)
       push($chunk, $paths[$k])
       $k = $k + 1
     end
-    $checked = run_argv_must(concat(["ln", "-s", "-t", $stage], $chunk))
+    $checked = run_argv_must(concat(["ln", "-s", "-t", $stage], $chunk), {timeout: 300})
     $i = $j
   end
-  $tr = run_argv([$SL, "-d", $dir, "train-dir", $stage, $cls], {timeout: 3600})
+  $tr = run_argv([$SL, "-d", $dir, "train-dir", $stage, $cls], {timeout: 3600, max_output: 256 * 1024 * 1024})
   $ok = 0
   $fail = 0
   $tl = split(strip($tr.stdout), "\n")
