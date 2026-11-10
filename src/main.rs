@@ -25,8 +25,7 @@ static THRESHOLD: OnceLock<f64> = OnceLock::new();
 /// - `0.2` (default) — trusted = `[0, 0.2] ∪ [0.8, 1]` → train confident verdicts, skip uncertain
 /// - `0.5` — trusted region covers `[0, 1]` → pure TOE, train on everything
 ///
-/// Default `0.2` is a reasonable starting point but should be revisited once
-/// using explain to measure the actual score distribution
+/// Default `0.2` is a starting point; use explain to measure score distributions
 /// on `admin_maildir/` and the production cluster. The right gate width
 /// depends on how well-calibrated spamlite's scores are on this mail mix,
 /// which is an empirical question, not a guess.
@@ -1277,6 +1276,24 @@ mod tests {
     #[test]
     fn message_reader_refuses_non_regular_open_handle() {
         assert!(read_message_file(&std::env::temp_dir()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn message_reader_refuses_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = std::env::temp_dir().join(format!("spamlite-fifo-{}", process::id()));
+        assert!(process::Command::new("mkfifo").arg(&path).status().unwrap().success());
+        let writer_path = path.clone();
+        // Release a blocking pre-fix reader so the regression fails without hanging.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = std::fs::OpenOptions::new().write(true).custom_flags(0o4000).open(writer_path);
+        });
+        let result = read_message_file(&path);
+        writer.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_err());
     }
 
     #[test]

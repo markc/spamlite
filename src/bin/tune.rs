@@ -88,7 +88,14 @@ mod database_open_tests {
     use super::*;
     #[test]
     fn missing_corpus_is_not_created() {
-        let dir = std::env::temp_dir().join(format!("spamlite-missing-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "spamlite-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let path = dir.join("db.sqlite");
         assert!(open_evaluation_db(&path).is_err());
         assert!(!path.exists());
@@ -151,11 +158,11 @@ fn parse_args() -> Args {
                 i += 2;
             }
             "--baseline-threshold" => {
-                baseline_threshold = parse_number(need(i, a), a);
+                baseline_threshold = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--holdout" => {
-                holdout = parse_number(need(i, a), a);
+                holdout = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--write" => {
@@ -167,15 +174,15 @@ fn parse_args() -> Args {
                 i += 1;
             }
             "--limit" => {
-                limit = Some(parse_number(need(i, a), a));
+                limit = Some(parse_number(&need(i, a), a));
                 i += 2;
             }
             "--fp-weight" => {
-                fp_weight = parse_number(need(i, a), a);
+                fp_weight = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-test-spam" => {
-                min_test_spam = parse_number(need(i, a), a);
+                min_test_spam = parse_number(&need(i, a), a);
                 i += 2;
             }
             "-h" | "--help" | "help" => usage_and_exit(),
@@ -845,6 +852,7 @@ mod tests {
     #[test]
     fn search_keeps_effective_unmanaged_baseline() {
         let baseline = Params {
+            combine_mode: scoring::CombineMode::Geometric,
             new_word_score: 0.23,
             min_distance: 0.12,
             min_array_size: 7,
@@ -852,6 +860,7 @@ mod tests {
             ..Default::default()
         };
         let (best, _) = tune(&[], 1, 1, 1.0, &baseline);
+        assert_eq!(best.combine_mode, baseline.combine_mode);
         assert_eq!(best.new_word_score, baseline.new_word_score);
         assert_eq!(best.min_distance, baseline.min_distance);
         assert_eq!(best.min_array_size, baseline.min_array_size);

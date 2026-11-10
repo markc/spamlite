@@ -78,7 +78,14 @@ mod database_open_tests {
     use super::*;
     #[test]
     fn missing_corpus_is_not_created() {
-        let dir = std::env::temp_dir().join(format!("spamlite-missing-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "spamlite-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let path = dir.join("db.sqlite");
         assert!(open_evaluation_db(&path).is_err());
         assert!(!path.exists());
@@ -150,23 +157,23 @@ fn parse_args() -> Args {
                 i += 2;
             }
             "--max-interesting" => {
-                params.max_interesting = parse_number(need(i, a), a);
+                params.max_interesting = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--unknown-prob" => {
-                params.unknown_prob = parse_number(need(i, a), a);
+                params.unknown_prob = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--good-bias" => {
-                params.good_bias = parse_number(need(i, a), a);
+                params.good_bias = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-word-count" => {
-                params.min_word_count = parse_number(need(i, a), a);
+                params.min_word_count = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--strength" => {
-                params.strength = parse_number(need(i, a), a);
+                params.strength = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--combine-mode" => {
@@ -183,27 +190,27 @@ fn parse_args() -> Args {
                 i += 2;
             }
             "--new-word-score" => {
-                params.new_word_score = parse_number(need(i, a), a);
+                params.new_word_score = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-distance" => {
-                params.min_distance = parse_number(need(i, a), a);
+                params.min_distance = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-array-size" => {
-                params.min_array_size = parse_number(need(i, a), a);
+                params.min_array_size = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--threshold" | "-t" => {
-                params.threshold = parse_number(need(i, a), a);
+                params.threshold = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-len" => {
-                tok.min_len = parse_number(need(i, a), a);
+                tok.min_len = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--max-len" => {
-                tok.max_len = parse_number(need(i, a), a);
+                tok.max_len = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--expanded-headers" => {
@@ -215,11 +222,11 @@ fn parse_args() -> Args {
                 i += 1;
             }
             "--limit" => {
-                limit = Some(parse_number(need(i, a), a));
+                limit = Some(parse_number(&need(i, a), a));
                 i += 2;
             }
             "--show-errors" => {
-                show_errors = parse_number(need(i, a), a);
+                show_errors = parse_number(&need(i, a), a);
                 i += 2;
             }
             "-h" | "--help" | "help" => usage_and_exit(),
