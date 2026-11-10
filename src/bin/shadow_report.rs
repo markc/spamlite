@@ -112,6 +112,12 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+fn lossy_lines(reader: impl BufRead) -> impl Iterator<Item = std::io::Result<String>> {
+    reader
+        .split(b'\n')
+        .map(|line| line.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+}
+
 fn main() {
     let args = parse_args();
     let mut per_user: BTreeMap<String, UserStats> = BTreeMap::new();
@@ -123,7 +129,14 @@ fn main() {
             eprintln!("shadow-report: cannot open {}", path.display());
             continue;
         };
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
+        for line in lossy_lines(BufReader::new(file)) {
+            let line = match line {
+                Ok(line) => line,
+                Err(e) => {
+                    eprintln!("shadow-report: read error: {e}");
+                    break;
+                }
+            };
             total_lines += 1;
             let line = line.trim();
             if line.is_empty() {
@@ -261,5 +274,17 @@ fn main() {
             percentile(&deltas, 0.5),
             percentile(&deltas, 0.99)
         );
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    #[test]
+    fn invalid_utf8_does_not_stop_later_lines() {
+        let lines = lossy_lines(&b"bad\xff\nnext\n"[..])
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(lines, ["bad\u{fffd}", "next"]);
     }
 }

@@ -5,8 +5,8 @@
 //
 // Walks a maildir with user-supplied ham/spam folder labels, classifies every
 // message against an existing spamlite database under configurable parameters,
-// and reports a confusion matrix + score distribution. Read-only — never
-// writes to the database. Used to measure Phase 2 parameter changes against
+// and reports a confusion matrix + score distribution. Never trains or creates
+// a missing corpus; SQLite may initialise schema/WAL on open. Used to measure changes against
 // the `admin_maildir/` ground-truth corpus before committing.
 //
 // Usage:
@@ -69,6 +69,23 @@ fn usage_and_exit() -> ! {
     process::exit(2);
 }
 
+fn open_evaluation_db(path: &Path) -> Result<Database, String> {
+    Database::open_existing(path)
+}
+
+fn numeric_value<T: std::str::FromStr>(value: &str) -> Result<T, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid number: {value}"))
+}
+
+fn parse_number<T: std::str::FromStr>(value: &str, flag: &str) -> T {
+    numeric_value(value).unwrap_or_else(|e| {
+        eprintln!("usage error: {flag}: {e}");
+        std::process::exit(2);
+    })
+}
+
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
     let mut db_dir: Option<PathBuf> = None;
@@ -109,23 +126,23 @@ fn parse_args() -> Args {
                 i += 2;
             }
             "--max-interesting" => {
-                params.max_interesting = need(i, a).parse().expect("usize");
+                params.max_interesting = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--unknown-prob" => {
-                params.unknown_prob = need(i, a).parse().expect("f64");
+                params.unknown_prob = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--good-bias" => {
-                params.good_bias = need(i, a).parse().expect("f64");
+                params.good_bias = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-word-count" => {
-                params.min_word_count = need(i, a).parse().expect("u64");
+                params.min_word_count = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--strength" => {
-                params.strength = need(i, a).parse().expect("f64");
+                params.strength = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--combine-mode" => {
@@ -142,27 +159,27 @@ fn parse_args() -> Args {
                 i += 2;
             }
             "--new-word-score" => {
-                params.new_word_score = need(i, a).parse().expect("f64");
+                params.new_word_score = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-distance" => {
-                params.min_distance = need(i, a).parse().expect("f64");
+                params.min_distance = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-array-size" => {
-                params.min_array_size = need(i, a).parse().expect("usize");
+                params.min_array_size = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--threshold" | "-t" => {
-                params.threshold = need(i, a).parse().expect("f64");
+                params.threshold = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-len" => {
-                tok.min_len = need(i, a).parse().expect("usize");
+                tok.min_len = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--max-len" => {
-                tok.max_len = need(i, a).parse().expect("usize");
+                tok.max_len = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--expanded-headers" => {
@@ -174,11 +191,11 @@ fn parse_args() -> Args {
                 i += 1;
             }
             "--limit" => {
-                limit = Some(need(i, a).parse().expect("usize"));
+                limit = Some(parse_number(&need(i, a), a));
                 i += 2;
             }
             "--show-errors" => {
-                show_errors = need(i, a).parse().expect("usize");
+                show_errors = parse_number(&need(i, a), a);
                 i += 2;
             }
             "-h" | "--help" | "help" => usage_and_exit(),
@@ -294,7 +311,7 @@ fn main() {
     let args = parse_args();
 
     let db_path = args.db_dir.join("db.sqlite");
-    let db = Database::open(&db_path).unwrap_or_else(|e| {
+    let db = open_evaluation_db(&db_path).unwrap_or_else(|e| {
         eprintln!("spamlite-eval: open {}: {e}", db_path.display());
         process::exit(1);
     });
@@ -495,5 +512,36 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod database_open_tests {
+    use super::*;
+    #[test]
+    fn missing_corpus_is_not_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "spamlite-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("db.sqlite");
+        assert!(open_evaluation_db(&path).is_err());
+        assert!(!path.exists());
+        assert!(!dir.exists());
+    }
+}
+
+#[cfg(test)]
+mod numeric_tests {
+    use super::*;
+    #[test]
+    fn invalid_numbers_are_usage_errors() {
+        assert!(numeric_value::<f64>("oops").is_err());
+        assert!(numeric_value::<u64>("-1").is_err());
+        assert_eq!(numeric_value::<usize>("12").unwrap(), 12);
     }
 }

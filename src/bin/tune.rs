@@ -79,6 +79,23 @@ fn usage_and_exit() -> ! {
     process::exit(2);
 }
 
+fn open_evaluation_db(path: &Path) -> Result<Database, String> {
+    Database::open_existing(path)
+}
+
+fn numeric_value<T: std::str::FromStr>(value: &str) -> Result<T, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid number: {value}"))
+}
+
+fn parse_number<T: std::str::FromStr>(value: &str, flag: &str) -> T {
+    numeric_value(value).unwrap_or_else(|e| {
+        eprintln!("usage error: {flag}: {e}");
+        std::process::exit(2);
+    })
+}
+
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
     let mut db_dir: Option<PathBuf> = None;
@@ -121,11 +138,11 @@ fn parse_args() -> Args {
                 i += 2;
             }
             "--baseline-threshold" => {
-                baseline_threshold = need(i, a).parse().expect("f64");
+                baseline_threshold = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--holdout" => {
-                holdout = need(i, a).parse().expect("f64");
+                holdout = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--write" => {
@@ -137,15 +154,15 @@ fn parse_args() -> Args {
                 i += 1;
             }
             "--limit" => {
-                limit = Some(need(i, a).parse().expect("usize"));
+                limit = Some(parse_number(&need(i, a), a));
                 i += 2;
             }
             "--fp-weight" => {
-                fp_weight = need(i, a).parse().expect("f64");
+                fp_weight = parse_number(&need(i, a), a);
                 i += 2;
             }
             "--min-test-spam" => {
-                min_test_spam = need(i, a).parse().expect("usize");
+                min_test_spam = parse_number(&need(i, a), a);
                 i += 2;
             }
             "-h" | "--help" | "help" => usage_and_exit(),
@@ -371,6 +388,7 @@ fn tune(
     total_good: u64,
     total_spam: u64,
     fp_weight: f64,
+    baseline: &Params,
 ) -> (Params, EvalResult) {
     let threshold_grid = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85];
     let good_bias_grid = [1.0, 1.5, 2.0, 2.5, 3.0];
@@ -379,7 +397,7 @@ fn tune(
     let max_int_grid = [27usize, 50, 100, 150, 200];
     let mwc_grid = [0u64, 2, 5];
 
-    let mut best = Params::default();
+    let mut best = clone_params(baseline);
     let mut best_r = evaluate(samples, total_good, total_spam, &best);
 
     for round in 0..3 {
@@ -543,6 +561,7 @@ const MANAGED_KEYS: [&str; 6] = [
 /// corpus for the tuner to run on them, taking the comments with it.
 fn write_params_toml(db_dir: &Path, params: &Params) -> std::io::Result<()> {
     let path = db_dir.join("params.toml");
+    refuse_symlink(&path)?;
 
     let managed_value = |k: &str| -> String {
         match k {
@@ -556,7 +575,7 @@ fn write_params_toml(db_dir: &Path, params: &Params) -> std::io::Result<()> {
         }
     };
 
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let existing = read_existing_params(&path)?;
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
 
@@ -590,8 +609,79 @@ fn write_params_toml(db_dir: &Path, params: &Params) -> std::io::Result<()> {
 
     let mut body = out.join("\n");
     body.push('\n');
-    fs::write(&path, body)?;
-    Ok(())
+    atomic_write_params(&path, body.as_bytes())
+}
+
+fn refuse_symlink(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing symlink params.toml",
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_existing_params(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Linux O_NOFOLLOW | O_NONBLOCK: reject a symlink/FIFO swapped in
+        // after lstat, including during the preservation read before writing.
+        options.custom_flags(0o400000 | 0o4000);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "params.toml is not a regular file",
+        ));
+    }
+    let mut body = String::new();
+    file.read_to_string(&mut body)?;
+    Ok(body)
+}
+
+fn atomic_write_params(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = path.with_file_name(format!(".params-{}-{stamp}.tmp", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Deliveries may run as the mail user after a root-run tuning job.
+        options.mode(0o644);
+    }
+    let mut file = options.open(&temp)?;
+    let result = (|| {
+        file.write_all(body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
+        file.sync_all()?;
+        refuse_symlink(path)?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn fmt_params_inline(p: &Params) -> String {
@@ -615,7 +705,7 @@ fn fmt_eval_inline(r: &EvalResult) -> String {
 fn main() {
     let args = parse_args();
     let db_path = args.db_dir.join("db.sqlite");
-    let db = Database::open(&db_path).unwrap_or_else(|e| {
+    let db = open_evaluation_db(&db_path).unwrap_or_else(|e| {
         eprintln!("spamlite-tune: open {}: {e}", db_path.display());
         process::exit(1);
     });
@@ -654,7 +744,7 @@ fn main() {
     let baseline_test = evaluate(&test, total_good, total_spam, &baseline);
 
     let t1 = Instant::now();
-    let (best, best_train) = tune(&train, total_good, total_spam, args.fp_weight);
+    let (best, best_train) = tune(&train, total_good, total_spam, args.fp_weight, &baseline);
     let tune_elapsed = t1.elapsed().as_secs_f64();
     let best_test = evaluate(&test, total_good, total_spam, &best);
 
@@ -764,6 +854,56 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn invalid_numbers_are_usage_errors() {
+        assert!(numeric_value::<f64>("oops").is_err());
+        assert!(numeric_value::<usize>("-1").is_err());
+        assert_eq!(numeric_value::<usize>("12").unwrap(), 12);
+    }
+
+    #[test]
+    fn search_keeps_effective_unmanaged_baseline() {
+        let baseline = Params {
+            combine_mode: scoring::CombineMode::Geometric,
+            new_word_score: 0.23,
+            min_distance: 0.12,
+            min_array_size: 7,
+            threshold: 0.71,
+            ..Default::default()
+        };
+        let (best, _) = tune(&[], 1, 1, 1.0, &baseline);
+        assert_eq!(best.combine_mode, baseline.combine_mode);
+        assert_eq!(best.new_word_score, baseline.new_word_score);
+        assert_eq!(best.min_distance, baseline.min_distance);
+        assert_eq!(best.min_array_size, baseline.min_array_size);
+        assert_eq!(best.threshold, baseline.threshold);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn params_write_replaces_inode_and_refuses_symlink() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let dir = std::env::temp_dir().join(format!("spamlite-atomic-{}", process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("params.toml");
+        fs::write(&path, "threshold = 0.6\n").unwrap();
+        let held = fs::File::open(&path).unwrap();
+        write_params_toml(&dir, &Params::default()).unwrap();
+        assert_ne!(
+            held.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+        let target = dir.join("target");
+        fs::write(&target, "untouched").unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(write_params_toml(&dir, &Params::default()).is_err());
+        #[cfg(target_os = "linux")]
+        assert!(read_existing_params(&path).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn ev(fp: u32, fn_: u32, tp: u32, tn: u32) -> EvalResult {
         EvalResult { fp, fn_, tp, tn }
     }
@@ -844,5 +984,25 @@ mod tests {
         }
 
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod database_open_tests {
+    use super::*;
+    #[test]
+    fn missing_corpus_is_not_created() {
+        let dir = std::env::temp_dir().join(format!(
+            "spamlite-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("db.sqlite");
+        assert!(open_evaluation_db(&path).is_err());
+        assert!(!path.exists());
+        assert!(!dir.exists());
     }
 }
