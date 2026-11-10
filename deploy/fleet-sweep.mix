@@ -47,14 +47,25 @@ end
 
 fn score_list($dir, $paths, $outfile)
   $out = ""
+  $unscored = 0
   $i = 0
   while $i < len($paths)
-    $r = run_argv_must([$SL, "-d", $dir, "score"], {stdin: {file: $paths[$i]}, timeout: 900})
-    $f = split(strip($r), " ")
-    if len($f) > 1 then $out = $out .. $f[1] .. "\t" .. $paths[$i] .. "\n" end
+    -- One message that cannot be scored (expunged since the listing, a
+    -- timeout) is skipped and counted, as the old `|| true` did; it must not
+    -- abort the sweep and lose every score gathered so far.
+    $r = run_argv([$SL, "-d", $dir, "score"], {stdin: {file: $paths[$i]}, timeout: 900})
+    if $r.exit_code == 0 then
+      $f = split(strip($r.stdout), " ")
+      if len($f) > 1 then $out = $out .. $f[1] .. "\t" .. $paths[$i] .. "\n" end
+    else
+      $unscored = $unscored + 1
+    end
     $i = $i + 1
   end
   write_file($outfile, $out)
+  if $unscored > 0 then
+    print("  " .. to_string($unscored) .. " message(s) could not be scored and were skipped: " .. $outfile)
+  end
 end
 
 fn user_tag($d)

@@ -2,6 +2,23 @@
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
 
+-- journalctl -g exits 1 when nothing matches. That is an empty result, as it
+-- was when this was a shell pipeline ending in `|| true`; anything else
+-- (another exit code, a timeout, truncated output) is a real failure.
+fn journal_grep($argv)
+  $r = run_argv($argv, {timeout: 600, max_output: 256 * 1024 * 1024})
+  if $r.timed_out or $r.stdout_truncated then
+    raise("JOURNAL", "journalctl timed out or its output was truncated")
+  end
+  if $r.exit_code == 1 then
+    return ""
+  end
+  if $r.exit_code != 0 then
+    raise("JOURNAL", "journalctl rc=" .. to_string($r.exit_code) .. ": " .. trim($r.stderr))
+  end
+  return $r.stdout
+end
+
 fn journal_literal($text)
   for $c in ["\\", ".", "^", "$", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]
     $text = replace($text, $c, "\\" .. $c)
@@ -100,7 +117,7 @@ for each $addr in $addrs
   -- `grep -F '-> good'` looks like a FLAG to grep (the pattern starts with `-`) and
   -- silently matches nothing. Anchor the extraction on the msgid instead, so every
   -- pattern begins with a harmless character.
-  $journal = run_argv_must(["/usr/bin/journalctl", "--since", to_string($DAYS) .. " days ago", "--no-pager", "-g", journal_literal("TRAIN: " .. $addr .. " ")], {timeout: 600, max_output: 256 * 1024 * 1024})
+  $journal = journal_grep(["/usr/bin/journalctl", "--since", to_string($DAYS) .. " days ago", "--no-pager", "-g", journal_literal("TRAIN: " .. $addr .. " ")])
   $mids = []
   $seen = {}
   for each $l in lines($journal)
