@@ -17,8 +17,14 @@ fn private_stage()
   end
   $dir = "/run/spamlite/stage-" .. uuid()
   mkdir($dir, {parents: false})
-  chmod($dir, 0o700)
-  return $dir
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
 end
 -- spamlite-user-review.mix — daily 24h review of one user's spamlite filtering,
 -- emailed to markc@renta.net. Fleet-generic (mbc/mrn/mbx): mailbox access is
@@ -355,6 +361,8 @@ if $DRY == 1 then
   print($r)
 else
   $stage = private_stage()
+
+try
   $eml = $stage .. "/review.eml"
   $cc = ""
   if $TO != "markc@renta.net" then
@@ -365,7 +373,9 @@ else
   -- the corpus. Recipients check Trash for it (same as bounces). 2026-08-23.
   write_file($eml, "To: " .. $TO .. "\n" .. $cc .. "From: root@" .. $fqdn .. "\nSubject: spamlite daily review " .. $U .. "\n\n" .. $r)
   $sent = run_argv_must(["/usr/sbin/sendmail", "-oi", "-t"], {stdin: {file: $eml}, timeout: 300})
+finally
   remove_dir($stage)
+end
   write_file($BASE, strip($st.stdout) .. "\n")
   print("emailed + baseline refreshed " .. $ts)
 end

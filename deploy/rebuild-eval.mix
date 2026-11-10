@@ -48,6 +48,7 @@ if is_file($live) == false then print("FAIL: no live db at " .. $live); exit(1) 
 $W = "/root/rebuild-eval"
 remove_dir($W)
 mkdir($W)
+try
 mkdir($W .. "/msgs")
 mkdir($W .. "/sets")
 
@@ -303,3 +304,7 @@ while $ti < len($ths)
 end
 print("")
 print("nothing was written to " .. $live)
+
+finally
+  remove_dir($W)
+end

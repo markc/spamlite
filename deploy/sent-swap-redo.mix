@@ -127,9 +127,9 @@ end
 -- first, which may be the only exact record of the pre-redo corpus.
 $stamp = "presentswap-" .. floor(time())
 $bk = $db .. ".bak-" .. $stamp
-$b = run_argv(["sqlite3", $db, ".backup '" .. $bk .. "'"], {timeout: 600})
+$b = run_argv(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "sqlite3", $db, ".backup '" .. $bk .. "'"], {timeout: 600})
 if $b.exit_code != 0 then print("FAIL: db backup: " .. strip($b.stderr)); exit(1) end
-copy($log, $log .. ".bak-" .. $stamp)
+$backup_log = run_argv_must(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "cp", "-a", "--", $log, $log .. ".bak-" .. $stamp], {timeout: 600})
 print("backed up -> " .. $bk .. " and " .. $log .. ".bak-" .. $stamp)
 print($SL .. " stats BEFORE:")
 print(run_argv([$SL, "-d", $dbdir, "stats"]).stdout)

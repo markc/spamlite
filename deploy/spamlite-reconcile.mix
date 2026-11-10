@@ -17,8 +17,14 @@ fn private_stage()
   end
   $dir = "/run/spamlite/stage-" .. uuid()
   mkdir($dir, {parents: false})
-  chmod($dir, 0o700)
-  return $dir
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
 end
 -- spamlite-reconcile.mix — nightly STATE-based trainer.
 --
@@ -220,6 +226,8 @@ $NOW = floor(time())
 $HAM_HI = $NOW - $RIPEN
 $HAM_LO = $NOW - $WINDOW
 $STAGE_ROOT = private_stage()
+
+try
 $STAGE = $STAGE_ROOT .. "/slrec"
 
 if $USERS_GLOB == "" then
@@ -1126,7 +1134,7 @@ while $u < len($users)
             end
             $tl = []
             if strip($tr.stdout) != "" then
-              $tl = split(strip($tr.stdout), "\n")
+              $tl = slice(split($tr.stdout, "\n"), 0, -1)
             end
             $warned_corr = 0
             $logbuf = ""
@@ -1234,4 +1242,6 @@ while $u < len($users)
   $u = $u + 1
 end
 
-remove_dir($STAGE_ROOT)
+finally
+  remove_dir($STAGE_ROOT)
+end

@@ -35,6 +35,7 @@ if is_file($live) == false then print("FAIL: no live db at " .. $live); exit(1) 
 $W = "/root/sent-swap-verify"
 remove_dir($W)
 mkdir($W)
+try
 mkdir($W .. "/msgs")
 
 -- ---------------------------------------------------------------- staging
@@ -231,3 +232,7 @@ if $ok == 1 then
   exit(0)
 end
 exit(1)
+
+finally
+  remove_dir($W)
+end

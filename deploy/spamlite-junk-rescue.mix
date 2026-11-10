@@ -31,8 +31,14 @@ fn private_stage()
   end
   $dir = "/run/spamlite/stage-" .. uuid()
   mkdir($dir, {parents: false})
-  chmod($dir, 0o700)
-  return $dir
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
 end
 -- spamlite-junk-rescue.mix — retrain a REVIEWED list of Junk false positives
 -- as good and (optionally) move recent ones back to INBOX. 2026-09-17.
@@ -60,6 +66,8 @@ end
 $mode = $a[0]
 $CUT = $a[2]
 $W = private_stage()
+
+try
 $by = {}
 for $l in lines(read_file($a[1]))
   $c = split($l, "\t")
@@ -92,6 +100,8 @@ for $login in sort(keys($by))
     end
   end
   $stage = private_stage()
+
+try
   mkdir($stage .. "/corr", {parents: false})
   mkdir($stage .. "/plain", {parents: false})
   chmod($stage .. "/corr", 0o700)
@@ -166,10 +176,10 @@ for $login in sort(keys($by))
     $nm = $nm + 1
   end
   print($login .. ": retrain corr=" .. $nc .. " plain=" .. $np .. "  not-retrained=" .. $ns .. "  to-move=" .. $nm)
-  if $mode != "apply" then remove_dir($stage); continue end
+  if $mode != "apply" then continue end
 
-  $checked = run_argv_must(["cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-" .. $STAMP .. "-rescue"], {timeout: 600})
-  if is_file($log) then $checked = run_argv_must(["cp", "-a", $log, $log .. ".bak-" .. $STAMP .. "-rescue"], {timeout: 600}) end
+  $checked = run_argv_must(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "cp", "-a", $db .. "/db.sqlite", $db .. "/db.sqlite.bak-" .. $STAMP .. "-rescue"], {timeout: 600})
+  if is_file($log) then $checked = run_argv_must(["setpriv", "--reuid", to_string($identity.uid), "--regid", to_string($identity.gid), "--clear-groups", "cp", "-a", $log, $log .. ".bak-" .. $STAMP .. "-rescue"], {timeout: 600}) end
   $trained = {}
   for $sub in ["corr", "plain"]
     $argv = [$SL, "-d", $db, "train-dir", "./" .. $sub, "good"]
@@ -209,8 +219,12 @@ for $login in sort(keys($by))
       end
     end
   end
+finally
   remove_dir($stage)
+end
   $T.skipped = $T.skipped + $ns
 end
-remove_dir($W)
+finally
+  remove_dir($W)
+end
 print("TOTAL mode=" .. $mode .. " corr=" .. $T.corr .. " plain=" .. $T.plain .. " not-retrained=" .. $T.skipped .. " moved=" .. $T.moved .. " missing=" .. $T.missing .. " failed=" .. $T.failed)

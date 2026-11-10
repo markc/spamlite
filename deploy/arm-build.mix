@@ -17,8 +17,14 @@ fn private_stage()
   end
   $dir = "/run/spamlite/stage-" .. uuid()
   mkdir($dir, {parents: false})
-  chmod($dir, 0o700)
-  return $dir
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
 end
 -- arm-build.mix — build one candidate db ("arm") for fp-eval.mix, using 0.9.0 train-dir.
 --
@@ -110,6 +116,8 @@ fn train($dir, $list, $cls)
   $paths = readlist($list)
   if len($paths) == 0 then return "none" end
   $stage = private_stage()
+
+try
   -- ln in chunks of 1000 to stay well under ARG_MAX
   $i = 0
   while $i < len($paths)
@@ -136,7 +144,9 @@ fn train($dir, $list, $cls)
     end
     $i = $i + 1
   end
+finally
   remove_dir($stage)
+end
   return "listed=" .. len($paths) .. " ok=" .. $ok .. " fail=" .. $fail .. " exit=" .. $tr.exit_code
 end
 

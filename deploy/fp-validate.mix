@@ -2,6 +2,13 @@
 -- SPDX-FileCopyrightText: 2026 Mark Constable <mc@mixos.dev>
 -- SPDX-License-Identifier: MIT OR Apache-2.0
 
+fn journal_literal($text)
+  for $c in ["\\", ".", "^", "$", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]
+    $text = replace($text, $c, "\\" .. $c)
+  end
+  return $text
+end
+
 -- Private scratch: never follow a pre-planted parent or recreate its parents.
 fn private_stage()
   try
@@ -17,8 +24,14 @@ fn private_stage()
   end
   $dir = "/run/spamlite/stage-" .. uuid()
   mkdir($dir, {parents: false})
-  chmod($dir, 0o700)
-  return $dir
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
 end
 -- fp-validate.mix <days> <addr> [<addr>...] — is each "confirmed false positive"
 -- actually ham?
@@ -87,7 +100,7 @@ for each $addr in $addrs
   -- `grep -F '-> good'` looks like a FLAG to grep (the pattern starts with `-`) and
   -- silently matches nothing. Anchor the extraction on the msgid instead, so every
   -- pattern begins with a harmless character.
-  $journal = run_argv_must(["/usr/bin/journalctl", "--since", to_string($DAYS) .. " days ago", "--no-pager", "-g", "TRAIN: " .. $addr .. " "], {timeout: 600, max_output: 256 * 1024 * 1024})
+  $journal = run_argv_must(["/usr/bin/journalctl", "--since", to_string($DAYS) .. " days ago", "--no-pager", "-g", journal_literal("TRAIN: " .. $addr .. " ")], {timeout: 600, max_output: 256 * 1024 * 1024})
   $mids = []
   $seen = {}
   for each $l in lines($journal)
@@ -112,6 +125,8 @@ for each $addr in $addrs
   if length($mids) > 0 then
     -- 2. ONE grep pass over the Maildir with every msgid as a fixed pattern.
     $scratch = private_stage()
+    $keep_lists = false
+try
     $pf = $scratch .. "/mids"
     write_file($pf, join($mids, "\n") .. "\n")
     chmod($pf, 0o600)
@@ -199,6 +214,11 @@ for each $addr in $addrs
     write_file($od .. "/ham-regress.list", join($hl, "\n") .. "\n")
     chmod($od .. "/ham-regress.list", 0o600)
     remove($pf)
+
+    $keep_lists = true
+finally
+    if not $keep_lists then remove_dir($scratch) end
+end
     print "     lists: " .. $od .. " (watch " .. ("" .. length($wl)) .. ", ham-regress " .. ("" .. length($hl)) .. ")"
     print ""
   end

@@ -114,6 +114,7 @@ if $a[0] == "sweep" then
           $W = $ROOT .. "/" .. $tag
           $checked = run_argv_must(["rm", "-rf", $W], {timeout: 600})
           mkdir($W)
+          try
           mkdir($W .. "/live")
           mkdir($W .. "/tuned")
           $checked = run_argv_must(["sqlite3", $d .. "/.spamlite/db.sqlite", ".backup " .. $W .. "/live/db.sqlite"], {timeout: 600})
@@ -127,6 +128,10 @@ if $a[0] == "sweep" then
           score_list($W .. "/tuned", $ham, $W .. "/tuned.ham.scores")
           score_list($W .. "/tuned", $spam_paths, $W .. "/tuned.spam.scores")
           $cleanup = run_argv(["rm", "-f", $W .. "/live/db.sqlite", $W .. "/tuned/db.sqlite", $W .. "/live/db.sqlite-wal", $W .. "/live/db.sqlite-shm", $W .. "/tuned/db.sqlite-wal", $W .. "/tuned/db.sqlite-shm"])
+          finally
+            remove_dir($W .. "/live")
+            remove_dir($W .. "/tuned")
+          end
           print($tag .. " ham=" .. len($ham) .. " spam=" .. len($spam_paths))
         end
       end

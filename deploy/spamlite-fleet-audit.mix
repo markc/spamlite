@@ -17,8 +17,14 @@ fn private_stage()
   end
   $dir = "/run/spamlite/stage-" .. uuid()
   mkdir($dir, {parents: false})
-  chmod($dir, 0o700)
-  return $dir
+  $ready = false
+  try
+    chmod($dir, 0o700)
+    $ready = true
+    return $dir
+  finally
+    if not $ready then remove_dir($dir) end
+  end
 end
 -- spamlite-fleet-audit.mix — READ-ONLY per-user health audit (2026-09-17).
 --
@@ -40,6 +46,8 @@ end
 -- runs as the mailbox owner so no root-owned -wal/-shm can appear.
 
 $W = private_stage()
+$keep_report = false
+try
 $SL = "/usr/local/bin/spamlite"
 $NOW = floor(time())
 $D30 = $NOW - 30 * 86400
@@ -295,4 +303,12 @@ write_file($W .. "/stall.tsv", $stall_rows)
 chmod($W .. "/stall.tsv", 0o600)
 $cleanup = run_argv(["rm", "-f", $W .. "/all.tmp", $W .. "/junk.tmp"])
 print("users=" .. $tot.users .. " fetch_failed=" .. $tot.fail .. " loop_senders=" .. $tot.loop .. " junk_candidates=" .. $tot.junk .. " stalled(G30=0,S30>=5)=" .. $tot.stalled)
+
+$keep_report = true
+finally
+  remove_dir($W .. "/msg")
+  remove($W .. "/all.tmp")
+  remove($W .. "/junk.tmp")
+  if not $keep_report then remove_dir($W) end
+end
 print("reports: " .. $W .. "/{loop,junk,stall}.tsv")
