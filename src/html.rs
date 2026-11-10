@@ -174,8 +174,7 @@ fn handle_tag(s: &str, depth: usize, no_gt: &mut bool) -> (String, usize) {
         // Dropped along with their content.
         name @ ("head" | "script" | "style") => {
             let closing_tag = format!("</{name}>");
-            let end_tag_start =
-                find_ascii_ci(rest, closing_tag.as_bytes()).unwrap_or(rest.len());
+            let end_tag_start = find_ascii_ci(rest, closing_tag.as_bytes()).unwrap_or(rest.len());
             let closing_tag_len = if end_tag_start < rest.len() {
                 closing_tag.len()
             } else {

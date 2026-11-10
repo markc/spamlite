@@ -1236,9 +1236,7 @@ mod tests {
         // `open_does_not_wait_for_a_writer_on_an_initialised_database`).
         std::fs::create_dir_all(&root).unwrap();
         let holder = Connection::open(&path).unwrap();
-        holder
-            .execute_batch("PRAGMA journal_mode = WAL;")
-            .unwrap();
+        holder.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
 
         // A short configured timeout must apply before init's schema/meta
         // writes, rather than inheriting schema::init's 5 seconds.
